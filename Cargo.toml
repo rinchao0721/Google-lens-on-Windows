@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/platform",
+    "crates/overlay",
+    "crates/upload",
+    "crates/actions",
+    "crates/settings_ui",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+# 内部 crate
+lenswin-core = { path = "crates/core" }
+lenswin-platform = { path = "crates/platform" }
+lenswin-overlay = { path = "crates/overlay" }
+lenswin-upload = { path = "crates/upload" }
+lenswin-actions = { path = "crates/actions" }
+lenswin-settings-ui = { path = "crates/settings_ui" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+let_underscore_must_use = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

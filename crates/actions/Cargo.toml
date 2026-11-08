@@ -1,0 +1,15 @@
+[package]
+name = "lenswin-actions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lenswin-upload.workspace = true
+lenswin-overlay.workspace = true
+lenswin-platform.workspace = true
+lenswin-core.workspace = true
+
+[lints]
+workspace = true
