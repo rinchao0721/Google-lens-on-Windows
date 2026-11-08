@@ -27,6 +27,7 @@ lenswin-settings-ui = { path = "crates/settings_ui" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -38,6 +39,10 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
 let_underscore_must_use = "deny"
+undocumented_unsafe_blocks = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
 
 [profile.release]
 lto = "thin"
