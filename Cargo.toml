@@ -25,6 +25,11 @@ lenswin-upload = { path = "crates/upload" }
 lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
 
+# 外部依赖（均在 PLAN 第 8 节批准范围内）
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+toml = "1.2.1"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
