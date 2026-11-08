@@ -96,6 +96,8 @@ impl Rect {
     }
 
     /// 点集的外接矩形，可能宽或高为 0；点集为空时返回 `None`。
+    ///
+    /// 采用半开区间：不包含最大 x、最大 y 所在的那一行和那一列像素。
     pub fn bounding(points: &[Point]) -> Option<Rect> {
         let first = points.first()?;
         let (mut min_x, mut max_x) = (first.x, first.x);

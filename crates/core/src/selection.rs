@@ -28,15 +28,27 @@ pub enum SelectionShape {
 /// 一次选区结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
-    /// 形状。
-    pub shape: SelectionShape,
-    /// 虚拟桌面物理像素坐标下的外接范围，保证非空。
-    pub bounds: Rect,
-    /// 选区所在显示器的序号。
-    pub monitor_index: usize,
+    shape: SelectionShape,
+    bounds: Rect,
+    monitor_index: usize,
 }
 
 impl Selection {
+    /// 形状。
+    pub fn shape(&self) -> &SelectionShape {
+        &self.shape
+    }
+
+    /// 虚拟桌面物理像素坐标下的外接范围，保证非空。
+    pub fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    /// 选区所在显示器的序号。
+    pub fn monitor_index(&self) -> usize {
+        self.monitor_index
+    }
+
     /// 构造选区；范围为空或套索轨迹为空时返回错误。
     pub fn new(
         shape: SelectionShape,
@@ -114,9 +126,9 @@ mod tests {
             1,
         )
         .expect("框选");
-        assert_eq!(sel.bounds, Rect::new(1900, 1000, 20, 80));
-        assert_eq!(sel.monitor_index, 1);
-        assert_eq!(sel.shape, SelectionShape::Rect);
+        assert_eq!(sel.bounds(), Rect::new(1900, 1000, 20, 80));
+        assert_eq!(sel.monitor_index(), 1);
+        assert_eq!(sel.shape(), &SelectionShape::Rect);
     }
 
     #[test]
@@ -130,8 +142,8 @@ mod tests {
     fn lasso_keeps_trajectory_and_expands() {
         let pts = vec![Point::new(100, 100), Point::new(200, 150)];
         let sel = Selection::from_lasso(pts.clone(), 10, 4, &monitor(), 0).expect("套索");
-        assert_eq!(sel.bounds, Rect::new(88, 88, 124, 74));
-        assert_eq!(sel.shape, SelectionShape::Lasso(pts));
+        assert_eq!(sel.bounds(), Rect::new(88, 88, 124, 74));
+        assert_eq!(sel.shape(), &SelectionShape::Lasso(pts));
     }
 
     #[test]

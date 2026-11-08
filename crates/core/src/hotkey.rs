@@ -213,10 +213,31 @@ impl fmt::Display for Key {
 /// 解析后的快捷键。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hotkey {
+    modifiers: Modifiers,
+    key: Key,
+}
+
+impl Hotkey {
+    /// 构造快捷键；没有修饰键，或主键取值不合法时返回错误。
+    pub fn new(modifiers: Modifiers, key: Key) -> Result<Self, HotkeyError> {
+        if key.vk_code().is_none() {
+            return Err(HotkeyError::UnknownKey(key.to_string()));
+        }
+        if modifiers.is_empty() {
+            return Err(HotkeyError::NoModifier);
+        }
+        Ok(Self { modifiers, key })
+    }
+
     /// 修饰键，至少一个。
-    pub modifiers: Modifiers,
+    pub fn modifiers(&self) -> Modifiers {
+        self.modifiers
+    }
+
     /// 主键。
-    pub key: Key,
+    pub fn key(&self) -> Key {
+        self.key
+    }
 }
 
 fn parse_modifier(token: &str) -> Option<Modifiers> {
@@ -257,10 +278,7 @@ impl FromStr for Hotkey {
         }
         let key = Key::parse(key_token)
             .ok_or_else(|| HotkeyError::UnknownKey((*key_token).to_string()))?;
-        if modifiers.is_empty() {
-            return Err(HotkeyError::NoModifier);
-        }
-        Ok(Hotkey { modifiers, key })
+        Hotkey::new(modifiers, key)
     }
 }
 
@@ -292,8 +310,8 @@ mod tests {
     #[test]
     fn parses_default_hotkeys() {
         let h = parse("Win+Shift+A").expect("默认搜索快捷键");
-        assert_eq!(h.modifiers, Modifiers::WIN.union(Modifiers::SHIFT));
-        assert_eq!(h.key, Key::Letter('A'));
+        assert_eq!(h.modifiers(), Modifiers::WIN.union(Modifiers::SHIFT));
+        assert_eq!(h.key(), Key::Letter('A'));
         assert!(parse("Win+Shift+C").is_ok());
     }
 
@@ -302,7 +320,25 @@ mod tests {
         let a = parse("ctrl + ALT + f12").expect("解析");
         let b = parse("Ctrl+Alt+F12").expect("解析");
         assert_eq!(a, b);
-        assert_eq!(a.key, Key::Function(12));
+        assert_eq!(a.key(), Key::Function(12));
+    }
+
+    #[test]
+    fn new_enforces_invariants() {
+        let key = Key::Letter('A');
+        assert_eq!(
+            Hotkey::new(Modifiers::NONE, key),
+            Err(HotkeyError::NoModifier)
+        );
+        assert_eq!(
+            Hotkey::new(Modifiers::CTRL, Key::Letter('a')),
+            Err(HotkeyError::UnknownKey("a".into()))
+        );
+        assert_eq!(
+            Hotkey::new(Modifiers::CTRL, Key::Function(25)),
+            Err(HotkeyError::UnknownKey("F25".into()))
+        );
+        assert!(Hotkey::new(Modifiers::CTRL, key).is_ok());
     }
 
     #[test]
