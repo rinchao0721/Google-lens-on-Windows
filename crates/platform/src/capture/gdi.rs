@@ -95,6 +95,12 @@ fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, Ca
     if copied == 0 {
         return Err(last_error("GetDIBits").into());
     }
+    // 返回值是实际复制的扫描行数，部分复制时剩余行为黑色，必须视为失败
+    if copied != height {
+        return Err(
+            PlatformError::Invalid(format!("GetDIBits 只复制了 {copied}/{height} 行")).into(),
+        );
+    }
     bgra_to_opaque_rgba(&mut rgba);
     Ok(Frame::new(monitor.bounds, rgba)?)
 }

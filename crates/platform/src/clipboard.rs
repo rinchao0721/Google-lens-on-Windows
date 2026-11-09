@@ -58,10 +58,7 @@ impl Drop for ClipboardGuard {
 /// 把图像写入剪贴板，会清空原有内容。
 pub fn set_image(owner: &MessageWindow, image: &CroppedImage) -> Result<(), PlatformError> {
     let dib = rgba_to_dib(image)?;
-    let _clipboard = ClipboardGuard::open(owner)?;
-    // SAFETY: 剪贴板已由当前线程打开。
-    unsafe { EmptyClipboard() }.map_err(win32("EmptyClipboard"))?;
-
+    // 先备好全部数据，打开并清空剪贴板之后不再有会丢失原内容的失败路径
     let mut mem = GlobalMem::alloc(dib.len())?;
     let handle = mem
         .raw()
@@ -77,6 +74,9 @@ pub fn set_image(owner: &MessageWindow, image: &CroppedImage) -> Result<(), Plat
     // SAFETY: 与上面的 GlobalLock 配对。
     discard(unsafe { GlobalUnlock(handle) });
 
+    let _clipboard = ClipboardGuard::open(owner)?;
+    // SAFETY: 剪贴板已由当前线程打开。
+    unsafe { EmptyClipboard() }.map_err(win32("EmptyClipboard"))?;
     // SAFETY: 剪贴板已打开且已清空，handle 为可移动内存；成功后所有权归系统。
     unsafe { SetClipboardData(u32::from(CF_DIB.0), Some(HANDLE(handle.0))) }
         .map_err(win32("SetClipboardData"))?;

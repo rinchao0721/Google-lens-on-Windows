@@ -33,6 +33,19 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     // 必须早于任何窗口创建，之后所有坐标才是物理像素
     let dpi_result = dpi::enable_per_monitor_v2();
+    // 先抢互斥量再碰日志，避免第二个实例轮转或打开正被首个实例写入的日志
+    let _instance =
+        match single_instance::acquire(TRAY_MUTEX_NAME).context("创建单实例互斥量失败")? {
+            Acquired::First(instance) => instance,
+            Acquired::AlreadyRunning => {
+                // 日志尚未初始化，通知失败也只能放弃
+                match single_instance::notify_existing(TRAY_WINDOW_CLASS) {
+                    Ok(()) | Err(_) => {}
+                }
+                return Ok(());
+            }
+        };
+
     let paths = AppPaths::detect().context("确定数据目录失败")?;
     logging::init(&paths.log_dir).context("初始化日志失败")?;
     log::info!(
@@ -44,18 +57,6 @@ fn run() -> anyhow::Result<()> {
     if let Err(e) = dpi_result {
         log::debug!("设置 DPI 感知未生效（可能已由 manifest 声明）：{e}");
     }
-
-    let _instance =
-        match single_instance::acquire(TRAY_MUTEX_NAME).context("创建单实例互斥量失败")? {
-            Acquired::First(instance) => instance,
-            Acquired::AlreadyRunning => {
-                log::info!("已有实例在运行，通知后退出");
-                if let Err(e) = single_instance::notify_existing(TRAY_WINDOW_CLASS) {
-                    log::warn!("通知已运行的实例失败：{e}");
-                }
-                return Ok(());
-            }
-        };
 
     // 配置读取与热更新在 M5 由 ConfigStore 接管，此处暂用默认值
     let config = Config::default();
