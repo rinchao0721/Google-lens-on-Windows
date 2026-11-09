@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use lenswin_core::frame::CroppedImage;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -21,14 +21,31 @@ const OPEN_RETRY_DELAY: Duration = Duration::from_millis(15);
 /// BITMAPINFOHEADER 大小。
 const DIB_HEADER_LEN: usize = 40;
 
+/// 剪贴板所有者：消息窗口句柄的数值，可跨线程传递。
+///
+/// 窗口销毁后再使用，`OpenClipboard` 会返回错误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardOwner(usize);
+
+impl ClipboardOwner {
+    /// 以消息窗口作为所有者。
+    pub fn of(window: &MessageWindow) -> Self {
+        Self(window.hwnd().0.expose_provenance())
+    }
+
+    fn hwnd(self) -> HWND {
+        HWND(std::ptr::with_exposed_provenance_mut(self.0))
+    }
+}
+
 /// 打开期间持有剪贴板，离开作用域时关闭。
 struct ClipboardGuard;
 
 impl ClipboardGuard {
-    fn open(owner: &MessageWindow) -> Result<Self, PlatformError> {
+    fn open(owner: ClipboardOwner) -> Result<Self, PlatformError> {
         let mut last = None;
         for attempt in 0..OPEN_RETRIES {
-            // SAFETY: owner 是本线程创建的有效窗口。
+            // SAFETY: 句柄无效时 OpenClipboard 只会返回错误。
             match unsafe { OpenClipboard(Some(owner.hwnd())) } {
                 Ok(()) => return Ok(Self),
                 Err(e) => last = Some(e),
@@ -56,7 +73,7 @@ impl Drop for ClipboardGuard {
 }
 
 /// 把图像写入剪贴板，会清空原有内容。
-pub fn set_image(owner: &MessageWindow, image: &CroppedImage) -> Result<(), PlatformError> {
+pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), PlatformError> {
     let dib = rgba_to_dib(image)?;
     // 先备好全部数据，打开并清空剪贴板之后不再有会丢失原内容的失败路径
     let mut mem = GlobalMem::alloc(dib.len())?;

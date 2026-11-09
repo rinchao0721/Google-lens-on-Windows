@@ -10,6 +10,8 @@ lenswin-upload.workspace = true
 lenswin-overlay.workspace = true
 lenswin-platform.workspace = true
 lenswin-core.workspace = true
+log.workspace = true
+png.workspace = true
 
 [lints]
 workspace = true

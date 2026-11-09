@@ -8,9 +8,9 @@ use lenswin_core::ipc::SECOND_INSTANCE_MESSAGE_OFFSET;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, RegisterWindowMessageW,
-    UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassExW,
+    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_HOTKEY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -22,6 +22,9 @@ use crate::text::to_wide;
 pub(crate) const WM_TRAY: u32 = WM_APP + 1;
 /// 第二个实例的通知消息。
 pub(crate) const WM_SECOND_INSTANCE: u32 = WM_APP + SECOND_INSTANCE_MESSAGE_OFFSET;
+
+/// 后台任务完成的通知消息。
+pub(crate) const WM_TASK_DONE: u32 = WM_APP + 3;
 
 /// 资源管理器重启后系统广播的消息号，创建窗口时注册。
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -46,6 +49,8 @@ pub enum WindowEvent {
     TaskbarCreated,
     /// 又启动了一个实例。
     SecondInstance,
+    /// 后台任务有结果待取。
+    TaskDone,
 }
 
 thread_local! {
@@ -160,6 +165,31 @@ impl MessageWindow {
     pub fn hwnd(&self) -> HWND {
         self.hwnd
     }
+
+    /// 可跨线程使用的任务完成通知器。
+    pub fn task_notifier(&self) -> TaskNotifier {
+        TaskNotifier {
+            hwnd: self.hwnd.0.expose_provenance(),
+        }
+    }
+}
+
+/// 工作线程用它向消息窗口投递 [`WindowEvent::TaskDone`]。
+///
+/// 只保存窗口句柄的数值，窗口销毁后投递会失败并返回错误。
+#[derive(Debug, Clone, Copy)]
+pub struct TaskNotifier {
+    hwnd: usize,
+}
+
+impl TaskNotifier {
+    /// 通知主线程有任务结果。
+    pub fn notify(&self) -> Result<(), PlatformError> {
+        let hwnd = HWND(std::ptr::with_exposed_provenance_mut(self.hwnd));
+        // SAFETY: PostMessageW 可跨线程调用；句柄无效时只会返回错误。
+        unsafe { PostMessageW(Some(hwnd), WM_TASK_DONE, WPARAM(0), LPARAM(0)) }
+            .map_err(win32("PostMessageW"))
+    }
 }
 
 impl Drop for MessageWindow {
@@ -196,6 +226,7 @@ unsafe extern "system" fn wnd_proc(
             }
         }
         WM_SECOND_INSTANCE => enqueue(WindowEvent::SecondInstance),
+        WM_TASK_DONE => enqueue(WindowEvent::TaskDone),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             enqueue(WindowEvent::TaskbarCreated);
         }

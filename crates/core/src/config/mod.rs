@@ -286,9 +286,29 @@ pub struct PrivacyConfig {
     pub acknowledged_host: String,
 }
 
+impl PrivacyConfig {
+    /// 用户是否已确认过向该主机上传图片；主机名不区分大小写。
+    pub fn is_acknowledged(&self, host: &str) -> bool {
+        let known = self.acknowledged_host.trim();
+        !known.is_empty() && known.eq_ignore_ascii_case(host.trim())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledgement_matches_host_case_insensitively() {
+        let privacy = PrivacyConfig {
+            acknowledged_host: " Litterbox.Catbox.moe ".to_string(),
+        };
+        assert!(privacy.is_acknowledged("litterbox.catbox.moe"));
+        assert!(!privacy.is_acknowledged("uguu.se"));
+        assert!(!privacy.is_acknowledged(""));
+        assert!(!PrivacyConfig::default().is_acknowledged(""));
+        assert!(!PrivacyConfig::default().is_acknowledged("uguu.se"));
+    }
 
     #[test]
     fn default_config_is_valid() {

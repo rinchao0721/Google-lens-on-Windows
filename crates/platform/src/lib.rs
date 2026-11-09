@@ -4,6 +4,8 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod clock;
+pub mod dialog;
 pub mod dpi;
 pub mod error;
 pub mod handle;

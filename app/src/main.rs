@@ -3,14 +3,17 @@
 #![forbid(unsafe_code)]
 #![windows_subsystem = "windows"]
 
+mod config_file;
 mod dispatcher;
 mod logging;
 mod tray_menu;
 
 use anyhow::Context;
+use lenswin_actions::ActionRegistry;
 use lenswin_core::config::Config;
 use lenswin_core::hotkey::Hotkey;
 use lenswin_core::ipc::{TRAY_MUTEX_NAME, TRAY_WINDOW_CLASS};
+use lenswin_platform::clipboard::ClipboardOwner;
 use lenswin_platform::hotkey::{self, HotkeyGuard};
 use lenswin_platform::notify::NotifyLevel;
 use lenswin_platform::paths::{AppPaths, Mode};
@@ -58,11 +61,18 @@ fn run() -> anyhow::Result<()> {
         log::debug!("设置 DPI 感知未生效（可能已由 manifest 声明）：{e}");
     }
 
-    // 配置读取与热更新在 M5 由 ConfigStore 接管，此处暂用默认值
-    let config = Config::default();
+    // 热更新与统一写入在 M5 由 ConfigStore 接管，此处只在启动时读取一次
+    let loaded = config_file::load(&paths.config_file());
+    let config = loaded.config.clone();
+    let notice = loaded.notice.clone();
     let window = MessageWindow::create(TRAY_WINDOW_CLASS).context("创建消息窗口失败")?;
     let tray = TrayIcon::add(&window, "lenswin").context("添加托盘图标失败")?;
-    let dispatcher = Dispatcher::new(&tray, &paths, config.clone());
+    let registry = ActionRegistry::new(ClipboardOwner::of(&window));
+    let dispatcher = Dispatcher::new(&tray, &paths, loaded, registry, window.task_notifier());
+    if let Some(text) = notice {
+        log::warn!("{text}");
+        dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
+    }
 
     let _hotkeys = register_hotkeys(&window, &config, &dispatcher);
     if paths.mode == Mode::PortableFallback {
