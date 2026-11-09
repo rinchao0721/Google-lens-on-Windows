@@ -22,6 +22,8 @@ pub enum MenuAction {
     SetExpiry(LitterboxExpiry),
     /// 开启或关闭开机自启（路径过期时为更新）。
     ToggleAutostart,
+    /// 打开设置窗口。
+    OpenSettings,
     /// 打开配置文件夹。
     OpenConfigDir,
     /// 重新加载配置文件。
@@ -182,6 +184,7 @@ pub fn build(config: &Config, autostart: &AutostartState) -> Menu {
         expiry_menu(&mut b, config),
         MenuItem::Separator,
         autostart_item(&mut b, autostart),
+        b.plain(MenuAction::OpenSettings, "设置…"),
         b.plain(MenuAction::OpenConfigDir, "打开配置文件夹"),
         b.plain(MenuAction::ReloadConfig, "重新加载配置"),
         MenuItem::Separator,

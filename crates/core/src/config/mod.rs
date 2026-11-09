@@ -63,6 +63,8 @@ pub fn preset_index_of(template: &str) -> Option<usize> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// 常规。
+    pub general: GeneralConfig,
     /// 快捷键。
     pub hotkeys: HotkeysConfig,
     /// 搜索。
@@ -88,6 +90,22 @@ impl Config {
     /// 序列化为 TOML 文本。
     pub fn to_toml_string(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
+    }
+}
+
+/// `[general]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GeneralConfig {
+    /// 是否弹出成功类提示；关闭后错误和警告仍会提示。
+    pub notifications: bool,
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            notifications: true,
+        }
     }
 }
 
@@ -344,6 +362,16 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), LitterboxExpiry::ALL.len());
         assert_eq!(labels.first(), Some(&"1 小时"));
+    }
+
+    #[test]
+    fn notifications_default_on_and_roundtrip_off() {
+        assert!(Config::default().general.notifications);
+        let parsed = Config::from_toml_str("[general]\nnotifications = false\n").expect("解析");
+        assert!(!parsed.general.notifications);
+        let text = parsed.to_toml_string().expect("序列化");
+        assert_eq!(Config::from_toml_str(&text).expect("回读"), parsed);
+        assert!(Config::from_toml_str("[general]\nbogus = 1\n").is_err());
     }
 
     #[test]

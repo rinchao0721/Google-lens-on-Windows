@@ -1,13 +1,14 @@
 //! 热键、托盘事件到命令的路由。
 
-use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::ActionRegistry;
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS};
 use lenswin_core::frame::{CroppedImage, Frame};
+use lenswin_core::ipc::SETTINGS_ARG;
 use lenswin_core::selection::{Selection, SelectionMode};
 use lenswin_overlay::SelectRequest;
 use lenswin_platform::autostart::{self, AutostartState};
@@ -20,17 +21,15 @@ use lenswin_platform::notify::{self, NotifyLevel};
 use lenswin_platform::paths::AppPaths;
 use lenswin_platform::shell;
 use lenswin_platform::tray::TrayIcon;
-use lenswin_platform::window::{
-    MessageWindow, TaskNotifier, TrayMouse, WindowEvent, discard_pending_hotkeys,
-};
+use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_hotkeys};
 use lenswin_upload::privacy_summary;
 
-use crate::config_store::ConfigStore;
 use crate::hotkeys::{self, HotkeySet};
+use crate::shared::AppShared;
 use crate::tray_menu::{self, MenuAction};
 
 /// 开机自启在注册表里的值名。
-const AUTOSTART_NAME: &str = "lenswin";
+const AUTOSTART_NAME: &str = autostart::VALUE_NAME;
 
 /// 用户可触发的命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,12 +82,10 @@ struct TaskResult {
 pub struct Dispatcher<'a> {
     tray: &'a TrayIcon,
     paths: &'a AppPaths,
-    window: &'a MessageWindow,
-    store: ConfigStore,
+    shared: Rc<AppShared>,
     registry: ActionRegistry,
     notifier: TaskNotifier,
     exe: Option<PathBuf>,
-    hotkeys: RefCell<HotkeySet>,
     results_tx: Sender<TaskResult>,
     results_rx: Receiver<TaskResult>,
 }
@@ -98,9 +95,9 @@ impl<'a> Dispatcher<'a> {
     pub fn new(
         tray: &'a TrayIcon,
         paths: &'a AppPaths,
-        window: &'a MessageWindow,
-        store: ConfigStore,
+        shared: Rc<AppShared>,
         registry: ActionRegistry,
+        notifier: TaskNotifier,
     ) -> Self {
         let (results_tx, results_rx) = channel();
         let exe = match std::env::current_exe() {
@@ -113,12 +110,10 @@ impl<'a> Dispatcher<'a> {
         Self {
             tray,
             paths,
-            window,
-            store,
+            shared,
             registry,
-            notifier: window.task_notifier(),
+            notifier,
             exe,
-            hotkeys: RefCell::new(HotkeySet::default()),
             results_tx,
             results_rx,
         }
@@ -126,11 +121,11 @@ impl<'a> Dispatcher<'a> {
 
     /// 按当前配置注册热键，失败项合并成一条气泡并指明配置文件位置。
     pub fn install_hotkeys(&self) {
-        let config = self.store.snapshot();
-        let (set, failures) = HotkeySet::register(self.window, &config.hotkeys);
-        self.hotkeys.replace(set);
+        let config = self.shared.store.snapshot();
+        let (set, failures) = HotkeySet::register(self.shared.window, &config.hotkeys);
+        self.shared.hotkeys.replace(set);
         if !failures.is_empty() {
-            let text = hotkeys::failure_summary(&failures, self.store.path());
+            let text = hotkeys::failure_summary(&failures, self.shared.store.path());
             self.balloon(NotifyLevel::Warning, "lenswin", &text);
         }
     }
@@ -191,9 +186,9 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn show_menu(&self) -> LoopControl {
-        let mut config = self.store.snapshot();
+        let mut config = self.shared.store.snapshot();
         // 菜单显示实际生效的热键，而不是文件里可能被占用的写法
-        config.hotkeys = self.hotkeys.borrow().effective().clone();
+        config.hotkeys = self.shared.hotkeys.borrow().effective().clone();
         let menu = tray_menu::build(&config, &self.autostart_state());
         match self.tray.show_menu(&menu.items) {
             Ok(Some(id)) => match menu.action(id) {
@@ -235,6 +230,7 @@ impl<'a> Dispatcher<'a> {
                     shell::open_folder(&dir).err().map(|e| e.to_string())
                 });
             }
+            MenuAction::OpenSettings => self.open_settings(),
             MenuAction::ReloadConfig => self.reload_config(),
             MenuAction::Display => {}
         }
@@ -243,9 +239,25 @@ impl<'a> Dispatcher<'a> {
 
     /// 修改配置并交给 `ConfigStore`；被拒绝时提示原因。
     fn apply_change(&self, change: impl FnOnce(&mut Config)) {
-        if let Err(e) = self.store.update(change) {
+        if let Err(e) = self.shared.store.update(change) {
             log::warn!("配置未生效：{e}");
             self.balloon(NotifyLevel::Warning, "lenswin", &format!("配置未生效：{e}"));
+        }
+    }
+
+    /// 以 `--settings` 启动自身；设置窗口已打开时新进程会激活它后退出。
+    fn open_settings(&self) {
+        let Some(exe) = &self.exe else {
+            self.balloon(
+                NotifyLevel::Error,
+                "lenswin",
+                "无法确定程序路径，不能打开设置",
+            );
+            return;
+        };
+        if let Err(e) = std::process::Command::new(exe).arg(SETTINGS_ARG).spawn() {
+            log::error!("启动设置进程失败：{e}");
+            self.balloon(NotifyLevel::Error, "lenswin", &format!("无法打开设置：{e}"));
         }
     }
 
@@ -276,7 +288,7 @@ impl<'a> Dispatcher<'a> {
 
     /// 重新读取配置文件；热键变化时重注册，冲突则回滚旧热键。
     fn reload_config(&self) {
-        let reloaded = match self.store.reload() {
+        let reloaded = match self.shared.store.reload() {
             Ok(reloaded) => reloaded,
             Err(e) => {
                 log::warn!("重新加载配置失败：{e}");
@@ -289,12 +301,12 @@ impl<'a> Dispatcher<'a> {
             }
         };
         let (report, effective) = {
-            let mut set = self.hotkeys.borrow_mut();
-            let report = set.replace(self.window, &reloaded.current.hotkeys);
+            let mut set = self.shared.hotkeys.borrow_mut();
+            let report = set.replace(self.shared.window, &reloaded.current.hotkeys);
             (report, set.effective().clone())
         };
         // 退回只发生在内存里，不写文件：用户手写的配置保持原样，下次重新加载会再次尝试
-        match hotkeys::reload_summary(&report, &effective, self.store.path()) {
+        match hotkeys::reload_summary(&report, &effective, self.shared.store.path()) {
             None => self.balloon(NotifyLevel::Info, "lenswin", "配置已重新加载"),
             Some(text) => self.balloon(NotifyLevel::Warning, "lenswin", &text),
         }
@@ -328,7 +340,7 @@ impl<'a> Dispatcher<'a> {
 
     /// 圈选 → 隐私确认 → 在工作线程上传并打开搜索结果。
     fn search(&self) {
-        let mode = self.store.snapshot().search.selection_mode;
+        let mode = self.shared.store.snapshot().search.selection_mode;
         let Some(image) = self.pick_image(Command::Search, mode) else {
             return;
         };
@@ -345,7 +357,14 @@ impl<'a> Dispatcher<'a> {
         let Some(image) = self.pick_image(Command::ScreenshotCopy, SelectionMode::Rect) else {
             return;
         };
-        let save = !self.store.snapshot().screenshot.save_dir.trim().is_empty();
+        let save = !self
+            .shared
+            .store
+            .snapshot()
+            .screenshot
+            .save_dir
+            .trim()
+            .is_empty();
         let spare = save.then(|| image.clone());
         match self.registry.get(ActionKind::Copy) {
             Some(copy) => match copy.run(&self.context(), ActionInput::Image(image)) {
@@ -364,13 +383,13 @@ impl<'a> Dispatcher<'a> {
 
     fn context(&self) -> ActionContext {
         ActionContext {
-            config: self.store.snapshot(),
+            config: self.shared.store.snapshot(),
         }
     }
 
     /// 首次向某个图床上传前弹确认；确认后记入配置。
     fn ensure_upload_acknowledged(&self) -> bool {
-        let config = self.store.snapshot();
+        let config = self.shared.store.snapshot();
         let summary = match privacy_summary(&config.upload) {
             Ok(summary) => summary,
             Err(e) => {
@@ -446,7 +465,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn drain_results(&self) {
-        for message in self.store.drain_failures() {
+        for message in self.shared.store.drain_failures() {
             self.balloon(
                 NotifyLevel::Warning,
                 "lenswin",
@@ -509,7 +528,7 @@ impl<'a> Dispatcher<'a> {
                 return None;
             }
         };
-        let lasso = self.store.snapshot().selection.lasso;
+        let lasso = self.shared.store.snapshot().selection.lasso;
         let request = SelectRequest {
             frames: &frames,
             monitors: &monitors,
@@ -542,6 +561,11 @@ impl<'a> Dispatcher<'a> {
 
     /// 弹气泡；失败只记日志，不影响主流程。
     pub fn balloon(&self, level: NotifyLevel, title: &str, text: &str) {
+        // 关闭通知后只静音提示类，警告和错误仍要让用户看到
+        if level == NotifyLevel::Info && !self.shared.store.snapshot().general.notifications {
+            log::info!("通知已关闭，略过：{text}");
+            return;
+        }
         if let Err(e) = notify::balloon(self.tray, level, title, text) {
             log::error!("显示通知失败：{e}");
         }

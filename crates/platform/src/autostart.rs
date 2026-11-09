@@ -13,6 +13,9 @@ use crate::error::{PlatformError, win32};
 use crate::handle::RegKey;
 use crate::text::to_wide;
 
+/// 自启项在注册表里的值名。
+pub const VALUE_NAME: &str = "lenswin";
+
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// 自启项当前状态。

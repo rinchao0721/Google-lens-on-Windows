@@ -10,7 +10,7 @@ use windows::core::HRESULT;
 
 use crate::error::PlatformError;
 use crate::handle::discard;
-use crate::window::MessageWindow;
+use crate::window::WindowHandle;
 
 /// 已注册的热键，销毁时注销。
 pub struct HotkeyGuard {
@@ -34,7 +34,7 @@ fn modifier_flags(modifiers: Modifiers) -> HOT_KEY_MODIFIERS {
 
 /// 在消息窗口上注册热键；被其它程序占用时返回 [`PlatformError::HotkeyConflict`]。
 pub fn register(
-    window: &MessageWindow,
+    window: WindowHandle,
     id: i32,
     hotkey: &Hotkey,
 ) -> Result<HotkeyGuard, PlatformError> {

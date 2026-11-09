@@ -5,7 +5,7 @@ use std::path::Path;
 use lenswin_core::config::HotkeysConfig;
 use lenswin_core::hotkey::Hotkey;
 use lenswin_platform::hotkey::{self, HotkeyGuard};
-use lenswin_platform::window::MessageWindow;
+use lenswin_platform::window::WindowHandle;
 
 use crate::dispatcher::Command;
 
@@ -99,7 +99,7 @@ fn entries(config: &HotkeysConfig) -> [(Command, &str); 2] {
 }
 
 fn try_register(
-    window: &MessageWindow,
+    window: WindowHandle,
     command: Command,
     text: &str,
 ) -> Result<HotkeyGuard, Failure> {
@@ -133,7 +133,7 @@ pub struct HotkeySet {
 
 impl HotkeySet {
     /// 按配置注册；返回失败项。
-    pub fn register(window: &MessageWindow, config: &HotkeysConfig) -> (Self, Vec<Failure>) {
+    pub fn register(window: WindowHandle, config: &HotkeysConfig) -> (Self, Vec<Failure>) {
         let mut guards = Vec::new();
         let mut failures = Vec::new();
         for (command, text) in entries(config) {
@@ -168,7 +168,7 @@ impl HotkeySet {
 
     /// 换成配置文件里的新热键，逐键处理：改了且成功就采用，改了但失败就退回旧值，
     /// 没改的键保持原样。
-    pub fn replace(&mut self, window: &MessageWindow, new: &HotkeysConfig) -> ReplaceReport {
+    pub fn replace(&mut self, window: WindowHandle, new: &HotkeysConfig) -> ReplaceReport {
         let old = self.effective.clone();
         // 同一组合键不能重复注册，先全部注销再逐个尝试
         self.guards.clear();

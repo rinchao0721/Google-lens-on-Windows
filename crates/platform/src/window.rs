@@ -2,15 +2,17 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use lenswin_core::ipc::SECOND_INSTANCE_MESSAGE_OFFSET;
+use lenswin_core::ipc::{IpcResult, MAX_PAYLOAD_BYTES, SECOND_INSTANCE_MESSAGE_OFFSET};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassExW,
-    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_HOTKEY, WM_LBUTTONUP,
-    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_COPYDATA, WM_HOTKEY,
+    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -53,8 +55,64 @@ pub enum WindowEvent {
     TaskDone,
 }
 
+/// 处理跨进程提交的回调：参数为消息类型与负载，返回 [`IpcResult`] 的数值。
+type CopyDataHandler = Rc<dyn Fn(u32, &[u8]) -> u32>;
+
 thread_local! {
     static EVENTS: RefCell<VecDeque<WindowEvent>> = const { RefCell::new(VecDeque::new()) };
+    static COPYDATA_HANDLER: RefCell<Option<CopyDataHandler>> = const { RefCell::new(None) };
+}
+
+/// 登记处理 `WM_COPYDATA` 的回调，只对调用线程的消息窗口生效。
+///
+/// 回调在窗口过程里同步执行，发送方正阻塞等待返回值，所以只应做短小的工作，
+/// 且不得在其中弹出模态界面或持有跨调用的借用。
+pub fn set_copydata_handler(handler: impl Fn(u32, &[u8]) -> u32 + 'static) {
+    COPYDATA_HANDLER.with(|slot| slot.replace(Some(Rc::new(handler))));
+}
+
+/// 撤销 [`set_copydata_handler`] 登记的回调，让回调持有的资源能在消息循环结束后释放。
+pub fn clear_copydata_handler() {
+    // 线程退出阶段 TLS 已销毁时无需处理
+    match COPYDATA_HANDLER.try_with(|slot| slot.replace(None)) {
+        Ok(_) | Err(_) => {}
+    }
+}
+
+/// 解析 `WM_COPYDATA` 并交给回调；任何异常都返回对应结果码，不 panic。
+fn handle_copydata(lparam: LPARAM) -> u32 {
+    let reject = IpcResult::InvalidMessage.code();
+    let address = usize::try_from(lparam.0).unwrap_or(0);
+    if address == 0 {
+        return reject;
+    }
+    let data_ptr = std::ptr::with_exposed_provenance::<COPYDATASTRUCT>(address);
+    // SAFETY: WM_COPYDATA 的 lparam 在消息处理期间指向发送方构造的有效 COPYDATASTRUCT。
+    let data = unsafe { &*data_ptr };
+    let Ok(len) = usize::try_from(data.cbData) else {
+        return IpcResult::PayloadTooLarge.code();
+    };
+    if len > MAX_PAYLOAD_BYTES {
+        return IpcResult::PayloadTooLarge.code();
+    }
+    let payload: &[u8] = if len == 0 || data.lpData.is_null() {
+        &[]
+    } else {
+        // SAFETY: 系统保证 lpData 指向 cbData 字节的可读内存，且在本次消息处理期间有效；len 已校验。
+        unsafe { std::slice::from_raw_parts(data.lpData.cast::<u8>(), len) }
+    };
+    let Ok(kind) = u32::try_from(data.dwData) else {
+        return reject;
+    };
+    // 先取出回调再调用，避免回调内部再登记时与借用冲突
+    let handler = COPYDATA_HANDLER
+        .try_with(|slot| slot.try_borrow().ok().and_then(|h| h.clone()))
+        .ok()
+        .flatten();
+    match handler {
+        Some(handler) => handler(kind, payload),
+        None => reject,
+    }
 }
 
 fn enqueue(event: WindowEvent) {
@@ -166,11 +224,30 @@ impl MessageWindow {
         self.hwnd
     }
 
+    /// 可复制的窗口句柄数值，供不持有窗口本身的代码（如回调）注册热键。
+    pub fn handle(&self) -> WindowHandle {
+        WindowHandle {
+            hwnd: self.hwnd.0.expose_provenance(),
+        }
+    }
+
     /// 可跨线程使用的任务完成通知器。
     pub fn task_notifier(&self) -> TaskNotifier {
         TaskNotifier {
             hwnd: self.hwnd.0.expose_provenance(),
         }
+    }
+}
+
+/// 消息窗口句柄的数值副本，窗口销毁后不再有效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowHandle {
+    hwnd: usize,
+}
+
+impl WindowHandle {
+    pub(crate) fn hwnd(self) -> HWND {
+        HWND(std::ptr::with_exposed_provenance_mut(self.hwnd))
     }
 }
 
@@ -224,6 +301,10 @@ unsafe extern "system" fn wnd_proc(
                 }
                 _ => {}
             }
+        }
+        WM_COPYDATA => {
+            let code = handle_copydata(lparam);
+            return LRESULT(isize::try_from(code).unwrap_or(0));
         }
         WM_SECOND_INSTANCE => enqueue(WindowEvent::SecondInstance),
         WM_TASK_DONE => enqueue(WindowEvent::TaskDone),

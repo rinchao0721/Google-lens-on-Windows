@@ -240,6 +240,67 @@ impl Hotkey {
     }
 }
 
+/// 全部可选主键，供界面生成下拉列表：字母、数字、F1–F24、具名键。
+pub fn selectable_keys() -> Vec<Key> {
+    let letters = ('A'..='Z').map(Key::Letter);
+    let digits = (0..=9).map(Key::Digit);
+    let functions = (1..=24).map(Key::Function);
+    let named = NamedKey::ALL.into_iter().map(Key::Named);
+    letters
+        .chain(digits)
+        .chain(functions)
+        .chain(named)
+        .collect()
+}
+
+/// 界面上的快捷键编辑状态：四个修饰键复选框加一个主键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyChoice {
+    /// Ctrl。
+    pub ctrl: bool,
+    /// Alt。
+    pub alt: bool,
+    /// Shift。
+    pub shift: bool,
+    /// Windows 键。
+    pub win: bool,
+    /// 主键。
+    pub key: Key,
+}
+
+impl HotkeyChoice {
+    /// 由快捷键文字还原；文字无法解析时返回 `None`。
+    pub fn parse(text: &str) -> Option<Self> {
+        let hotkey: Hotkey = text.parse().ok()?;
+        let m = hotkey.modifiers();
+        Some(Self {
+            ctrl: m.contains(Modifiers::CTRL),
+            alt: m.contains(Modifiers::ALT),
+            shift: m.contains(Modifiers::SHIFT),
+            win: m.contains(Modifiers::WIN),
+            key: hotkey.key(),
+        })
+    }
+
+    /// 修饰键集合。
+    pub fn modifiers(&self) -> Modifiers {
+        [
+            (self.ctrl, Modifiers::CTRL),
+            (self.alt, Modifiers::ALT),
+            (self.shift, Modifiers::SHIFT),
+            (self.win, Modifiers::WIN),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .fold(Modifiers::NONE, |acc, (_, m)| acc.union(m))
+    }
+
+    /// 转成规范的快捷键文字；没有勾选任何修饰键时返回错误。
+    pub fn to_text(&self) -> Result<String, HotkeyError> {
+        Hotkey::new(self.modifiers(), self.key).map(|h| h.to_string())
+    }
+}
+
 fn parse_modifier(token: &str) -> Option<Modifiers> {
     match token.to_ascii_lowercase().as_str() {
         "ctrl" | "control" => Some(Modifiers::CTRL),
@@ -400,6 +461,44 @@ mod tests {
         assert_eq!(Key::Letter('a').vk_code(), None);
         assert_eq!(Key::Digit(10).vk_code(), None);
         assert_eq!(Key::Function(0).vk_code(), None);
+    }
+
+    #[test]
+    fn selectable_keys_are_unique_valid_and_parse_back() {
+        let keys = selectable_keys();
+        assert_eq!(keys.len(), 26 + 10 + 24 + NamedKey::ALL.len());
+        for (i, key) in keys.iter().enumerate() {
+            assert!(key.vk_code().is_some(), "{key}");
+            assert_eq!(keys.iter().position(|k| k == key), Some(i), "{key}");
+            let text = format!("Ctrl+{key}");
+            assert_eq!(parse(&text).expect("解析").key(), *key, "{text}");
+        }
+    }
+
+    #[test]
+    fn choice_roundtrips_default_and_custom_hotkeys() {
+        // 输出按 Ctrl、Alt、Shift、Win 的固定顺序，与输入顺序无关
+        for text in [
+            "Shift+Win+A",
+            "Ctrl+Alt+F13",
+            "Ctrl+Shift+PrintScreen",
+            "Alt+0",
+        ] {
+            let choice = HotkeyChoice::parse(text).expect("解析");
+            assert_eq!(choice.to_text().expect("生成"), text);
+        }
+        let default = HotkeyChoice::parse("Win+Shift+A").expect("解析");
+        assert_eq!(default.to_text().expect("生成"), "Shift+Win+A");
+        assert_eq!(HotkeyChoice::parse("bad"), None);
+        assert_eq!(HotkeyChoice::parse(""), None);
+    }
+
+    #[test]
+    fn choice_without_modifier_is_rejected() {
+        let mut choice = HotkeyChoice::parse("Ctrl+A").expect("解析");
+        choice.ctrl = false;
+        assert_eq!(choice.to_text(), Err(HotkeyError::NoModifier));
+        assert!(choice.modifiers().is_empty());
     }
 
     #[test]

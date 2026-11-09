@@ -17,6 +17,8 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+# 设置窗口专用；关闭默认特性，只开 glow 后端、内置字体与无障碍支持
+eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # 内部 crate
 lenswin-core = { path = "crates/core" }
 lenswin-platform = { path = "crates/platform" }

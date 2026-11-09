@@ -12,16 +12,29 @@ use crate::config_file::{self, ConfigState, LoadedConfig};
 
 /// 等待工作线程读完配置的上限。
 const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// 同步写盘的等待上限，需小于设置进程的发送超时。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 发给工作线程的任务。
 enum Job {
     Write {
         config: Box<Config>,
         state: ConfigState,
+        /// 需要同步得知写盘结果时给出回执通道；此时失败不再进入异步失败队列。
+        ack: Option<Sender<Result<(), String>>>,
     },
     Load {
         reply: Sender<LoadedConfig>,
     },
+}
+
+/// 同步应用失败的原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncApplyError {
+    /// 校验未通过，附带说明。
+    Invalid(String),
+    /// 写盘失败，附带说明；内存中的配置已经生效。
+    WriteFailed(String),
 }
 
 /// 重新加载成功后的结果。
@@ -67,12 +80,24 @@ fn run_worker(
                     log::warn!("配置读取结果无人接收");
                 }
             }
-            Job::Write { config, state } => {
-                if let Err(message) = config_file::persist(&path, state, &config) {
+            Job::Write { config, state, ack } => {
+                let result = config_file::persist(&path, state, &config);
+                if let Err(message) = &result {
                     log::warn!("保存配置失败：{message}");
-                    if failures.send(message).is_ok() {
-                        notify();
+                }
+                match (ack, result) {
+                    (Some(ack), result) => {
+                        if ack.send(result).is_err() {
+                            // 等待方已超时放弃，结果无人接收
+                            log::warn!("配置写盘回执无人接收");
+                        }
                     }
+                    (None, Err(message)) => {
+                        if failures.send(message).is_ok() {
+                            notify();
+                        }
+                    }
+                    (None, Ok(())) => {}
                 }
             }
         }
@@ -138,7 +163,26 @@ impl ConfigStore {
         self.send(Job::Write {
             config: Box::new(new),
             state: self.state.get(),
+            ack: None,
         })
+    }
+
+    /// 与 [`ConfigStore::apply`] 相同，但等写盘结果返回；用于需要把结果同步告知对方的场景。
+    pub fn apply_sync(&self, new: Config) -> Result<(), SyncApplyError> {
+        validate(&new).map_err(|issues| SyncApplyError::Invalid(describe_issues(&issues)))?;
+        self.current.replace(new.clone());
+        let (ack, answer) = channel();
+        self.send(Job::Write {
+            config: Box::new(new),
+            state: self.state.get(),
+            ack: Some(ack),
+        })
+        .map_err(SyncApplyError::WriteFailed)?;
+        match answer.recv_timeout(WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(SyncApplyError::WriteFailed(message)),
+            Err(_) => Err(SyncApplyError::WriteFailed("写盘超时".to_string())),
+        }
     }
 
     /// 在当前配置上做一处修改并应用。
@@ -218,6 +262,42 @@ mod tests {
             SelectionMode::Rect
         );
         drop(reopened);
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn apply_sync_reports_disk_result() {
+        let dir = temp_dir("sync");
+        let path = dir.join("config.toml");
+        let (store, _) = open(path.clone());
+        let mut next = Config::default();
+        next.search.selection_mode = SelectionMode::Rect;
+        assert_eq!(store.apply_sync(next.clone()), Ok(()));
+        let text = fs::read_to_string(&path).expect("读取");
+        assert_eq!(Config::from_toml_str(&text).expect("解析"), next);
+
+        let mut bad = next;
+        bad.upload.timeout_secs = 0;
+        assert!(matches!(
+            store.apply_sync(bad),
+            Err(SyncApplyError::Invalid(_))
+        ));
+        drop(store);
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn apply_sync_reports_write_failure_for_broken_file() {
+        let dir = temp_dir("syncbroken");
+        fs::create_dir_all(&dir).expect("目录");
+        let path = dir.join("config.toml");
+        fs::write(&path, "garbage ===").expect("写入");
+        let (store, _) = open(path.clone());
+        let result = store.apply_sync(Config::default());
+        assert!(matches!(result, Err(SyncApplyError::WriteFailed(_))));
+        assert!(store.drain_failures().is_empty());
+        drop(store);
+        assert_eq!(fs::read_to_string(&path).expect("读取"), "garbage ===");
         fs::remove_dir_all(&dir).expect("清理");
     }
 
