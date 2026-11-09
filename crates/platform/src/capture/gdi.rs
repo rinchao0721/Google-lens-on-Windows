@@ -10,15 +10,13 @@ use windows::Win32::Graphics::Gdi::{
 use super::{CaptureError, ScreenCapturer};
 use crate::error::{PlatformError, last_error};
 use crate::handle::{Bitmap, MemDc, ScreenDc, SelectGuard};
-use crate::monitor;
 
 /// GDI 捕获器。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GdiCapturer;
 
 impl ScreenCapturer for GdiCapturer {
-    fn capture_all(&self) -> Result<Vec<Frame>, CaptureError> {
-        let monitors = monitor::enumerate()?;
+    fn capture_all(&self, monitors: &[MonitorInfo]) -> Result<Vec<Frame>, CaptureError> {
         let screen = ScreenDc::acquire()?;
         monitors
             .iter()

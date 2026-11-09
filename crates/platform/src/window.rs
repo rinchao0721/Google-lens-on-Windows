@@ -63,16 +63,22 @@ fn enqueue(event: WindowEvent) {
     }
 }
 
-/// 丢弃尚未处理的事件，用于模态界面（如选区覆盖层）结束后清掉期间积压的热键。
-pub fn discard_pending_events() {
+/// 丢弃尚未处理的热键事件，用于模态界面（如选区覆盖层）结束后清掉期间积压的热键。
+///
+/// 其它事件（托盘重建、第二实例通知、托盘点击）原样保留。
+pub fn discard_pending_hotkeys() {
     let result = EVENTS.try_with(|queue| {
         if let Ok(mut queue) = queue.try_borrow_mut() {
-            queue.clear();
+            retain_non_hotkeys(&mut queue);
         }
     });
     match result {
         Ok(()) | Err(_) => {} // 线程退出阶段无事件可清
     }
+}
+
+fn retain_non_hotkeys(queue: &mut VecDeque<WindowEvent>) {
+    queue.retain(|event| !matches!(event, WindowEvent::Hotkey(_)));
 }
 
 /// 取出最早的待处理事件。
@@ -197,4 +203,41 @@ unsafe extern "system" fn wnd_proc(
     }
     // SAFETY: 参数原样来自系统传入的窗口消息。
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retain_non_hotkeys_drops_only_hotkeys() {
+        let mut queue = VecDeque::from([
+            WindowEvent::Hotkey(1),
+            WindowEvent::TaskbarCreated,
+            WindowEvent::Hotkey(2),
+            WindowEvent::SecondInstance,
+            WindowEvent::Tray(TrayMouse::RightClick),
+        ]);
+        retain_non_hotkeys(&mut queue);
+        assert_eq!(
+            Vec::from(queue),
+            vec![
+                WindowEvent::TaskbarCreated,
+                WindowEvent::SecondInstance,
+                WindowEvent::Tray(TrayMouse::RightClick),
+            ]
+        );
+    }
+
+    #[test]
+    fn discard_pending_hotkeys_keeps_other_events_in_queue() {
+        enqueue(WindowEvent::Hotkey(1));
+        enqueue(WindowEvent::TaskbarCreated);
+        enqueue(WindowEvent::Hotkey(2));
+        enqueue(WindowEvent::SecondInstance);
+        discard_pending_hotkeys();
+        assert_eq!(pop_event(), Some(WindowEvent::TaskbarCreated));
+        assert_eq!(pop_event(), Some(WindowEvent::SecondInstance));
+        assert_eq!(pop_event(), None);
+    }
 }

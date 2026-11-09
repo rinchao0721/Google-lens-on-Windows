@@ -10,6 +10,14 @@ use super::{Preview, SelectionTool};
 /// 轨迹点数上限，超出后忽略新点，防止长时间拖拽耗尽内存。
 const MAX_TRAIL_POINTS: usize = 50_000;
 
+/// 原始轨迹外接矩形的宽高都小于该值（物理像素）时视为误点，外扩之前判断。
+const MIN_TRAIL_SPAN: u32 = 4;
+
+/// 轨迹是否过小：宽和高都不足阈值。
+fn is_trail_too_small(points: &[Point]) -> bool {
+    Rect::bounding(points).is_none_or(|r| r.width < MIN_TRAIL_SPAN && r.height < MIN_TRAIL_SPAN)
+}
+
 struct Drag {
     points: Vec<Point>,
     monitor_bounds: Rect,
@@ -58,6 +66,9 @@ impl SelectionTool for LassoTool {
     fn release(&mut self, point: Point) -> Result<Selection, SelectionError> {
         let mut drag = self.drag.take().ok_or(SelectionError::EmptyLasso)?;
         push_point(&mut drag.points, point);
+        if is_trail_too_small(&drag.points) {
+            return Err(SelectionError::EmptyBounds);
+        }
         Selection::from_lasso(
             drag.points,
             self.padding,
@@ -71,12 +82,16 @@ impl SelectionTool for LassoTool {
         match &self.drag {
             Some(d) => Preview::Lasso {
                 trail: &d.points,
-                bounds: lasso_bounds(
-                    &d.points,
-                    self.padding,
-                    self.stroke_width,
-                    &d.monitor_bounds,
-                ),
+                bounds: if is_trail_too_small(&d.points) {
+                    None
+                } else {
+                    lasso_bounds(
+                        &d.points,
+                        self.padding,
+                        self.stroke_width,
+                        &d.monitor_bounds,
+                    )
+                },
             },
             None => Preview::None,
         }
@@ -97,6 +112,13 @@ mod tests {
             bounds: Rect::new(x, 0, 1920, 1080),
             dpi: 96,
             primary: true,
+        }
+    }
+
+    fn preview_bounds(tool: &LassoTool) -> Option<Rect> {
+        match tool.preview() {
+            Preview::Lasso { bounds, .. } => bounds,
+            _ => None,
         }
     }
 
@@ -184,6 +206,59 @@ mod tests {
         let mut tool = LassoTool::new(0, 1);
         tool.press(Point::new(50, 50), &monitor(0), 0);
         assert!(tool.release(Point::new(50, 50)).is_err());
+    }
+
+    #[test]
+    fn single_click_with_default_margin_is_invalid() {
+        let mut tool = LassoTool::new(10, 4);
+        tool.press(Point::new(50, 50), &monitor(0), 0);
+        assert_eq!(preview_bounds(&tool), None);
+        assert_eq!(
+            tool.release(Point::new(50, 50)).unwrap_err(),
+            SelectionError::EmptyBounds
+        );
+    }
+
+    #[test]
+    fn tiny_jitter_below_threshold_is_invalid() {
+        let mut tool = LassoTool::new(10, 4);
+        tool.press(Point::new(50, 50), &monitor(0), 0);
+        tool.drag(Point::new(52, 51));
+        tool.drag(Point::new(51, 53));
+        assert_eq!(preview_bounds(&tool), None);
+        assert_eq!(
+            tool.release(Point::new(50, 52)).unwrap_err(),
+            SelectionError::EmptyBounds
+        );
+    }
+
+    #[test]
+    fn trail_reaching_threshold_is_valid() {
+        let mut tool = LassoTool::new(10, 4);
+        tool.press(Point::new(50, 50), &monitor(0), 0);
+        tool.drag(Point::new(
+            50 + i32::try_from(MIN_TRAIL_SPAN).expect("阈值可放入 i32"),
+            50,
+        ));
+        assert!(preview_bounds(&tool).is_some());
+        let sel = tool.release(Point::new(50, 50)).expect("选区");
+        assert_eq!(sel.bounds(), Rect::new(38, 38, 28, 24));
+    }
+
+    #[test]
+    fn one_axis_beyond_threshold_is_valid() {
+        let mut tool = LassoTool::new(10, 4);
+        tool.press(Point::new(50, 50), &monitor(0), 0);
+        let sel = tool.release(Point::new(150, 50)).expect("选区");
+        assert_eq!(sel.bounds(), Rect::new(38, 38, 124, 24));
+    }
+
+    #[test]
+    fn trail_just_below_threshold_is_invalid() {
+        let mut tool = LassoTool::new(10, 4);
+        tool.press(Point::new(50, 50), &monitor(0), 0);
+        let below = i32::try_from(MIN_TRAIL_SPAN).expect("阈值可放入 i32") - 1;
+        assert!(tool.release(Point::new(50 + below, 50 + below)).is_err());
     }
 
     #[test]

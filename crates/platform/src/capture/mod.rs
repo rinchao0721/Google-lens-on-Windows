@@ -4,6 +4,7 @@ pub mod gdi;
 
 use lenswin_core::error::FrameError;
 use lenswin_core::frame::Frame;
+use lenswin_core::monitor::MonitorInfo;
 use thiserror::Error;
 
 use crate::error::PlatformError;
@@ -21,6 +22,8 @@ pub enum CaptureError {
 
 /// 屏幕捕获后端，MVP 用 GDI，录屏阶段再加 WGC。
 pub trait ScreenCapturer {
-    /// 一次性抓取所有显示器，每个显示器一帧，顺序与 [`crate::monitor::enumerate`] 一致。
-    fn capture_all(&self) -> Result<Vec<Frame>, CaptureError>;
+    /// 按调用方给定的显示器列表抓取，每个显示器一帧，顺序与列表一致。
+    ///
+    /// 列表由调用方枚举一次后传入，保证帧与显示器来自同一份拓扑。
+    fn capture_all(&self, monitors: &[MonitorInfo]) -> Result<Vec<Frame>, CaptureError>;
 }

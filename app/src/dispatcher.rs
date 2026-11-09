@@ -10,7 +10,7 @@ use lenswin_platform::monitor;
 use lenswin_platform::notify::{self, NotifyLevel};
 use lenswin_platform::paths::AppPaths;
 use lenswin_platform::tray::TrayIcon;
-use lenswin_platform::window::{TrayMouse, WindowEvent, discard_pending_events};
+use lenswin_platform::window::{TrayMouse, WindowEvent, discard_pending_hotkeys};
 
 use crate::tray_menu;
 
@@ -173,7 +173,7 @@ impl<'a> Dispatcher<'a> {
                 return;
             }
         };
-        let frames = match GdiCapturer.capture_all() {
+        let frames = match GdiCapturer.capture_all(&monitors) {
             Ok(frames) => frames,
             Err(e) => {
                 log::error!("截屏失败：{e}");
@@ -200,7 +200,7 @@ impl<'a> Dispatcher<'a> {
             }
         }
         // 覆盖层期间积压的热键不应在结束后再次触发
-        discard_pending_events();
+        discard_pending_hotkeys();
     }
 
     /// 弹气泡；失败只记日志，不影响主流程。

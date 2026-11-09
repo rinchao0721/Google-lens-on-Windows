@@ -38,6 +38,7 @@ pub struct Interaction {
     tool: Box<dyn SelectionTool>,
     monitors: Vec<MonitorInfo>,
     dragging: bool,
+    active_window: Option<usize>,
     outcome: Option<Outcome>,
 }
 
@@ -48,6 +49,7 @@ impl Interaction {
             tool,
             monitors,
             dragging: false,
+            active_window: None,
             outcome: None,
         }
     }
@@ -65,6 +67,7 @@ impl Interaction {
         };
         self.tool.press(point, monitor, window_index);
         self.dragging = true;
+        self.active_window = Some(window_index);
     }
 
     /// 拖拽中移动；`window_index` 是收到消息的窗口，鼠标捕获期间始终是起始窗口。
@@ -87,6 +90,7 @@ impl Interaction {
             return;
         }
         self.dragging = false;
+        self.active_window = None;
         let Some(point) = self
             .monitors
             .get(window_index)
@@ -104,6 +108,7 @@ impl Interaction {
     pub fn cancel(&mut self) {
         self.tool.reset();
         self.dragging = false;
+        self.active_window = None;
         if self.outcome.is_none() {
             self.outcome = Some(Outcome::Cancelled);
         }
@@ -112,6 +117,11 @@ impl Interaction {
     /// 是否正在拖拽。
     pub fn is_dragging(&self) -> bool {
         self.dragging
+    }
+
+    /// 正在拖拽时预览所在的窗口序号，即按下时的显示器。
+    pub fn active_window(&self) -> Option<usize> {
+        self.active_window
     }
 
     /// 已有结局。
@@ -203,6 +213,19 @@ mod tests {
     }
 
     #[test]
+    fn lasso_click_without_drag_keeps_overlay_open() {
+        let mut it = Interaction::new(Box::new(LassoTool::new(10, 4)), monitors());
+        it.press(1, (10, 10));
+        it.release(1, (10, 10));
+        assert!(!it.is_finished());
+        assert!(!it.is_dragging());
+        it.press(1, (10, 10));
+        it.drag(1, (12, 11));
+        it.release(1, (11, 12));
+        assert!(!it.is_finished());
+    }
+
+    #[test]
     fn lasso_flow_on_primary_monitor() {
         let mut it = Interaction::new(Box::new(LassoTool::new(10, 4)), monitors());
         it.press(1, (100, 100));
@@ -216,6 +239,21 @@ mod tests {
             }
             other => panic!("期望得到选区，实际为 {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_window_follows_drag_lifecycle() {
+        let mut it = Interaction::new(Box::new(RectTool::new()), monitors());
+        assert_eq!(it.active_window(), None);
+        it.press(1, (10, 10));
+        assert_eq!(it.active_window(), Some(1));
+        it.drag(0, (30, 30));
+        assert_eq!(it.active_window(), Some(1));
+        it.release(1, (10, 10));
+        assert_eq!(it.active_window(), None);
+        it.press(0, (10, 10));
+        it.cancel();
+        assert_eq!(it.active_window(), None);
     }
 
     #[test]

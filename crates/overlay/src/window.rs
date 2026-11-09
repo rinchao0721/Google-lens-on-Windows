@@ -65,6 +65,14 @@ impl Session {
         self.windows.iter().position(|s| s.hwnd == hwnd)
     }
 
+    fn invalidate_window(&self, index: usize) {
+        if let Some(slot) = self.windows.get(index) {
+            // 只是标记重绘区域，失败时下一次事件还会再标记
+            // SAFETY: hwnd 是本会话创建且仍存活的窗口。
+            discard(unsafe { InvalidateRect(Some(slot.hwnd), None, false) });
+        }
+    }
+
     fn invalidate_all(&self) {
         for slot in &self.windows {
             // 只是标记重绘区域，失败时下一次事件还会再标记
@@ -128,6 +136,7 @@ fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
             return;
         };
         let local = point_from_lparam(lparam.0);
+        let before = s.interaction.active_window();
         match event {
             Mouse::Down => {
                 s.interaction.press(index, local);
@@ -148,7 +157,14 @@ fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
                 }
             }
         }
-        s.invalidate_all();
+        // 预览只存在于按下时的显示器上，只重绘状态变化涉及的窗口
+        let after = s.interaction.active_window();
+        if let Some(i) = before {
+            s.invalidate_window(i);
+        }
+        if let Some(i) = after.filter(|i| Some(*i) != before) {
+            s.invalidate_window(i);
+        }
     });
 }
 
