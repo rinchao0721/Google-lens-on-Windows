@@ -204,6 +204,7 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         if self.ensure_upload_acknowledged() {
+            self.balloon(NotifyLevel::Info, "lenswin", "正在上传…");
             self.spawn(ActionKind::Search, "搜索", image);
         } else {
             log::info!("上传未获确认，已丢弃截图");
@@ -313,6 +314,7 @@ impl<'a> Dispatcher<'a> {
                     .err()
                     .map(|e| e.to_string());
                 if tx.send(TaskResult { label, error }).is_err() {
+                    // 接收端随主线程销毁，只会发生在退出阶段，没有人再需要结果
                     return;
                 }
                 if let Err(e) = notifier.notify() {

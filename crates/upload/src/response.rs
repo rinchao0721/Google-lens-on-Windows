@@ -7,12 +7,21 @@ use crate::UploadError;
 
 fn checked_url(candidate: &str) -> Result<String, UploadError> {
     let trimmed = candidate.trim();
-    if is_http_url(trimmed) {
+    let bad = || UploadError::BadResponse("返回内容不是 http(s) 地址".to_string());
+    if !is_http_url(trimmed) {
+        return Err(bad());
+    }
+    // 浏览器会把反斜杠当作路径分隔符，与字符串判断的主机不一致，直接拒绝
+    if trimmed.contains('\\') {
+        return Err(bad());
+    }
+    let parsed = reqwest::Url::parse(trimmed).map_err(|_| bad())?;
+    let scheme_ok = matches!(parsed.scheme(), "http" | "https");
+    let host_ok = parsed.host_str().is_some_and(|h| !h.is_empty());
+    if scheme_ok && host_ok {
         Ok(trimmed.to_string())
     } else {
-        Err(UploadError::BadResponse(
-            "返回内容不是 http(s) 地址".to_string(),
-        ))
+        Err(bad())
     }
 }
 
@@ -57,6 +66,28 @@ mod tests {
         ] {
             assert!(parse_text(body).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn text_rejects_odd_addresses() {
+        for body in [
+            "https://a.b\\evil.com/x",
+            "https:\\\\a.b/x",
+            "http://[::1/x",
+            "https://:80/x",
+            "https://a.b:99999/x",
+            "https://user@/x",
+        ] {
+            assert!(parse_text(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn text_keeps_original_spelling() {
+        assert_eq!(
+            parse_text("HTTPS://Files.Example.com/a.png?x=1").as_deref(),
+            Ok("HTTPS://Files.Example.com/a.png?x=1")
+        );
     }
 
     #[test]

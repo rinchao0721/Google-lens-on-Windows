@@ -1,6 +1,7 @@
 //! multipart 上传的共用实现；全局只建一个 `Client`。
 
-use std::io::Read;
+use std::error::Error;
+use std::io::{self, Read};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -44,14 +45,84 @@ pub(crate) fn check_size(size: usize, limit: u64) -> Result<(), UploadError> {
     }
 }
 
-fn describe(error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        "请求超时".to_string()
-    } else if error.is_connect() {
-        "无法连接到图床，请检查网络".to_string()
-    } else {
-        error.to_string()
+/// 从错误链中识别出的网络故障类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkFault {
+    Timeout,
+    Connect,
+    Dns,
+}
+
+impl NetworkFault {
+    fn message(self) -> &'static str {
+        match self {
+            NetworkFault::Timeout => "请求超时",
+            NetworkFault::Connect => "无法连接到图床，请检查网络",
+            NetworkFault::Dns => "无法解析图床域名，请检查网络或域名",
+        }
     }
+}
+
+fn io_fault(kind: io::ErrorKind) -> Option<NetworkFault> {
+    match kind {
+        io::ErrorKind::TimedOut => Some(NetworkFault::Timeout),
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NetworkDown => Some(NetworkFault::Connect),
+        _ => None,
+    }
+}
+
+/// 沿 `source()` 链判断故障类型；multipart 上传会把连接错误包进请求体错误里。
+fn classify_chain(error: &(dyn Error + 'static)) -> Option<NetworkFault> {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(r) = e.downcast_ref::<reqwest::Error>() {
+            if r.is_timeout() {
+                return Some(NetworkFault::Timeout);
+            }
+            if r.is_connect() {
+                return Some(NetworkFault::Connect);
+            }
+        }
+        if let Some(fault) = e
+            .downcast_ref::<io::Error>()
+            .and_then(|i| io_fault(i.kind()))
+        {
+            return Some(fault);
+        }
+        // hyper 的 DNS 失败只在文本里带 "dns error"
+        if e.to_string().contains("dns error") {
+            return Some(NetworkFault::Dns);
+        }
+        current = e.source();
+    }
+    None
+}
+
+/// 错误链最底层的文本。
+fn root_cause(error: &(dyn Error + 'static)) -> String {
+    let mut last = error;
+    while let Some(next) = last.source() {
+        last = next;
+    }
+    last.to_string()
+}
+
+fn describe_chain(error: &(dyn Error + 'static)) -> String {
+    match classify_chain(error) {
+        Some(fault) => fault.message().to_string(),
+        None => root_cause(error),
+    }
+}
+
+fn describe(error: &reqwest::Error) -> String {
+    describe_chain(error)
 }
 
 /// 发送 multipart 请求并返回响应正文。
@@ -129,6 +200,66 @@ mod tests {
             post(&req, &[0; 5], "a.png"),
             Err(UploadError::TooLarge { .. })
         ));
+    }
+
+    #[derive(Debug)]
+    struct Wrapped {
+        text: &'static str,
+        source: Box<dyn Error + Send + Sync>,
+    }
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl Error for Wrapped {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    fn wrapped(text: &'static str, source: io::Error) -> Wrapped {
+        Wrapped {
+            text,
+            source: Box::new(source),
+        }
+    }
+
+    #[test]
+    fn refused_connection_is_found_under_body_error() {
+        let e = wrapped(
+            "request or response body error",
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+        );
+        assert_eq!(classify_chain(&e), Some(NetworkFault::Connect));
+        assert_eq!(describe_chain(&e), "无法连接到图床，请检查网络");
+    }
+
+    #[test]
+    fn timeout_kind_is_recognised() {
+        let e = wrapped("body", io::Error::from(io::ErrorKind::TimedOut));
+        assert_eq!(classify_chain(&e), Some(NetworkFault::Timeout));
+        assert_eq!(describe_chain(&e), "请求超时");
+    }
+
+    #[test]
+    fn dns_failure_is_recognised_by_text() {
+        let e = Wrapped {
+            text: "outer",
+            source: Box::new(wrapped("dns error", io::Error::other("No such host"))),
+        };
+        assert_eq!(classify_chain(&e), Some(NetworkFault::Dns));
+    }
+
+    #[test]
+    fn unknown_error_shows_root_cause() {
+        let e = wrapped("request or response body error", io::Error::other("boom"));
+        assert_eq!(classify_chain(&e), None);
+        assert_eq!(describe_chain(&e), "boom");
+        let plain = io::Error::other("alone");
+        assert_eq!(describe_chain(&plain), "alone");
     }
 
     #[test]

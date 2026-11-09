@@ -8,6 +8,8 @@ mod dispatcher;
 mod logging;
 mod tray_menu;
 
+use std::path::Path;
+
 use anyhow::Context;
 use lenswin_actions::ActionRegistry;
 use lenswin_core::config::Config;
@@ -74,7 +76,7 @@ fn run() -> anyhow::Result<()> {
         dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
     }
 
-    let _hotkeys = register_hotkeys(&window, &config, &dispatcher);
+    let _hotkeys = register_hotkeys(&window, &config, &paths.config_file(), &dispatcher);
     if paths.mode == Mode::PortableFallback {
         dispatcher.balloon(
             NotifyLevel::Warning,
@@ -92,6 +94,7 @@ fn run() -> anyhow::Result<()> {
 fn register_hotkeys(
     window: &MessageWindow,
     config: &Config,
+    config_path: &Path,
     dispatcher: &Dispatcher<'_>,
 ) -> Vec<HotkeyGuard> {
     let entries = [
@@ -102,6 +105,7 @@ fn register_hotkeys(
         ),
     ];
     let mut guards = Vec::new();
+    let mut failures = Vec::new();
     for (command, text) in entries {
         let Some(id) = command.hotkey_id() else {
             continue;
@@ -117,13 +121,18 @@ fn register_hotkeys(
             }
             Err(reason) => {
                 log::warn!("热键 {text}（{}）注册失败：{reason}", command.label());
-                dispatcher.balloon(
-                    NotifyLevel::Warning,
-                    "lenswin",
-                    &format!("{} 的快捷键 {text} 注册失败：{reason}", command.label()),
-                );
+                failures.push(format!("{} {text}", command.label()));
             }
         }
+    }
+    if !failures.is_empty() {
+        // 气泡正文上限 255 个字符，路径放最前以免被截断
+        let text = format!(
+            "快捷键被占用或无效，可在配置文件中修改：{}\n注册失败：{}",
+            config_path.display(),
+            failures.join("、")
+        );
+        dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
     }
     guards
 }

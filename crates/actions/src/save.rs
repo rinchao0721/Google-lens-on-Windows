@@ -32,14 +32,26 @@ fn numbered_name(name: &str, n: u32) -> String {
     }
 }
 
+/// 写入失败时删除刚创建的文件，避免留下半截 PNG。
+fn write_or_cleanup<W: Write>(mut writer: W, path: &Path, bytes: &[u8]) -> Result<(), ActionError> {
+    let Err(e) = writer.write_all(bytes) else {
+        return Ok(());
+    };
+    // 先释放句柄再删，Windows 下占用中的文件无法删除
+    drop(writer);
+    if let Err(remove_err) = fs::remove_file(path) {
+        log::warn!("清理未写完的文件 {} 失败：{remove_err}", path.display());
+    }
+    Err(ActionError::Failed(format!("写入文件失败：{e}")))
+}
+
 /// 以「不覆盖已有文件」的方式写入，重名时递增序号。
 fn write_unique(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, ActionError> {
     for n in 0..MAX_NAME_ATTEMPTS {
         let path = dir.join(numbered_name(name, n));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(bytes)
-                    .map_err(|e| ActionError::Failed(format!("写入文件失败：{e}")))?;
+            Ok(file) => {
+                write_or_cleanup(file, &path, bytes)?;
                 return Ok(path);
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
@@ -118,6 +130,30 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(fs::read(&first).expect("读取"), b"one");
         assert_eq!(fs::read(&second).expect("读取"), b"two");
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("磁盘已满"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_write_removes_the_created_file() {
+        let dir = temp_dir("cleanup");
+        fs::create_dir_all(&dir).expect("创建目录");
+        let path = dir.join("half.png");
+        fs::write(&path, b"").expect("预置文件");
+        let err = write_or_cleanup(FailingWriter, &path, b"data");
+        assert!(matches!(err, Err(ActionError::Failed(_))));
+        assert!(!path.exists());
         fs::remove_dir_all(&dir).expect("清理");
     }
 

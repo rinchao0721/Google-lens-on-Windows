@@ -187,10 +187,16 @@ fn check_selection(config: &Config, issues: &mut Vec<ValidationIssue>) {
 }
 
 fn check_misc(config: &Config, issues: &mut Vec<ValidationIssue>) {
-    if config.screenshot.save_dir.chars().any(char::is_control) {
+    let save_dir = config.screenshot.save_dir.trim();
+    if save_dir.chars().any(char::is_control) {
         issues.push(ValidationIssue::new(
             "screenshot.save_dir",
             "路径含有非法字符",
+        ));
+    } else if !save_dir.is_empty() && !std::path::Path::new(save_dir).is_absolute() {
+        issues.push(ValidationIssue::new(
+            "screenshot.save_dir",
+            "保存目录必须是绝对路径",
         ));
     }
     let host = &config.privacy.acknowledged_host;
@@ -377,6 +383,19 @@ mod tests {
             fields(&c),
             vec!["screenshot.save_dir", "privacy.acknowledged_host"]
         );
+    }
+
+    #[test]
+    fn save_dir_must_be_absolute_when_set() {
+        let mut c = Config::default();
+        for ok in ["", "   ", "D:\\shots", "C:\\Users\\a b\\Pictures"] {
+            c.screenshot.save_dir = ok.to_string();
+            assert!(fields(&c).is_empty(), "{ok}");
+        }
+        for bad in ["shots", ".\\shots", "..\\shots", "\\shots", "D:shots"] {
+            c.screenshot.save_dir = bad.to_string();
+            assert_eq!(fields(&c), vec!["screenshot.save_dir"], "{bad}");
+        }
     }
 
     #[test]
