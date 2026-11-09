@@ -84,6 +84,8 @@ name = "lenswin-overlay"
 version = "0.1.0"
 dependencies = [
  "lenswin-core",
+ "thiserror",
+ "windows",
 ]
 
 [[package]]

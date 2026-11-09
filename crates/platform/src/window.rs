@@ -63,6 +63,18 @@ fn enqueue(event: WindowEvent) {
     }
 }
 
+/// 丢弃尚未处理的事件，用于模态界面（如选区覆盖层）结束后清掉期间积压的热键。
+pub fn discard_pending_events() {
+    let result = EVENTS.try_with(|queue| {
+        if let Ok(mut queue) = queue.try_borrow_mut() {
+            queue.clear();
+        }
+    });
+    match result {
+        Ok(()) | Err(_) => {} // 线程退出阶段无事件可清
+    }
+}
+
 /// 取出最早的待处理事件。
 pub(crate) fn pop_event() -> Option<WindowEvent> {
     EVENTS

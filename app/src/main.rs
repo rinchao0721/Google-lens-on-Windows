@@ -62,7 +62,7 @@ fn run() -> anyhow::Result<()> {
     let config = Config::default();
     let window = MessageWindow::create(TRAY_WINDOW_CLASS).context("创建消息窗口失败")?;
     let tray = TrayIcon::add(&window, "lenswin").context("添加托盘图标失败")?;
-    let dispatcher = Dispatcher::new(&tray, &paths, config.hotkeys.clone());
+    let dispatcher = Dispatcher::new(&tray, &paths, config.clone());
 
     let _hotkeys = register_hotkeys(&window, &config, &dispatcher);
     if paths.mode == Mode::PortableFallback {

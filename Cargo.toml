@@ -32,6 +32,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 simplelog = { version = "0.12.2", default-features = false, features = ["local-offset"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Com",

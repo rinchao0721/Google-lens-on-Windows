@@ -1,11 +1,16 @@
 //! 热键、托盘事件到命令的路由。
 
-use lenswin_core::config::HotkeysConfig;
+use lenswin_core::config::Config;
+use lenswin_core::selection::SelectionMode;
+use lenswin_overlay::SelectRequest;
+use lenswin_platform::capture::ScreenCapturer;
+use lenswin_platform::capture::gdi::GdiCapturer;
 use lenswin_platform::message_loop::LoopControl;
+use lenswin_platform::monitor;
 use lenswin_platform::notify::{self, NotifyLevel};
 use lenswin_platform::paths::AppPaths;
 use lenswin_platform::tray::TrayIcon;
-use lenswin_platform::window::{TrayMouse, WindowEvent};
+use lenswin_platform::window::{TrayMouse, WindowEvent, discard_pending_events};
 
 use crate::tray_menu;
 
@@ -76,16 +81,16 @@ impl Command {
 pub struct Dispatcher<'a> {
     tray: &'a TrayIcon,
     paths: &'a AppPaths,
-    hotkeys: HotkeysConfig,
+    config: Config,
 }
 
 impl<'a> Dispatcher<'a> {
     /// 构造分发器。
-    pub fn new(tray: &'a TrayIcon, paths: &'a AppPaths, hotkeys: HotkeysConfig) -> Self {
+    pub fn new(tray: &'a TrayIcon, paths: &'a AppPaths, config: Config) -> Self {
         Self {
             tray,
             paths,
-            hotkeys,
+            config,
         }
     }
 
@@ -116,7 +121,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn show_menu(&self) -> LoopControl {
-        match self.tray.show_menu(&tray_menu::items(&self.hotkeys)) {
+        match self.tray.show_menu(&tray_menu::items(&self.config.hotkeys)) {
             Ok(Some(id)) => match Command::from_menu_id(id) {
                 Some(command) => self.run(command),
                 None => {
@@ -134,8 +139,12 @@ impl<'a> Dispatcher<'a> {
 
     fn run(&self, command: Command) -> LoopControl {
         match command {
-            Command::Search | Command::ScreenshotCopy => {
-                log::info!("触发命令：{}", command.label());
+            Command::Search => {
+                self.pick_region(command, self.config.search.selection_mode);
+                LoopControl::Continue
+            }
+            Command::ScreenshotCopy => {
+                self.pick_region(command, SelectionMode::Rect);
                 LoopControl::Continue
             }
             Command::About => {
@@ -152,6 +161,46 @@ impl<'a> Dispatcher<'a> {
                 LoopControl::Quit
             }
         }
+    }
+
+    /// 冻结屏幕并让用户选区；M4 起由 actions 接手后续动作，目前只记录选区结果。
+    fn pick_region(&self, command: Command, mode: SelectionMode) {
+        log::info!("触发命令：{}", command.label());
+        let monitors = match monitor::enumerate() {
+            Ok(list) => list,
+            Err(e) => {
+                log::error!("枚举显示器失败：{e}");
+                return;
+            }
+        };
+        let frames = match GdiCapturer.capture_all() {
+            Ok(frames) => frames,
+            Err(e) => {
+                log::error!("截屏失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("截屏失败：{e}"));
+                return;
+            }
+        };
+        let request = SelectRequest {
+            frames: &frames,
+            monitors: &monitors,
+            mode,
+            lasso: &self.config.selection.lasso,
+        };
+        match lenswin_overlay::select(&request) {
+            Ok(Some(selection)) => log::info!(
+                "选区完成：范围 {:?}，显示器 {}",
+                selection.bounds(),
+                selection.monitor_index()
+            ),
+            Ok(None) => log::info!("选区已取消"),
+            Err(e) => {
+                log::error!("选区失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
+            }
+        }
+        // 覆盖层期间积压的热键不应在结束后再次触发
+        discard_pending_events();
     }
 
     /// 弹气泡；失败只记日志，不影响主流程。
