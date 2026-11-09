@@ -5,8 +5,9 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, GetCursorPos, IDI_APPLICATION, LoadIconW, MF_SEPARATOR, MF_STRING, PostMessageW,
-    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+    AppendMenuW, GetCursorPos, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
 };
 use windows::core::PCWSTR;
 
@@ -18,18 +19,116 @@ use crate::window::{MessageWindow, WM_TRAY};
 /// 托盘图标在窗口内的标识。
 const TRAY_ICON_UID: u32 = 1;
 
+/// 子菜单最多嵌套的层数。
+const MAX_MENU_DEPTH: usize = 4;
+
 /// 托盘菜单项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
-    /// 可点击项，`id` 必须大于 0。
+    /// 可点击项，`id` 必须大于 0 且在整棵菜单中唯一。
     Entry {
         /// 选中后返回的命令号。
         id: u16,
         /// 显示文字。
         label: String,
+        /// 是否带勾选标记。
+        checked: bool,
+        /// 是否可点击；不可点击时灰显。
+        enabled: bool,
+    },
+    /// 子菜单。
+    Submenu {
+        /// 显示文字。
+        label: String,
+        /// 子项。
+        items: Vec<MenuItem>,
     },
     /// 分隔线。
     Separator,
+}
+
+impl MenuItem {
+    /// 普通可点击项，未勾选。
+    pub fn entry(id: u16, label: impl Into<String>) -> Self {
+        MenuItem::Entry {
+            id,
+            label: label.into(),
+            checked: false,
+            enabled: true,
+        }
+    }
+}
+
+/// 校验菜单：命令号必须非 0 且全局唯一，嵌套不能过深。
+fn check_items(items: &[MenuItem], seen: &mut Vec<u16>, depth: usize) -> Result<(), PlatformError> {
+    if depth > MAX_MENU_DEPTH {
+        return Err(PlatformError::Invalid("菜单嵌套过深".to_string()));
+    }
+    for item in items {
+        match item {
+            MenuItem::Entry { id, .. } => {
+                if *id == 0 {
+                    return Err(PlatformError::Invalid("菜单项 id 不能为 0".to_string()));
+                }
+                if seen.contains(id) {
+                    return Err(PlatformError::Invalid(format!("菜单项 id {id} 重复")));
+                }
+                seen.push(*id);
+            }
+            MenuItem::Submenu { items, .. } => check_items(items, seen, depth + 1)?,
+            MenuItem::Separator => {}
+        }
+    }
+    Ok(())
+}
+
+/// 把菜单项逐个加入 `menu`，子菜单递归创建。
+fn append_items(menu: &PopupMenu, items: &[MenuItem]) -> Result<(), PlatformError> {
+    for item in items {
+        match item {
+            MenuItem::Entry {
+                id,
+                label,
+                checked,
+                enabled,
+            } => {
+                let mut flags = MF_STRING;
+                if *checked {
+                    flags |= MF_CHECKED;
+                }
+                if !*enabled {
+                    flags |= MF_GRAYED;
+                }
+                let wide = to_wide(label);
+                // SAFETY: wide 在调用期间有效，菜单由 PopupMenu 持有。
+                unsafe { AppendMenuW(menu.raw(), flags, usize::from(*id), PCWSTR(wide.as_ptr())) }
+                    .map_err(win32("AppendMenuW"))?;
+            }
+            MenuItem::Submenu { label, items } => {
+                let child = PopupMenu::create()?;
+                append_items(&child, items)?;
+                let wide = to_wide(label);
+                // SAFETY: MF_POPUP 下第三个参数是子菜单句柄，child 在此之前保持有效。
+                unsafe {
+                    AppendMenuW(
+                        menu.raw(),
+                        MF_POPUP | MF_STRING,
+                        child.raw().0.addr(),
+                        PCWSTR(wide.as_ptr()),
+                    )
+                }
+                .map_err(win32("AppendMenuW"))?;
+                // 成功后子菜单归父菜单所有，随父菜单销毁
+                child.into_parent_owned();
+            }
+            MenuItem::Separator => {
+                // SAFETY: 分隔线不需要文字，菜单由 PopupMenu 持有。
+                unsafe { AppendMenuW(menu.raw(), MF_SEPARATOR, 0, PCWSTR::null()) }
+                    .map_err(win32("AppendMenuW"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 托盘图标，销毁时从系统托盘移除。
@@ -82,32 +181,9 @@ impl TrayIcon {
 
     /// 在光标处弹出菜单，返回选中项的 `id`；点空白处取消时返回 `None`。
     pub fn show_menu(&self, items: &[MenuItem]) -> Result<Option<u16>, PlatformError> {
+        check_items(items, &mut Vec::new(), 0)?;
         let menu = PopupMenu::create()?;
-        for item in items {
-            match item {
-                MenuItem::Entry { id, label } => {
-                    if *id == 0 {
-                        return Err(PlatformError::Invalid("菜单项 id 不能为 0".to_string()));
-                    }
-                    let wide = to_wide(label);
-                    // SAFETY: wide 在调用期间有效，菜单由 PopupMenu 持有。
-                    unsafe {
-                        AppendMenuW(
-                            menu.raw(),
-                            MF_STRING,
-                            usize::from(*id),
-                            PCWSTR(wide.as_ptr()),
-                        )
-                    }
-                    .map_err(win32("AppendMenuW"))?;
-                }
-                MenuItem::Separator => {
-                    // SAFETY: 分隔线不需要文字，菜单由 PopupMenu 持有。
-                    unsafe { AppendMenuW(menu.raw(), MF_SEPARATOR, 0, PCWSTR::null()) }
-                        .map_err(win32("AppendMenuW"))?;
-                }
-            }
-        }
+        append_items(&menu, items)?;
         let mut cursor = POINT::default();
         // SAFETY: cursor 是有效的局部变量。
         unsafe { GetCursorPos(&mut cursor) }.map_err(win32("GetCursorPos"))?;
@@ -146,5 +222,44 @@ impl Drop for TrayIcon {
         // Drop 中无法上报错误，移除失败时系统会在鼠标划过后清理残留图标
         // SAFETY: nid 已按要求填充 cbSize、hWnd 与 uID。
         discard(unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(items: Vec<MenuItem>) -> MenuItem {
+        MenuItem::Submenu {
+            label: "s".to_string(),
+            items,
+        }
+    }
+
+    #[test]
+    fn valid_nested_menu_passes() {
+        let items = vec![
+            MenuItem::entry(1, "a"),
+            MenuItem::Separator,
+            sub(vec![MenuItem::entry(2, "b"), MenuItem::entry(3, "c")]),
+        ];
+        assert!(check_items(&items, &mut Vec::new(), 0).is_ok());
+    }
+
+    #[test]
+    fn zero_and_duplicate_ids_are_rejected() {
+        let zero = vec![MenuItem::entry(0, "a")];
+        assert!(check_items(&zero, &mut Vec::new(), 0).is_err());
+        let dup = vec![MenuItem::entry(1, "a"), sub(vec![MenuItem::entry(1, "b")])];
+        assert!(check_items(&dup, &mut Vec::new(), 0).is_err());
+    }
+
+    #[test]
+    fn too_deep_nesting_is_rejected() {
+        let mut item = MenuItem::entry(1, "leaf");
+        for _ in 0..=MAX_MENU_DEPTH {
+            item = sub(vec![item]);
+        }
+        assert!(check_items(&[item], &mut Vec::new(), 0).is_err());
     }
 }

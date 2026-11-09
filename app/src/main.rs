@@ -4,19 +4,16 @@
 #![windows_subsystem = "windows"]
 
 mod config_file;
+mod config_store;
 mod dispatcher;
+mod hotkeys;
 mod logging;
 mod tray_menu;
 
-use std::path::Path;
-
 use anyhow::Context;
 use lenswin_actions::ActionRegistry;
-use lenswin_core::config::Config;
-use lenswin_core::hotkey::Hotkey;
 use lenswin_core::ipc::{TRAY_MUTEX_NAME, TRAY_WINDOW_CLASS};
 use lenswin_platform::clipboard::ClipboardOwner;
-use lenswin_platform::hotkey::{self, HotkeyGuard};
 use lenswin_platform::notify::NotifyLevel;
 use lenswin_platform::paths::{AppPaths, Mode};
 use lenswin_platform::single_instance::{self, Acquired};
@@ -24,7 +21,8 @@ use lenswin_platform::tray::TrayIcon;
 use lenswin_platform::window::MessageWindow;
 use lenswin_platform::{dpi, message_loop};
 
-use crate::dispatcher::{Command, Dispatcher};
+use crate::config_store::ConfigStore;
+use crate::dispatcher::Dispatcher;
 
 fn main() {
     if let Err(err) = run() {
@@ -63,20 +61,25 @@ fn run() -> anyhow::Result<()> {
         log::debug!("设置 DPI 感知未生效（可能已由 manifest 声明）：{e}");
     }
 
-    // 热更新与统一写入在 M5 由 ConfigStore 接管，此处只在启动时读取一次
-    let loaded = config_file::load(&paths.config_file());
-    let config = loaded.config.clone();
-    let notice = loaded.notice.clone();
     let window = MessageWindow::create(TRAY_WINDOW_CLASS).context("创建消息窗口失败")?;
+    let notifier = window.task_notifier();
+    let (store, notice) = ConfigStore::open(paths.config_file(), move || {
+        if let Err(e) = notifier.notify() {
+            log::error!("通知主线程配置写盘结果失败：{e}");
+        }
+    })
+    .map_err(anyhow::Error::msg)
+    .context("启动配置中心失败")?;
     let tray = TrayIcon::add(&window, "lenswin").context("添加托盘图标失败")?;
     let registry = ActionRegistry::new(ClipboardOwner::of(&window));
-    let dispatcher = Dispatcher::new(&tray, &paths, loaded, registry, window.task_notifier());
+    let dispatcher = Dispatcher::new(&tray, &paths, &window, store, registry);
     if let Some(text) = notice {
         log::warn!("{text}");
         dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
     }
 
-    let _hotkeys = register_hotkeys(&window, &config, &paths.config_file(), &dispatcher);
+    dispatcher.install_hotkeys();
+    dispatcher.check_autostart();
     if paths.mode == Mode::PortableFallback {
         dispatcher.balloon(
             NotifyLevel::Warning,
@@ -88,51 +91,4 @@ fn run() -> anyhow::Result<()> {
     message_loop::run(|event| dispatcher.handle(event)).context("消息循环异常")?;
     log::info!("lenswin 退出");
     Ok(())
-}
-
-/// 注册全部热键；单个失败只提示并跳过，不影响其它功能。
-fn register_hotkeys(
-    window: &MessageWindow,
-    config: &Config,
-    config_path: &Path,
-    dispatcher: &Dispatcher<'_>,
-) -> Vec<HotkeyGuard> {
-    let entries = [
-        (Command::Search, config.hotkeys.search.as_str()),
-        (
-            Command::ScreenshotCopy,
-            config.hotkeys.screenshot_copy.as_str(),
-        ),
-    ];
-    let mut guards = Vec::new();
-    let mut failures = Vec::new();
-    for (command, text) in entries {
-        let Some(id) = command.hotkey_id() else {
-            continue;
-        };
-        let registered = text
-            .parse::<Hotkey>()
-            .map_err(|e| e.to_string())
-            .and_then(|h| hotkey::register(window, id, &h).map_err(|e| e.to_string()));
-        match registered {
-            Ok(guard) => {
-                log::info!("已注册热键 {text}（{}）", command.label());
-                guards.push(guard);
-            }
-            Err(reason) => {
-                log::warn!("热键 {text}（{}）注册失败：{reason}", command.label());
-                failures.push(format!("{} {text}", command.label()));
-            }
-        }
-    }
-    if !failures.is_empty() {
-        // 气泡正文上限 255 个字符，路径放最前以免被截断
-        let text = format!(
-            "快捷键被占用或无效，可在配置文件中修改：{}\n注册失败：{}",
-            config_path.display(),
-            failures.join("、")
-        );
-        dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
-    }
-    guards
 }

@@ -1,14 +1,20 @@
 //! Win32 句柄的 RAII 包装，在 `Drop` 中释放。
 
-use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC,
     HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, RegCloseKey, RegCreateKeyExW,
+    RegOpenKeyExW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu, HMENU};
 
 use crate::error::{PlatformError, last_error, win32};
+use crate::text::to_wide;
+use windows::core::PCWSTR;
 
 /// 显式丢弃 `Drop` 中无法处理的返回值。
 pub(crate) fn discard<T>(_value: T) {}
@@ -160,6 +166,11 @@ impl PopupMenu {
     pub fn raw(&self) -> HMENU {
         self.0
     }
+
+    /// 菜单已作为子菜单交给父菜单后调用，父菜单销毁时会一并销毁，此处不再释放。
+    pub(crate) fn into_parent_owned(self) {
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for PopupMenu {
@@ -203,5 +214,67 @@ impl Drop for GlobalMem {
             // SAFETY: 句柄由 GlobalAlloc 分配且所有权仍在本对象手中。
             discard(unsafe { GlobalFree(Some(handle)) });
         }
+    }
+}
+
+/// `HKEY_CURRENT_USER` 下的注册表项。
+pub struct RegKey(HKEY);
+
+impl RegKey {
+    /// 打开（不存在则创建）子项。
+    pub fn create(subkey: &str, access: REG_SAM_FLAGS) -> Result<Self, PlatformError> {
+        let wide = to_wide(subkey);
+        let mut key = HKEY::default();
+        // SAFETY: wide 以 NUL 结尾且在调用期间有效，key 是有效的输出变量。
+        unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(wide.as_ptr()),
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                access,
+                None,
+                &mut key,
+                None,
+            )
+        }
+        .ok()
+        .map_err(win32("RegCreateKeyExW"))?;
+        Ok(Self(key))
+    }
+
+    /// 打开已存在的子项；子项不存在时返回 `Ok(None)`。
+    pub fn open(subkey: &str, access: REG_SAM_FLAGS) -> Result<Option<Self>, PlatformError> {
+        let wide = to_wide(subkey);
+        let mut key = HKEY::default();
+        // SAFETY: wide 以 NUL 结尾且在调用期间有效，key 是有效的输出变量。
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(wide.as_ptr()),
+                None,
+                access,
+                &mut key,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        status.ok().map_err(win32("RegOpenKeyExW"))?;
+        Ok(Some(Self(key)))
+    }
+
+    /// 原始句柄，借用期间不得关闭。
+    pub fn raw(&self) -> HKEY {
+        self.0
+    }
+}
+
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        // Drop 中无法上报错误，关闭失败只会泄漏一个句柄
+        // SAFETY: 句柄由 RegCreateKeyExW / RegOpenKeyExW 取得，仅在此处关闭一次。
+        discard(unsafe { RegCloseKey(self.0) });
     }
 }

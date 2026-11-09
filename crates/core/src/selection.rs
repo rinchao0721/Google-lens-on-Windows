@@ -16,6 +16,19 @@ pub enum SelectionMode {
     Lasso,
 }
 
+impl SelectionMode {
+    /// 全部取值，供界面生成选项。
+    pub const ALL: [SelectionMode; 2] = [SelectionMode::Lasso, SelectionMode::Rect];
+
+    /// 面向用户的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            SelectionMode::Rect => "矩形",
+            SelectionMode::Lasso => "圈选",
+        }
+    }
+}
+
 /// 选区形状。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionShape {
@@ -102,6 +115,13 @@ mod tests {
 
     fn monitor() -> Rect {
         Rect::new(0, 0, 1920, 1080)
+    }
+
+    #[test]
+    fn mode_list_covers_every_variant_with_distinct_labels() {
+        assert!(SelectionMode::ALL.contains(&SelectionMode::Rect));
+        assert!(SelectionMode::ALL.contains(&SelectionMode::Lasso));
+        assert_ne!(SelectionMode::Rect.label(), SelectionMode::Lasso.label());
     }
 
     #[test]

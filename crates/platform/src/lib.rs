@@ -2,6 +2,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod autostart;
 pub mod capture;
 pub mod clipboard;
 pub mod clock;

@@ -52,6 +52,13 @@ pub const SEARCH_ENGINE_PRESETS: [SearchEnginePreset; 4] = [
     },
 ];
 
+/// 地址模板恰好等于某个预置时返回其序号；自定义模板返回 `None`。
+pub fn preset_index_of(template: &str) -> Option<usize> {
+    SEARCH_ENGINE_PRESETS
+        .iter()
+        .position(|preset| preset.url_template == template)
+}
+
 /// 顶层配置。缺失的段和字段使用默认值，未知字段视为错误。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -188,6 +195,16 @@ impl LitterboxExpiry {
         LitterboxExpiry::Hours72,
     ];
 
+    /// 面向用户的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            LitterboxExpiry::Hours1 => "1 小时",
+            LitterboxExpiry::Hours12 => "12 小时",
+            LitterboxExpiry::Hours24 => "24 小时",
+            LitterboxExpiry::Hours72 => "72 小时",
+        }
+    }
+
     /// 图床接口使用的取值，如 `1h`。
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -308,6 +325,25 @@ mod tests {
         assert!(!privacy.is_acknowledged(""));
         assert!(!PrivacyConfig::default().is_acknowledged(""));
         assert!(!PrivacyConfig::default().is_acknowledged("uguu.se"));
+    }
+
+    #[test]
+    fn preset_index_matches_only_exact_templates() {
+        for (i, preset) in SEARCH_ENGINE_PRESETS.iter().enumerate() {
+            assert_eq!(preset_index_of(preset.url_template), Some(i));
+        }
+        assert_eq!(preset_index_of("https://example.com/?u={url}"), None);
+        assert_eq!(preset_index_of(""), None);
+    }
+
+    #[test]
+    fn expiry_labels_are_distinct_and_match_all() {
+        let labels: Vec<_> = LitterboxExpiry::ALL.iter().map(|e| e.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), LitterboxExpiry::ALL.len());
+        assert_eq!(labels.first(), Some(&"1 小时"));
     }
 
     #[test]

@@ -1,13 +1,16 @@
 //! 热键、托盘事件到命令的路由。
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::ActionRegistry;
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
+use lenswin_core::config::{Config, HotkeysConfig, SEARCH_ENGINE_PRESETS};
 use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::selection::{Selection, SelectionMode};
 use lenswin_overlay::SelectRequest;
+use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::ScreenCapturer;
 use lenswin_platform::capture::gdi::GdiCapturer;
 use lenswin_platform::dialog;
@@ -15,12 +18,19 @@ use lenswin_platform::message_loop::LoopControl;
 use lenswin_platform::monitor;
 use lenswin_platform::notify::{self, NotifyLevel};
 use lenswin_platform::paths::AppPaths;
+use lenswin_platform::shell;
 use lenswin_platform::tray::TrayIcon;
-use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_hotkeys};
+use lenswin_platform::window::{
+    MessageWindow, TaskNotifier, TrayMouse, WindowEvent, discard_pending_hotkeys,
+};
 use lenswin_upload::privacy_summary;
 
-use crate::config_file::{self, LoadedConfig};
-use crate::tray_menu;
+use crate::config_store::ConfigStore;
+use crate::hotkeys::{self, HotkeySet};
+use crate::tray_menu::{self, MenuAction};
+
+/// 开机自启在注册表里的值名。
+const AUTOSTART_NAME: &str = "lenswin";
 
 /// 用户可触发的命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,28 +46,6 @@ pub enum Command {
 }
 
 impl Command {
-    /// 托盘菜单项命令号，必须大于 0 且互不相同。
-    pub const fn menu_id(self) -> u16 {
-        match self {
-            Command::Search => 1,
-            Command::ScreenshotCopy => 2,
-            Command::About => 3,
-            Command::Exit => 4,
-        }
-    }
-
-    /// 由菜单命令号还原。
-    pub fn from_menu_id(id: u16) -> Option<Self> {
-        [
-            Command::Search,
-            Command::ScreenshotCopy,
-            Command::About,
-            Command::Exit,
-        ]
-        .into_iter()
-        .find(|c| c.menu_id() == id)
-    }
-
     /// 全局热键 id，仅可由热键触发的命令有值。
     pub const fn hotkey_id(self) -> Option<i32> {
         match self {
@@ -95,31 +83,80 @@ struct TaskResult {
 pub struct Dispatcher<'a> {
     tray: &'a TrayIcon,
     paths: &'a AppPaths,
-    config: RefCell<LoadedConfig>,
+    window: &'a MessageWindow,
+    store: ConfigStore,
     registry: ActionRegistry,
     notifier: TaskNotifier,
+    exe: Option<PathBuf>,
+    hotkeys: RefCell<HotkeySet>,
     results_tx: Sender<TaskResult>,
     results_rx: Receiver<TaskResult>,
 }
 
 impl<'a> Dispatcher<'a> {
-    /// 构造分发器。
+    /// 构造分发器；热键需随后调用 [`Dispatcher::install_hotkeys`] 注册。
     pub fn new(
         tray: &'a TrayIcon,
         paths: &'a AppPaths,
-        config: LoadedConfig,
+        window: &'a MessageWindow,
+        store: ConfigStore,
         registry: ActionRegistry,
-        notifier: TaskNotifier,
     ) -> Self {
         let (results_tx, results_rx) = channel();
+        let exe = match std::env::current_exe() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                log::warn!("获取 exe 路径失败，开机自启不可用：{e}");
+                None
+            }
+        };
         Self {
             tray,
             paths,
-            config: RefCell::new(config),
+            window,
+            store,
             registry,
-            notifier,
+            notifier: window.task_notifier(),
+            exe,
+            hotkeys: RefCell::new(HotkeySet::default()),
             results_tx,
             results_rx,
+        }
+    }
+
+    /// 按当前配置注册热键，失败项合并成一条气泡并指明配置文件位置。
+    pub fn install_hotkeys(&self) {
+        let config = self.store.snapshot();
+        let (set, failures) = HotkeySet::register(self.window, &config.hotkeys);
+        self.hotkeys.replace(set);
+        if !failures.is_empty() {
+            let text = hotkeys::failure_summary(&failures, self.store.path());
+            self.balloon(NotifyLevel::Warning, "lenswin", &text);
+        }
+    }
+
+    /// 自启项指向别的路径（如便携版被移动）时提示用户更新。
+    pub fn check_autostart(&self) {
+        if let AutostartState::StalePath(command) = self.autostart_state() {
+            log::warn!("开机自启指向其他位置：{command}");
+            self.balloon(
+                NotifyLevel::Warning,
+                "lenswin",
+                "开机自启指向的位置已变化，可在托盘菜单里重新开启以更新",
+            );
+        }
+    }
+
+    fn autostart_state(&self) -> AutostartState {
+        let Some(exe) = &self.exe else {
+            return AutostartState::Disabled;
+        };
+        match autostart::state(AUTOSTART_NAME, exe) {
+            Ok(state) => state,
+            Err(e) => {
+                log::warn!("读取开机自启状态失败：{e}");
+                AutostartState::Disabled
+            }
         }
     }
 
@@ -154,10 +191,10 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn show_menu(&self) -> LoopControl {
-        let items = tray_menu::items(&self.config.borrow().config.hotkeys);
-        match self.tray.show_menu(&items) {
-            Ok(Some(id)) => match Command::from_menu_id(id) {
-                Some(command) => self.run(command),
+        let menu = tray_menu::build(&self.store.snapshot(), &self.autostart_state());
+        match self.tray.show_menu(&menu.items) {
+            Ok(Some(id)) => match menu.action(id) {
+                Some(action) => self.perform(action),
                 None => {
                     log::warn!("收到未知菜单项 id：{id}");
                     LoopControl::Continue
@@ -169,6 +206,111 @@ impl<'a> Dispatcher<'a> {
                 LoopControl::Continue
             }
         }
+    }
+
+    fn perform(&self, action: MenuAction) -> LoopControl {
+        match action {
+            MenuAction::Run(command) => return self.run(command),
+            MenuAction::SetSelectionMode(mode) => {
+                self.apply_change(|c| c.search.selection_mode = mode);
+            }
+            MenuAction::SetSearchEngine(index) => match SEARCH_ENGINE_PRESETS.get(index) {
+                Some(preset) => {
+                    self.apply_change(|c| {
+                        c.search.engine_url_template = preset.url_template.to_string();
+                    });
+                }
+                None => log::warn!("未知的搜索引擎序号：{index}"),
+            },
+            MenuAction::SetExpiry(expiry) => {
+                self.apply_change(|c| c.upload.litterbox.expiry = expiry);
+            }
+            MenuAction::ToggleAutostart => self.toggle_autostart(),
+            MenuAction::OpenConfigDir => {
+                if let Err(e) = shell::open_folder(&self.paths.config_dir) {
+                    log::error!("打开配置文件夹失败：{e}");
+                    self.balloon(
+                        NotifyLevel::Error,
+                        "lenswin",
+                        &format!("无法打开配置文件夹：{e}"),
+                    );
+                }
+            }
+            MenuAction::ReloadConfig => self.reload_config(),
+            MenuAction::Display => {}
+        }
+        LoopControl::Continue
+    }
+
+    /// 修改配置并交给 `ConfigStore`；被拒绝时提示原因。
+    fn apply_change(&self, change: impl FnOnce(&mut Config)) {
+        if let Err(e) = self.store.update(change) {
+            log::warn!("配置未生效：{e}");
+            self.balloon(NotifyLevel::Warning, "lenswin", &format!("配置未生效：{e}"));
+        }
+    }
+
+    fn toggle_autostart(&self) {
+        let Some(exe) = &self.exe else {
+            self.balloon(
+                NotifyLevel::Error,
+                "lenswin",
+                "无法确定程序路径，不能设置开机自启",
+            );
+            return;
+        };
+        let result = match self.autostart_state() {
+            AutostartState::Enabled => autostart::disable(AUTOSTART_NAME),
+            AutostartState::Disabled | AutostartState::StalePath(_) => {
+                autostart::enable(AUTOSTART_NAME, exe)
+            }
+        };
+        if let Err(e) = result {
+            log::error!("切换开机自启失败：{e}");
+            self.balloon(
+                NotifyLevel::Error,
+                "lenswin",
+                &format!("开机自启设置失败：{e}"),
+            );
+        }
+    }
+
+    /// 重新读取配置文件；热键变化时重注册，冲突则回滚旧热键。
+    fn reload_config(&self) {
+        let reloaded = match self.store.reload() {
+            Ok(reloaded) => reloaded,
+            Err(e) => {
+                log::warn!("重新加载配置失败：{e}");
+                self.balloon(
+                    NotifyLevel::Warning,
+                    "lenswin",
+                    &format!("配置未重新加载：{e}"),
+                );
+                return;
+            }
+        };
+        let result = self.hotkeys.borrow_mut().replace(
+            self.window,
+            &reloaded.previous.hotkeys,
+            &reloaded.current.hotkeys,
+        );
+        match result {
+            Ok(()) => self.balloon(NotifyLevel::Info, "lenswin", "配置已重新加载"),
+            Err(failures) => {
+                // 回滚的只是热键，其它配置项已生效，同步写回内存与文件以免与实际热键不一致
+                self.rollback_hotkey_config(&reloaded.previous.hotkeys, &reloaded.current.hotkeys);
+                let text = hotkeys::failure_summary(&failures, self.store.path());
+                self.balloon(NotifyLevel::Warning, "lenswin", &text);
+            }
+        }
+    }
+
+    /// 新热键注册失败后，旧热键仍在生效：把配置里的热键退回旧值。
+    fn rollback_hotkey_config(&self, previous: &HotkeysConfig, attempted: &HotkeysConfig) {
+        if previous == attempted {
+            return;
+        }
+        self.apply_change(|c| c.hotkeys = previous.clone());
     }
 
     fn run(&self, command: Command) -> LoopControl {
@@ -199,7 +341,7 @@ impl<'a> Dispatcher<'a> {
 
     /// 圈选 → 隐私确认 → 在工作线程上传并打开搜索结果。
     fn search(&self) {
-        let mode = self.config.borrow().config.search.selection_mode;
+        let mode = self.store.snapshot().search.selection_mode;
         let Some(image) = self.pick_image(Command::Search, mode) else {
             return;
         };
@@ -216,14 +358,7 @@ impl<'a> Dispatcher<'a> {
         let Some(image) = self.pick_image(Command::ScreenshotCopy, SelectionMode::Rect) else {
             return;
         };
-        let save = !self
-            .config
-            .borrow()
-            .config
-            .screenshot
-            .save_dir
-            .trim()
-            .is_empty();
+        let save = !self.store.snapshot().screenshot.save_dir.trim().is_empty();
         let spare = save.then(|| image.clone());
         match self.registry.get(ActionKind::Copy) {
             Some(copy) => match copy.run(&self.context(), ActionInput::Image(image)) {
@@ -242,13 +377,13 @@ impl<'a> Dispatcher<'a> {
 
     fn context(&self) -> ActionContext {
         ActionContext {
-            config: self.config.borrow().config.clone(),
+            config: self.store.snapshot(),
         }
     }
 
     /// 首次向某个图床上传前弹确认；确认后记入配置。
     fn ensure_upload_acknowledged(&self) -> bool {
-        let config = self.config.borrow().config.clone();
+        let config = self.store.snapshot();
         let summary = match privacy_summary(&config.upload) {
             Ok(summary) => summary,
             Err(e) => {
@@ -266,8 +401,7 @@ impl<'a> Dispatcher<'a> {
         );
         match dialog::confirm("lenswin 隐私提示", &text) {
             Ok(true) => {
-                self.config.borrow_mut().config.privacy.acknowledged_host = summary.host;
-                self.persist_config();
+                self.apply_change(|c| c.privacy.acknowledged_host = summary.host);
                 true
             }
             Ok(false) => false,
@@ -280,20 +414,6 @@ impl<'a> Dispatcher<'a> {
                 );
                 false
             }
-        }
-    }
-
-    /// 把当前配置写回文件；失败只提示，本次运行仍按已确认处理。
-    fn persist_config(&self) {
-        let loaded = self.config.borrow().clone();
-        let result = config_file::persist(&self.paths.config_file(), loaded.state, &loaded.config);
-        if let Err(e) = result {
-            log::warn!("保存配置失败：{e}");
-            self.balloon(
-                NotifyLevel::Warning,
-                "lenswin",
-                &format!("隐私确认未能保存，下次仍会询问：{e}"),
-            );
         }
     }
 
@@ -328,6 +448,13 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn drain_results(&self) {
+        for message in self.store.drain_failures() {
+            self.balloon(
+                NotifyLevel::Warning,
+                "lenswin",
+                &format!("配置未能保存，重启后会丢失：{message}"),
+            );
+        }
         while let Ok(result) = self.results_rx.try_recv() {
             match result.error {
                 Some(message) => {
@@ -384,7 +511,7 @@ impl<'a> Dispatcher<'a> {
                 return None;
             }
         };
-        let lasso = self.config.borrow().config.selection.lasso.clone();
+        let lasso = self.store.snapshot().selection.lasso;
         let request = SelectRequest {
             frames: &frames,
             monitors: &monitors,
@@ -426,20 +553,6 @@ impl<'a> Dispatcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn menu_ids_roundtrip() {
-        for c in [
-            Command::Search,
-            Command::ScreenshotCopy,
-            Command::About,
-            Command::Exit,
-        ] {
-            assert_eq!(Command::from_menu_id(c.menu_id()), Some(c));
-        }
-        assert_eq!(Command::from_menu_id(0), None);
-        assert_eq!(Command::from_menu_id(99), None);
-    }
 
     #[test]
     fn hotkey_ids_roundtrip() {
