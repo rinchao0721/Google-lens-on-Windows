@@ -9,6 +9,8 @@ pub const TRAY_WINDOW_CLASS: &str = "LenswinTrayWindow";
 pub const TRAY_MUTEX_NAME: &str = "Local\\lenswin";
 /// 设置进程单实例互斥量名称。
 pub const SETTINGS_MUTEX_NAME: &str = "Local\\lenswin-settings";
+/// 第二个实例通知首个实例用的窗口消息，实际消息号为 `WM_APP + 该偏移`。
+pub const SECOND_INSTANCE_MESSAGE_OFFSET: u32 = 2;
 /// 单条消息负载上限（1 MiB）。
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 

@@ -9,4 +9,5 @@ pub mod frame;
 pub mod geometry;
 pub mod hotkey;
 pub mod ipc;
+pub mod monitor;
 pub mod selection;
