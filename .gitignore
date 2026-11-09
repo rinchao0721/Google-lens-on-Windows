@@ -1,3 +1,10 @@
 /target/
 **/*.rs.bk
 *.pdb
+
+# 规划与智能体规范文件，不上传
+/PLAN.md
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/.claude/
