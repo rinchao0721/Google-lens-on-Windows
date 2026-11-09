@@ -156,6 +156,7 @@ pub fn disable(name: &str) -> Result<(), PlatformError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyW};
 
     #[test]
     fn command_line_quotes_path_with_spaces() {
@@ -187,18 +188,68 @@ mod tests {
         );
     }
 
+    /// 测试专用子项；销毁时删除整个子项，断言失败触发 panic 也会清理。
+    struct PrivateKey(String);
+
+    impl PrivateKey {
+        fn new(tag: &str) -> Self {
+            let key = Self(format!(
+                r"Software\lenswin-test-{}-{tag}",
+                std::process::id()
+            ));
+            // 清掉可能残留的同名子项，保证从空白开始
+            key.delete();
+            key
+        }
+
+        fn delete(&self) {
+            let wide = to_wide(&self.0);
+            // 子项不存在时会返回错误，属于预期情况
+            // SAFETY: wide 以 NUL 结尾且在调用期间有效。
+            match unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr())) }.ok() {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+
+    impl Drop for PrivateKey {
+        fn drop(&mut self) {
+            self.delete();
+        }
+    }
+
     #[test]
     fn registry_roundtrip_in_private_key() {
-        // 用带进程号的值名，结束后删除，不在注册表留下痕迹
-        let name = format!("lenswin-test-{}", std::process::id());
-        assert_eq!(read_value(RUN_KEY, &name).expect("读取"), None);
-        write_value(RUN_KEY, &name, r#""C:\x y\a.exe""#).expect("写入");
+        let key = PrivateKey::new("roundtrip");
+        let subkey = key.0.as_str();
+        assert_eq!(read_value(subkey, "v").expect("读取"), None);
+        write_value(subkey, "v", r#""C:\x y\a.exe""#).expect("写入");
         assert_eq!(
-            read_value(RUN_KEY, &name).expect("读取").as_deref(),
+            read_value(subkey, "v").expect("读取").as_deref(),
             Some(r#""C:\x y\a.exe""#)
         );
-        delete_value(RUN_KEY, &name).expect("删除");
-        assert_eq!(read_value(RUN_KEY, &name).expect("读取"), None);
-        delete_value(RUN_KEY, &name).expect("重复删除视为成功");
+        delete_value(subkey, "v").expect("删除");
+        assert_eq!(read_value(subkey, "v").expect("读取"), None);
+        delete_value(subkey, "v").expect("重复删除视为成功");
+    }
+
+    #[test]
+    fn private_key_is_removed_after_test() {
+        let subkey;
+        {
+            let key = PrivateKey::new("cleanup");
+            subkey = key.0.clone();
+            write_value(&subkey, "v", "x").expect("写入");
+            assert!(
+                RegKey::open(&subkey, KEY_QUERY_VALUE)
+                    .expect("打开")
+                    .is_some()
+            );
+        }
+        assert!(
+            RegKey::open(&subkey, KEY_QUERY_VALUE)
+                .expect("打开")
+                .is_none()
+        );
     }
 }

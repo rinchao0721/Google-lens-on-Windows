@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::ActionRegistry;
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
-use lenswin_core::config::{Config, HotkeysConfig, SEARCH_ENGINE_PRESETS};
+use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS};
 use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::selection::{Selection, SelectionMode};
 use lenswin_overlay::SelectRequest;
@@ -191,7 +191,10 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn show_menu(&self) -> LoopControl {
-        let menu = tray_menu::build(&self.store.snapshot(), &self.autostart_state());
+        let mut config = self.store.snapshot();
+        // 菜单显示实际生效的热键，而不是文件里可能被占用的写法
+        config.hotkeys = self.hotkeys.borrow().effective().clone();
+        let menu = tray_menu::build(&config, &self.autostart_state());
         match self.tray.show_menu(&menu.items) {
             Ok(Some(id)) => match menu.action(id) {
                 Some(action) => self.perform(action),
@@ -227,14 +230,10 @@ impl<'a> Dispatcher<'a> {
             }
             MenuAction::ToggleAutostart => self.toggle_autostart(),
             MenuAction::OpenConfigDir => {
-                if let Err(e) = shell::open_folder(&self.paths.config_dir) {
-                    log::error!("打开配置文件夹失败：{e}");
-                    self.balloon(
-                        NotifyLevel::Error,
-                        "lenswin",
-                        &format!("无法打开配置文件夹：{e}"),
-                    );
-                }
+                let dir = self.paths.config_dir.clone();
+                self.spawn_task("打开配置文件夹", move || {
+                    shell::open_folder(&dir).err().map(|e| e.to_string())
+                });
             }
             MenuAction::ReloadConfig => self.reload_config(),
             MenuAction::Display => {}
@@ -289,28 +288,16 @@ impl<'a> Dispatcher<'a> {
                 return;
             }
         };
-        let result = self.hotkeys.borrow_mut().replace(
-            self.window,
-            &reloaded.previous.hotkeys,
-            &reloaded.current.hotkeys,
-        );
-        match result {
-            Ok(()) => self.balloon(NotifyLevel::Info, "lenswin", "配置已重新加载"),
-            Err(failures) => {
-                // 回滚的只是热键，其它配置项已生效，同步写回内存与文件以免与实际热键不一致
-                self.rollback_hotkey_config(&reloaded.previous.hotkeys, &reloaded.current.hotkeys);
-                let text = hotkeys::failure_summary(&failures, self.store.path());
-                self.balloon(NotifyLevel::Warning, "lenswin", &text);
-            }
+        let (report, effective) = {
+            let mut set = self.hotkeys.borrow_mut();
+            let report = set.replace(self.window, &reloaded.current.hotkeys);
+            (report, set.effective().clone())
+        };
+        // 退回只发生在内存里，不写文件：用户手写的配置保持原样，下次重新加载会再次尝试
+        match hotkeys::reload_summary(&report, &effective, self.store.path()) {
+            None => self.balloon(NotifyLevel::Info, "lenswin", "配置已重新加载"),
+            Some(text) => self.balloon(NotifyLevel::Warning, "lenswin", &text),
         }
-    }
-
-    /// 新热键注册失败后，旧热键仍在生效：把配置里的热键退回旧值。
-    fn rollback_hotkey_config(&self, previous: &HotkeysConfig, attempted: &HotkeysConfig) {
-        if previous == attempted {
-            return;
-        }
-        self.apply_change(|c| c.hotkeys = previous.clone());
     }
 
     fn run(&self, command: Command) -> LoopControl {
@@ -424,15 +411,26 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         let ctx = self.context();
+        self.spawn_task(label, move || {
+            action
+                .run(&ctx, ActionInput::Image(image))
+                .err()
+                .map(|e| e.to_string())
+        });
+    }
+
+    /// 在工作线程运行任务，返回的错误文字经任务通知回到主线程提示。
+    fn spawn_task(
+        &self,
+        label: &'static str,
+        job: impl FnOnce() -> Option<String> + Send + 'static,
+    ) {
         let tx = self.results_tx.clone();
         let notifier = self.notifier;
         let spawned = std::thread::Builder::new()
             .name(format!("lenswin-{label}"))
             .spawn(move || {
-                let error = action
-                    .run(&ctx, ActionInput::Image(image))
-                    .err()
-                    .map(|e| e.to_string());
+                let error = job();
                 if tx.send(TaskResult { label, error }).is_err() {
                     // 接收端随主线程销毁，只会发生在退出阶段，没有人再需要结果
                     return;
