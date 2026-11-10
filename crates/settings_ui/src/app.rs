@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use eframe::egui;
 use lenswin_core::config::{
     Config, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry, ResponseKind,
-    SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, UploadProvider, ValidationIssue, validate,
+    SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider, ValidationIssue,
+    validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
 use lenswin_core::selection::SelectionMode;
@@ -331,6 +332,27 @@ impl SettingsApp {
             .right_width(48.0)
             .show(ui, &look, |ui| {
                 toggle(ui, &look, notifications);
+            });
+        let error = self.issue("general.tray_left_click");
+        let current = self.draft.config.general.tray_left_click;
+        Card::new("左键单击托盘图标")
+            .icon(icons::MOUSE)
+            .desc("单击托盘图标时直接开始的操作")
+            .error(error.as_deref())
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("tray-left-click")
+                    .width(COMBO_WIDTH)
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for action in TrayLeftClick::ALL {
+                            ui.selectable_value(
+                                &mut self.draft.config.general.tray_left_click,
+                                action,
+                                action.label(),
+                            );
+                        }
+                    });
             });
     }
 

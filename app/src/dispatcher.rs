@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::ActionRegistry;
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
-use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS};
+use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, TrayLeftClick};
 use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::ipc::SETTINGS_ARG;
 use lenswin_core::selection::{Selection, SelectionMode};
@@ -21,7 +21,7 @@ use lenswin_platform::notify::{self, NotifyLevel};
 use lenswin_platform::paths::AppPaths;
 use lenswin_platform::shell;
 use lenswin_platform::tray::TrayIcon;
-use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_hotkeys};
+use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_triggers};
 use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
@@ -30,6 +30,15 @@ use crate::tray_menu::{self, MenuAction};
 
 /// 开机自启在注册表里的值名。
 const AUTOSTART_NAME: &str = autostart::VALUE_NAME;
+
+/// 托盘左键配置对应的命令；「无操作」返回 `None`。
+fn left_click_command(action: TrayLeftClick) -> Option<Command> {
+    match action {
+        TrayLeftClick::Search => Some(Command::Search),
+        TrayLeftClick::ScreenshotCopy => Some(Command::ScreenshotCopy),
+        TrayLeftClick::Nothing => None,
+    }
+}
 
 /// 用户可触发的命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +175,13 @@ impl<'a> Dispatcher<'a> {
                 }
             },
             WindowEvent::Tray(TrayMouse::RightClick) => self.show_menu(),
-            WindowEvent::Tray(TrayMouse::LeftClick) => LoopControl::Continue,
+            WindowEvent::Tray(TrayMouse::LeftClick) => {
+                let action = self.shared.store.snapshot().general.tray_left_click;
+                match left_click_command(action) {
+                    Some(command) => self.run(command),
+                    None => LoopControl::Continue,
+                }
+            }
             WindowEvent::TaskbarCreated => {
                 if let Err(e) = self.tray.re_add() {
                     log::error!("资源管理器重启后重建托盘图标失败：{e}");
@@ -537,8 +552,8 @@ impl<'a> Dispatcher<'a> {
             lasso: &lasso,
         };
         let outcome = lenswin_overlay::select(&request);
-        // 覆盖层期间积压的热键不应在结束后再次触发
-        discard_pending_hotkeys();
+        // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
+        discard_pending_triggers();
         match outcome {
             Ok(Some(selection)) => {
                 log::info!(
@@ -576,6 +591,19 @@ impl<'a> Dispatcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn left_click_maps_to_matching_command() {
+        assert_eq!(
+            left_click_command(TrayLeftClick::Search),
+            Some(Command::Search)
+        );
+        assert_eq!(
+            left_click_command(TrayLeftClick::ScreenshotCopy),
+            Some(Command::ScreenshotCopy)
+        );
+        assert_eq!(left_click_command(TrayLeftClick::Nothing), None);
+    }
 
     #[test]
     fn hotkey_ids_roundtrip() {

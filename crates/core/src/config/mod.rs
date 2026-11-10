@@ -99,12 +99,47 @@ impl Config {
 pub struct GeneralConfig {
     /// 是否弹出成功类提示；关闭后错误和警告仍会提示。
     pub notifications: bool,
+    /// 左键单击托盘图标的动作。
+    pub tray_left_click: TrayLeftClick,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             notifications: true,
+            tray_left_click: TrayLeftClick::default(),
+        }
+    }
+}
+
+/// 左键单击托盘图标时执行的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayLeftClick {
+    /// 圈选搜索。
+    #[default]
+    Search,
+    /// 截屏到剪贴板。
+    ScreenshotCopy,
+    /// 不做任何事。
+    #[serde(rename = "none")]
+    Nothing,
+}
+
+impl TrayLeftClick {
+    /// 全部取值，供界面生成选项。
+    pub const ALL: [TrayLeftClick; 3] = [
+        TrayLeftClick::Search,
+        TrayLeftClick::ScreenshotCopy,
+        TrayLeftClick::Nothing,
+    ];
+
+    /// 面向用户的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            TrayLeftClick::Search => "即圈即搜",
+            TrayLeftClick::ScreenshotCopy => "截屏到剪贴板",
+            TrayLeftClick::Nothing => "无操作",
         }
     }
 }
@@ -372,6 +407,42 @@ mod tests {
         let text = parsed.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("回读"), parsed);
         assert!(Config::from_toml_str("[general]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn tray_left_click_defaults_to_search_and_parses_every_value() {
+        assert_eq!(
+            Config::default().general.tray_left_click,
+            TrayLeftClick::Search
+        );
+        for (text, expected) in [
+            ("search", TrayLeftClick::Search),
+            ("screenshot_copy", TrayLeftClick::ScreenshotCopy),
+            ("none", TrayLeftClick::Nothing),
+        ] {
+            let toml = format!("[general]\ntray_left_click = \"{text}\"\n");
+            let parsed = Config::from_toml_str(&toml).expect("解析");
+            assert_eq!(parsed.general.tray_left_click, expected, "{text}");
+            let back = parsed.to_toml_string().expect("序列化");
+            assert!(
+                back.contains(&format!("tray_left_click = \"{text}\"")),
+                "{back}"
+            );
+        }
+    }
+
+    #[test]
+    fn tray_left_click_rejects_unknown_value() {
+        assert!(Config::from_toml_str("[general]\ntray_left_click = \"nothing\"\n").is_err());
+        assert!(Config::from_toml_str("[general]\ntray_left_click = 1\n").is_err());
+    }
+
+    #[test]
+    fn tray_left_click_labels_are_distinct() {
+        let mut labels: Vec<_> = TrayLeftClick::ALL.iter().map(|t| t.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), TrayLeftClick::ALL.len());
     }
 
     #[test]

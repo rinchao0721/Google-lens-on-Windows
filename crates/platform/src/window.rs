@@ -182,13 +182,13 @@ fn enqueue_and_wake(hwnd: HWND, event: WindowEvent) {
     }
 }
 
-/// 丢弃尚未处理的热键事件，用于模态界面（如选区覆盖层）结束后清掉期间积压的热键。
+/// 丢弃尚未处理的热键与托盘左键事件，用于模态界面（如选区覆盖层）结束后清掉期间积压的触发。
 ///
-/// 其它事件（托盘重建、第二实例通知、托盘点击）原样保留。
-pub fn discard_pending_hotkeys() {
+/// 其它事件（托盘重建、第二实例通知、托盘右键）原样保留。
+pub fn discard_pending_triggers() {
     let result = EVENTS.try_with(|queue| {
         if let Ok(mut queue) = queue.try_borrow_mut() {
-            retain_non_hotkeys(&mut queue);
+            retain_non_triggers(&mut queue);
         }
     });
     match result {
@@ -196,8 +196,13 @@ pub fn discard_pending_hotkeys() {
     }
 }
 
-fn retain_non_hotkeys(queue: &mut VecDeque<WindowEvent>) {
-    queue.retain(|event| !matches!(event, WindowEvent::Hotkey(_)));
+fn retain_non_triggers(queue: &mut VecDeque<WindowEvent>) {
+    queue.retain(|event| {
+        !matches!(
+            event,
+            WindowEvent::Hotkey(_) | WindowEvent::Tray(TrayMouse::LeftClick)
+        )
+    });
 }
 
 /// 取出最早的待处理事件。
@@ -431,15 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn retain_non_hotkeys_drops_only_hotkeys() {
+    fn retain_non_triggers_drops_hotkeys_and_left_clicks() {
         let mut queue = VecDeque::from([
             WindowEvent::Hotkey(1),
             WindowEvent::TaskbarCreated,
             WindowEvent::Hotkey(2),
+            WindowEvent::Tray(TrayMouse::LeftClick),
             WindowEvent::SecondInstance,
             WindowEvent::Tray(TrayMouse::RightClick),
+            WindowEvent::Tray(TrayMouse::LeftClick),
         ]);
-        retain_non_hotkeys(&mut queue);
+        retain_non_triggers(&mut queue);
         assert_eq!(
             Vec::from(queue),
             vec![
@@ -451,12 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn discard_pending_hotkeys_keeps_other_events_in_queue() {
+    fn discard_pending_triggers_keeps_other_events_in_queue() {
         enqueue(WindowEvent::Hotkey(1));
         enqueue(WindowEvent::TaskbarCreated);
+        enqueue(WindowEvent::Tray(TrayMouse::LeftClick));
         enqueue(WindowEvent::Hotkey(2));
         enqueue(WindowEvent::SecondInstance);
-        discard_pending_hotkeys();
+        discard_pending_triggers();
         assert_eq!(pop_event(), Some(WindowEvent::TaskbarCreated));
         assert_eq!(pop_event(), Some(WindowEvent::SecondInstance));
         assert_eq!(pop_event(), None);

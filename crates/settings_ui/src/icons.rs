@@ -30,6 +30,8 @@ pub const EDIT: char = '\u{E70F}';
 pub const LINK: char = '\u{E71B}';
 /// 文档。
 pub const DOCUMENT: char = '\u{E8A5}';
+/// 鼠标。
+pub const MOUSE: char = '\u{E962}';
 
 /// 导航项图标。
 pub const fn page_icon(page: Page) -> char {
