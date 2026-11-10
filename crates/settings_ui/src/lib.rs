@@ -8,6 +8,9 @@ mod app;
 mod client;
 mod fonts;
 mod form;
+mod icons;
+mod theme;
+mod widgets;
 
 use eframe::egui;
 use lenswin_core::ipc::{SETTINGS_MUTEX_NAME, SETTINGS_WINDOW_TITLE};
@@ -30,13 +33,13 @@ pub enum SettingsError {
 }
 
 /// 窗口初始逻辑尺寸。
-const WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
+const WINDOW_SIZE: [f32; 2] = [820.0, 600.0];
 /// 窗口图标：64x64 的 RGBA 原始像素，由 `assets/icon-64.rgba` 嵌入。
 const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
 /// 窗口图标边长。
 const WINDOW_ICON_SIDE: u32 = 64;
 /// 窗口最小逻辑尺寸。
-const WINDOW_MIN_SIZE: [f32; 2] = [560.0, 420.0];
+const WINDOW_MIN_SIZE: [f32; 2] = [640.0, 460.0];
 
 /// 运行设置窗口，直到用户关闭；已有设置窗口时激活它后直接返回。
 pub fn run() -> Result<(), SettingsError> {
@@ -65,8 +68,10 @@ pub fn run() -> Result<(), SettingsError> {
         SETTINGS_WINDOW_TITLE,
         options,
         Box::new(move |cc| {
-            let font_loaded = fonts::install_chinese_font(&cc.egui_ctx);
-            Ok(Box::new(SettingsApp::new(startup, font_loaded)))
+            let fonts = fonts::install_fonts(&cc.egui_ctx);
+            let kind = theme::resolve_system(cc.egui_ctx.system_theme());
+            theme::install(&cc.egui_ctx, kind);
+            Ok(Box::new(SettingsApp::new(startup, fonts, kind)))
         }),
     )
     .map_err(|e| SettingsError::Window(e.to_string()))

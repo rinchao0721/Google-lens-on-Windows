@@ -210,10 +210,95 @@ pub fn hotkey_clash(a: &HotkeyChoice, b: &HotkeyChoice) -> Option<&'static str> 
     (same_mods && a.key == b.key).then_some("两个功能不能使用同一个快捷键")
 }
 
+/// 两个热键输入框之一。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyField {
+    /// 圈选搜索。
+    Search,
+    /// 截屏到剪贴板。
+    Screenshot,
+}
+
+/// 按键小方块上的文字：Ctrl、Alt、Shift、Win 依次排在主键前。
+pub fn hotkey_cap_labels(choice: &HotkeyChoice) -> Vec<String> {
+    [
+        (choice.ctrl, "Ctrl"),
+        (choice.alt, "Alt"),
+        (choice.shift, "Shift"),
+        (choice.win, "Win"),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, name)| name.to_string())
+    .chain(std::iter::once(choice.key.to_string()))
+    .collect()
+}
+
+/// 热键的展示文字，如 `Win+Shift+A`。
+pub fn hotkey_display(choice: &HotkeyChoice) -> String {
+    hotkey_cap_labels(choice).join("+")
+}
+
+/// 提交后被托盘报告冲突时，推断是哪些热键改动导致：与旧配置相比变了的那些。
+pub fn changed_hotkeys(old: &Config, new: &Config) -> Vec<(HotkeyField, HotkeyChoice)> {
+    let pairs = [
+        (
+            HotkeyField::Search,
+            &old.hotkeys.search,
+            &new.hotkeys.search,
+        ),
+        (
+            HotkeyField::Screenshot,
+            &old.hotkeys.screenshot_copy,
+            &new.hotkeys.screenshot_copy,
+        ),
+    ];
+    pairs
+        .into_iter()
+        .filter_map(|(field, before, after)| {
+            let after = HotkeyChoice::parse(after)?;
+            (HotkeyChoice::parse(before) != Some(after)).then_some((field, after))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lenswin_core::config::{UploadProvider, validate};
+
+    #[test]
+    fn cap_labels_list_modifiers_in_fixed_order_then_key() {
+        let a = HotkeyChoice::parse("Ctrl+Alt+F13").expect("解析");
+        assert_eq!(hotkey_cap_labels(&a), ["Ctrl", "Alt", "F13"]);
+        let b = HotkeyChoice::parse("Shift+Win+A").expect("解析");
+        assert_eq!(hotkey_cap_labels(&b), ["Shift", "Win", "A"]);
+        assert_eq!(hotkey_display(&b), "Shift+Win+A");
+        let c = HotkeyChoice::parse("Win+Ctrl+Alt+Shift+Space").expect("解析");
+        assert_eq!(hotkey_cap_labels(&c).len(), 5);
+        let none = HotkeyChoice {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+            key: lenswin_core::hotkey::Key::Letter('Z'),
+        };
+        assert_eq!(hotkey_cap_labels(&none), ["Z"]);
+    }
+
+    #[test]
+    fn changed_hotkeys_reports_only_real_changes() {
+        let old = Config::default();
+        assert!(changed_hotkeys(&old, &old).is_empty());
+        let mut new = old.clone();
+        new.hotkeys.search = "Ctrl+Alt+F13".to_string();
+        let changed = changed_hotkeys(&old, &new);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, HotkeyField::Search);
+        assert_eq!(hotkey_display(&changed[0].1), "Ctrl+Alt+F13");
+        new.hotkeys.screenshot_copy = "garbage".to_string();
+        assert_eq!(changed_hotkeys(&old, &new).len(), 1);
+    }
 
     #[test]
     fn draft_roundtrips_default_config_unchanged_apart_from_canonical_hotkeys() {

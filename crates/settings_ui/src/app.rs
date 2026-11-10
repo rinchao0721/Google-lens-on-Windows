@@ -15,9 +15,17 @@ use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::paths::AppPaths;
 
 use crate::client;
+use crate::fonts::FontStatus;
 use crate::form::{
-    Draft, Feedback, FeedbackKind, Page, Staleness, config_from_file_text, hotkey_clash,
-    page_of_field, staleness,
+    Draft, Feedback, FeedbackKind, HotkeyField, Page, Staleness, changed_hotkeys,
+    config_from_file_text, hotkey_cap_labels, hotkey_clash, hotkey_display, page_of_field,
+    staleness,
+};
+use crate::icons;
+use crate::theme::{self, CARD_GAP, FONT_DESC, Look, NAV_WIDTH, PAGE_MARGIN_X, Palette, ThemeKind};
+use crate::widgets::{
+    BannerKind, Card, banner, group_label, key_caps, modifier_chip, nav_item, page_title,
+    primary_button, secondary_button, text_input, toggle,
 };
 
 /// 上传大小上限的界面范围（MiB），与 `MAX_BYTES_RANGE` 的上下界一致。
@@ -86,7 +94,10 @@ pub struct SettingsApp {
     page: Page,
     issues: Vec<ValidationIssue>,
     feedback: Option<Feedback>,
-    font_loaded: bool,
+    fonts: FontStatus,
+    look: Look,
+    theme_kind: ThemeKind,
+    conflicts: Vec<(HotkeyField, HotkeyChoice)>,
     config_path: Option<PathBuf>,
     config_path_text: String,
     baseline: Config,
@@ -109,9 +120,18 @@ enum ButtonAction {
     Overwrite,
 }
 
+/// 底部「确定 / 应用 / 取消」三个按钮占的宽度。
+const BUTTONS_WIDTH: f32 = 76.0 * 3.0 + 8.0 * 2.0;
+/// 冲突提示多出的两个按钮占的宽度。
+const STALE_BUTTONS_WIDTH: f32 = 220.0;
+/// 右侧控件区的常用预留宽度。
+const COMBO_WIDTH: f32 = 190.0;
+/// 文本框的常用宽度。
+const FIELD_WIDTH: f32 = 190.0;
+
 impl SettingsApp {
     /// 由启动信息建立窗口状态。
-    pub fn new(startup: Startup, font_loaded: bool) -> Self {
+    pub fn new(startup: Startup, fonts: FontStatus, theme_kind: ThemeKind) -> Self {
         let autostart_enabled = startup.autostart == AutostartState::Enabled;
         let autostart_stale = matches!(startup.autostart, AutostartState::StalePath(_));
         Self {
@@ -119,7 +139,13 @@ impl SettingsApp {
             page: Page::General,
             issues: Vec::new(),
             feedback: None,
-            font_loaded,
+            fonts,
+            look: Look {
+                palette: Palette::of(theme_kind),
+                icons: fonts.icons,
+            },
+            theme_kind,
+            conflicts: Vec::new(),
             baseline: startup.config.clone(),
             stale_prompt: false,
             config_path: startup.config_path.clone(),
@@ -136,17 +162,12 @@ impl SettingsApp {
         }
     }
 
-    fn issue_text(&self, field: &str) -> Option<&str> {
+    /// 某配置字段上的校验问题文字。
+    fn issue(&self, field: &str) -> Option<String> {
         self.issues
             .iter()
             .find(|i| i.field == field)
-            .map(|i| i.message.as_str())
-    }
-
-    fn show_issue(&self, ui: &mut egui::Ui, field: &str) {
-        if let Some(message) = self.issue_text(field) {
-            ui.colored_label(ui.visuals().error_fg_color, message);
-        }
+            .map(|i| i.message.clone())
     }
 
     fn set_feedback(&mut self, kind: FeedbackKind, text: impl Into<String>) {
@@ -171,6 +192,7 @@ impl SettingsApp {
                 self.draft = Draft::from_config(&config, self.draft.autostart);
                 self.baseline = config;
                 self.issues.clear();
+                self.conflicts.clear();
                 self.stale_prompt = false;
                 self.set_feedback(FeedbackKind::Success, "已重新载入配置文件");
             }
@@ -181,6 +203,7 @@ impl SettingsApp {
     /// 校验并提交；`force` 为真时跳过「配置已在别处修改」的检查。返回是否完全成功。
     fn apply(&mut self, force: bool) -> bool {
         self.issues.clear();
+        self.conflicts.clear();
         self.stale_prompt = false;
         let config = match self.draft.to_config() {
             Ok(config) => config,
@@ -228,6 +251,10 @@ impl SettingsApp {
             };
         }
         let ok = feedback.kind == FeedbackKind::Success;
+        // 警告级别只来自热键冲突：与旧配置相比变了的热键就是被占用的那些
+        if feedback.kind == FeedbackKind::Warning {
+            self.conflicts = changed_hotkeys(&self.baseline, &config);
+        }
         // 成功或「已保存但热键冲突」时文件内容就是刚提交的配置，作为新的比较基准
         if feedback.kind != FeedbackKind::Error {
             self.baseline = config;
@@ -258,190 +285,315 @@ impl SettingsApp {
         }
     }
 
-    fn general_page(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.draft.autostart, "开机自启");
-        if self.autostart_stale {
-            ui.weak("注册表里的自启项指向别的位置，勾选并点「应用」即可更新到当前程序");
+    /// 跟随系统深浅色；主题变化时重装样式。
+    fn sync_theme(&mut self, ctx: &egui::Context) {
+        let kind = theme::resolve_system(ctx.system_theme());
+        if kind != self.theme_kind {
+            theme::install(ctx, kind);
+            self.theme_kind = kind;
+            self.look.palette = Palette::of(kind);
         }
-        ui.checkbox(
-            &mut self.draft.config.general.notifications,
-            "显示提示气泡（关闭后只保留警告和错误）",
-        );
-        self.show_issue(ui, "general.notifications");
+    }
+
+    fn general_page(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
+        let autostart_desc = if self.autostart_stale {
+            "注册表里的自启项指向别的位置，打开并点「应用」即可更新到当前程序"
+        } else {
+            "登录 Windows 后自动启动 lenswin"
+        };
+        let autostart = &mut self.draft.autostart;
+        Card::new("开机自启")
+            .icon(icons::POWER)
+            .desc(autostart_desc)
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, autostart);
+            });
+        let error = self.issue("general.notifications");
+        let notifications = &mut self.draft.config.general.notifications;
+        Card::new("显示提示气泡")
+            .icon(icons::RINGER)
+            .desc("关闭后只保留警告和错误")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, notifications);
+            });
     }
 
     fn hotkeys_page(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
         if self.draft.hotkey_fallback {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
+            banner(
+                ui,
+                &look,
+                BannerKind::Warn,
                 "配置文件里有无法识别的快捷键，下面显示的是默认值，应用后会覆盖",
             );
         }
-        ui.weak("快捷键至少要勾选一个修饰键；被其它程序占用时会保存但不生效");
-        ui.add_space(8.0);
         let keys = self.keys.clone();
-        ui.label("圈选搜索");
-        hotkey_editor(ui, "hotkey-search", &mut self.draft.search_hotkey, &keys);
-        self.show_issue(ui, "hotkeys.search");
-        ui.add_space(8.0);
-        ui.label("截屏到剪贴板");
-        hotkey_editor(ui, "hotkey-shot", &mut self.draft.screenshot_hotkey, &keys);
-        self.show_issue(ui, "hotkeys.screenshot_copy");
+        for (field, id, title, issue_field, choice) in [
+            (
+                HotkeyField::Search,
+                "hotkey-search",
+                "圈选搜索",
+                "hotkeys.search",
+                self.draft.search_hotkey,
+            ),
+            (
+                HotkeyField::Screenshot,
+                "hotkey-shot",
+                "截屏到剪贴板",
+                "hotkeys.screenshot_copy",
+                self.draft.screenshot_hotkey,
+            ),
+        ] {
+            let conflict = self
+                .conflicts
+                .iter()
+                .any(|(f, c)| *f == field && *c == choice)
+                .then(|| format!("{} 已被其它程序占用", hotkey_display(&choice)));
+            let error = self.issue(issue_field).or(conflict);
+            let target = match field {
+                HotkeyField::Search => &mut self.draft.search_hotkey,
+                HotkeyField::Screenshot => &mut self.draft.screenshot_hotkey,
+            };
+            hotkey_card(ui, &look, &keys, id, title, error.as_deref(), target);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("快捷键至少要选一个修饰键；被其它程序占用时会保存但不生效")
+                .size(FONT_DESC)
+                .color(look.palette.text_dim),
+        );
     }
 
     fn search_upload_page(&mut self, ui: &mut egui::Ui) {
         self.search_section(ui);
-        ui.separator();
         self.upload_section(ui);
-        ui.separator();
         self.privacy_section(ui);
     }
 
     fn search_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("搜索");
-        ui.horizontal(|ui| {
-            ui.label("选区模式");
-            let current = self.draft.config.search.selection_mode;
-            egui::ComboBox::from_id_salt("selection-mode")
-                .selected_text(current.label())
-                .show_ui(ui, |ui| {
-                    for mode in SelectionMode::ALL {
-                        ui.selectable_value(
-                            &mut self.draft.config.search.selection_mode,
-                            mode,
-                            mode.label(),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("搜索引擎");
-            let selected = if self.draft.engine_custom {
-                "自定义"
-            } else {
-                SEARCH_ENGINE_PRESETS
-                    .iter()
-                    .find(|p| p.url_template == self.draft.config.search.engine_url_template)
-                    .map_or("自定义", |p| p.name)
-            };
-            egui::ComboBox::from_id_salt("search-engine")
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                    for preset in SEARCH_ENGINE_PRESETS {
-                        let is_current = !self.draft.engine_custom
-                            && self.draft.config.search.engine_url_template == preset.url_template;
-                        if ui.selectable_label(is_current, preset.name).clicked() {
-                            self.draft.engine_custom = false;
-                            self.draft.config.search.engine_url_template =
-                                preset.url_template.to_string();
+        let look = self.look;
+        group_label(ui, &look, "搜索");
+        let current = self.draft.config.search.selection_mode;
+        Card::new("选区模式")
+            .icon(icons::EDIT)
+            .desc("圈选的方式")
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("selection-mode")
+                    .width(COMBO_WIDTH)
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for mode in SelectionMode::ALL {
+                            ui.selectable_value(
+                                &mut self.draft.config.search.selection_mode,
+                                mode,
+                                mode.label(),
+                            );
                         }
-                    }
-                    if ui
-                        .selectable_label(self.draft.engine_custom, "自定义")
-                        .clicked()
-                    {
-                        self.draft.engine_custom = true;
-                    }
-                });
-        });
+                    });
+            });
+        let engine_error = self.issue("search.engine_url_template");
+        let custom = self.draft.engine_custom;
+        let selected = if custom {
+            "自定义"
+        } else {
+            SEARCH_ENGINE_PRESETS
+                .iter()
+                .find(|p| p.url_template == self.draft.config.search.engine_url_template)
+                .map_or("自定义", |p| p.name)
+        };
+        Card::new("搜索引擎")
+            .icon(icons::SEARCH)
+            .desc("以图搜图使用的网站")
+            .error(if custom {
+                None
+            } else {
+                engine_error.as_deref()
+            })
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("search-engine")
+                    .width(COMBO_WIDTH)
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for preset in SEARCH_ENGINE_PRESETS {
+                            let is_current = !self.draft.engine_custom
+                                && self.draft.config.search.engine_url_template
+                                    == preset.url_template;
+                            if ui.selectable_label(is_current, preset.name).clicked() {
+                                self.draft.engine_custom = false;
+                                self.draft.config.search.engine_url_template =
+                                    preset.url_template.to_string();
+                            }
+                        }
+                        if ui
+                            .selectable_label(self.draft.engine_custom, "自定义")
+                            .clicked()
+                        {
+                            self.draft.engine_custom = true;
+                        }
+                    });
+            });
         if self.draft.engine_custom {
-            ui.label("地址模板（必须恰好含一个 {url}）");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.config.search.engine_url_template)
-                    .desired_width(f32::INFINITY),
-            );
+            let template = &mut self.draft.config.search.engine_url_template;
+            Card::new("地址模板")
+                .icon(icons::LINK)
+                .desc("必须恰好含一个 {url}")
+                .error(engine_error.as_deref())
+                .show_wide(
+                    ui,
+                    &look,
+                    |_| {},
+                    |ui| {
+                        let width = ui.available_width();
+                        text_input(ui, template, width);
+                    },
+                );
         }
-        self.show_issue(ui, "search.engine_url_template");
     }
 
     fn upload_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("上传");
-        ui.horizontal(|ui| {
-            ui.label("图床");
-            let provider = self.draft.config.upload.provider;
-            egui::ComboBox::from_id_salt("upload-provider")
-                .selected_text(provider_label(provider))
-                .show_ui(ui, |ui| {
-                    for option in [UploadProvider::Litterbox, UploadProvider::Custom] {
-                        ui.selectable_value(
-                            &mut self.draft.config.upload.provider,
-                            option,
-                            provider_label(option),
-                        );
-                    }
-                });
-        });
+        let look = self.look;
+        group_label(ui, &look, "上传");
+        let provider = self.draft.config.upload.provider;
+        Card::new("图床")
+            .icon(icons::CLOUD)
+            .desc("截图上传到哪里")
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("upload-provider")
+                    .width(COMBO_WIDTH)
+                    .selected_text(provider_label(provider))
+                    .show_ui(ui, |ui| {
+                        for option in [UploadProvider::Litterbox, UploadProvider::Custom] {
+                            ui.selectable_value(
+                                &mut self.draft.config.upload.provider,
+                                option,
+                                provider_label(option),
+                            );
+                        }
+                    });
+            });
         match self.draft.config.upload.provider {
             UploadProvider::Litterbox => {
-                ui.horizontal(|ui| {
-                    ui.label("图片保留时间");
-                    let current = self.draft.config.upload.litterbox.expiry;
-                    egui::ComboBox::from_id_salt("litterbox-expiry")
-                        .selected_text(current.label())
-                        .show_ui(ui, |ui| {
-                            for expiry in LitterboxExpiry::ALL {
-                                ui.selectable_value(
-                                    &mut self.draft.config.upload.litterbox.expiry,
-                                    expiry,
-                                    expiry.label(),
-                                );
-                            }
-                        });
-                });
+                let current = self.draft.config.upload.litterbox.expiry;
+                Card::new("图片保留时间")
+                    .icon(icons::CLOCK)
+                    .desc("到期后图床会删除图片")
+                    .right_width(COMBO_WIDTH)
+                    .show(ui, &look, |ui| {
+                        egui::ComboBox::from_id_salt("litterbox-expiry")
+                            .width(COMBO_WIDTH)
+                            .selected_text(current.label())
+                            .show_ui(ui, |ui| {
+                                for expiry in LitterboxExpiry::ALL {
+                                    ui.selectable_value(
+                                        &mut self.draft.config.upload.litterbox.expiry,
+                                        expiry,
+                                        expiry.label(),
+                                    );
+                                }
+                            });
+                    });
             }
             UploadProvider::Custom => self.custom_upload_fields(ui),
         }
-        ui.horizontal(|ui| {
-            ui.label("超时（秒）");
-            ui.add(
-                egui::DragValue::new(&mut self.draft.config.upload.timeout_secs)
-                    .range(TIMEOUT_SECS_RANGE),
-            );
-            ui.label("大小上限（MiB）");
-            ui.add(egui::DragValue::new(&mut self.draft.max_mib).range(MAX_MIB_RANGE));
-        });
-        self.show_issue(ui, "upload.timeout_secs");
-        self.show_issue(ui, "upload.max_bytes");
+        let timeout_error = self.issue("upload.timeout_secs");
+        Card::new("超时")
+            .icon(icons::CLOCK)
+            .desc("单次上传的等待上限")
+            .error(timeout_error.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.config.upload.timeout_secs)
+                        .range(TIMEOUT_SECS_RANGE)
+                        .suffix(" 秒"),
+                );
+            });
+        let size_error = self.issue("upload.max_bytes");
+        Card::new("大小上限")
+            .icon(icons::DOCUMENT)
+            .desc("超过上限的截图不会上传")
+            .error(size_error.as_deref())
+            .right_width(130.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.max_mib)
+                        .range(MAX_MIB_RANGE)
+                        .suffix(" MiB"),
+                );
+            });
     }
 
     fn custom_upload_fields(&mut self, ui: &mut egui::Ui) {
-        ui.label("上传端点（http 或 https）");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.draft.config.upload.custom.endpoint)
-                .desired_width(f32::INFINITY),
-        );
-        self.show_issue(ui, "upload.custom.endpoint");
-        ui.horizontal(|ui| {
-            ui.label("文件字段名");
-            ui.text_edit_singleline(&mut self.draft.config.upload.custom.file_field);
-        });
-        self.show_issue(ui, "upload.custom.file_field");
-        ui.horizontal(|ui| {
-            ui.label("响应格式");
-            let current = self.draft.config.upload.custom.response;
-            egui::ComboBox::from_id_salt("custom-response")
-                .selected_text(response_label(current))
-                .show_ui(ui, |ui| {
-                    for option in [ResponseKind::Json, ResponseKind::Text] {
-                        ui.selectable_value(
-                            &mut self.draft.config.upload.custom.response,
-                            option,
-                            response_label(option),
-                        );
-                    }
-                });
-        });
-        if self.draft.config.upload.custom.response == ResponseKind::Json {
-            ui.horizontal(|ui| {
-                ui.label("JSON 指针");
-                ui.text_edit_singleline(&mut self.draft.config.upload.custom.json_pointer);
+        let look = self.look;
+        let endpoint_error = self.issue("upload.custom.endpoint");
+        let endpoint = &mut self.draft.config.upload.custom.endpoint;
+        Card::new("上传端点")
+            .icon(icons::LINK)
+            .desc("http 或 https 地址")
+            .error(endpoint_error.as_deref())
+            .show_wide(
+                ui,
+                &look,
+                |_| {},
+                |ui| {
+                    let width = ui.available_width();
+                    text_input(ui, endpoint, width);
+                },
+            );
+        let field_error = self.issue("upload.custom.file_field");
+        let file_field = &mut self.draft.config.upload.custom.file_field;
+        Card::new("文件字段名")
+            .icon(icons::EDIT)
+            .desc("表单里图片文件使用的字段名")
+            .error(field_error.as_deref())
+            .right_width(FIELD_WIDTH)
+            .show(ui, &look, |ui| {
+                text_input(ui, file_field, FIELD_WIDTH);
             });
-            self.show_issue(ui, "upload.custom.json_pointer");
+        let current = self.draft.config.upload.custom.response;
+        Card::new("响应格式")
+            .icon(icons::DOCUMENT)
+            .desc("图床返回图片地址的方式")
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("custom-response")
+                    .width(COMBO_WIDTH)
+                    .selected_text(response_label(current))
+                    .show_ui(ui, |ui| {
+                        for option in [ResponseKind::Json, ResponseKind::Text] {
+                            ui.selectable_value(
+                                &mut self.draft.config.upload.custom.response,
+                                option,
+                                response_label(option),
+                            );
+                        }
+                    });
+            });
+        if self.draft.config.upload.custom.response == ResponseKind::Json {
+            let pointer_error = self.issue("upload.custom.json_pointer");
+            let pointer = &mut self.draft.config.upload.custom.json_pointer;
+            Card::new("JSON 指针")
+                .icon(icons::EDIT)
+                .desc("图片地址在响应 JSON 里的位置")
+                .error(pointer_error.as_deref())
+                .right_width(FIELD_WIDTH)
+                .show(ui, &look, |ui| {
+                    text_input(ui, pointer, FIELD_WIDTH);
+                });
         }
     }
 
     fn privacy_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("隐私");
+        let look = self.look;
+        group_label(ui, &look, "隐私");
         let host = self
             .draft
             .config
@@ -449,115 +601,209 @@ impl SettingsApp {
             .acknowledged_host
             .trim()
             .to_string();
-        let shown = if host.is_empty() {
-            "尚未确认"
+        let desc = if host.is_empty() {
+            "尚未确认；下次上传前会询问".to_string()
         } else {
-            host.as_str()
+            format!("{host}；重置后下次上传前会重新询问")
         };
-        ui.horizontal(|ui| {
-            ui.label(format!("已确认的图床：{shown}"));
-            if ui.button("重置确认").clicked() {
-                self.draft.config.privacy.acknowledged_host.clear();
-            }
-        });
-        ui.weak("重置后下次上传前会重新询问");
-        self.show_issue(ui, "privacy.acknowledged_host");
+        let error = self.issue("privacy.acknowledged_host");
+        Card::new("已确认的图床")
+            .icon(icons::LOCK)
+            .desc(&desc)
+            .error(error.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                if secondary_button(ui, &look, "重置确认").clicked() {
+                    self.draft.config.privacy.acknowledged_host.clear();
+                }
+            });
     }
 
     fn screenshot_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("保存");
-        ui.label("保存目录（绝对路径；留空则只复制到剪贴板）");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.draft.config.screenshot.save_dir)
-                .desired_width(f32::INFINITY),
-        );
-        self.show_issue(ui, "screenshot.save_dir");
-        ui.separator();
-        ui.heading("套索");
-        ui.horizontal(|ui| {
-            ui.label("外扩边距（像素）");
-            ui.add(
-                egui::DragValue::new(&mut self.draft.config.selection.lasso.padding)
-                    .range(LASSO_PADDING_RANGE),
+        let look = self.look;
+        group_label(ui, &look, "保存");
+        let dir_error = self.issue("screenshot.save_dir");
+        let save_dir = &mut self.draft.config.screenshot.save_dir;
+        Card::new("保存目录")
+            .icon(icons::FOLDER)
+            .desc("绝对路径；留空则只复制到剪贴板")
+            .error(dir_error.as_deref())
+            .show_wide(
+                ui,
+                &look,
+                |_| {},
+                |ui| {
+                    let width = ui.available_width();
+                    text_input(ui, save_dir, width);
+                },
             );
-            ui.label("线宽（像素）");
-            ui.add(
-                egui::DragValue::new(&mut self.draft.config.selection.lasso.stroke_width)
-                    .range(LASSO_STROKE_WIDTH_RANGE),
-            );
-        });
-        self.show_issue(ui, "selection.lasso.padding");
-        self.show_issue(ui, "selection.lasso.stroke_width");
+        group_label(ui, &look, "套索");
+        let padding_error = self.issue("selection.lasso.padding");
+        Card::new("外扩边距")
+            .icon(icons::EDIT)
+            .desc("套索外围多截取的范围")
+            .error(padding_error.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.config.selection.lasso.padding)
+                        .range(LASSO_PADDING_RANGE)
+                        .suffix(" 像素"),
+                );
+            });
+        let stroke_error = self.issue("selection.lasso.stroke_width");
+        Card::new("线宽")
+            .icon(icons::EDIT)
+            .desc("套索轨迹的粗细")
+            .error(stroke_error.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.config.selection.lasso.stroke_width)
+                        .range(LASSO_STROKE_WIDTH_RANGE)
+                        .suffix(" 像素"),
+                );
+            });
     }
 
     fn about_page(&self, ui: &mut egui::Ui) {
-        ui.heading("lenswin");
-        ui.label(format!("版本 {}", env!("CARGO_PKG_VERSION")));
-        ui.label(format!("运行方式：{}", self.mode_label));
-        ui.label("配置文件：");
-        ui.monospace(&self.config_path_text);
-        ui.weak("设置由主程序保存；手写在配置文件里的注释会在保存时丢失");
+        let look = self.look;
+        let p = look.palette;
+        Card::new("lenswin")
+            .icon(icons::INFO)
+            .desc(&format!("版本 {}", env!("CARGO_PKG_VERSION")))
+            .show(ui, &look, |_| {});
+        Card::new("运行方式")
+            .icon(icons::SETTINGS)
+            .desc(&self.mode_label)
+            .show(ui, &look, |_| {});
+        Card::new("配置文件").icon(icons::DOCUMENT).show_wide(
+            ui,
+            &look,
+            |_| {},
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&self.config_path_text)
+                            .monospace()
+                            .color(p.text_dim),
+                    )
+                    .wrap(),
+                );
+            },
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("设置由主程序保存；手写在配置文件里的注释会在保存时丢失")
+                .size(FONT_DESC)
+                .color(p.text_dim),
+        );
     }
 
     fn side_panel(&mut self, ctx: &egui::Context) {
+        let look = self.look;
         egui::SidePanel::left("pages")
             .resizable(false)
-            .exact_width(140.0)
+            .exact_width(NAV_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(look.palette.nav)
+                    .inner_margin(egui::Margin::symmetric(0, 12)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for page in Page::ALL {
-                    ui.selectable_value(&mut self.page, page, page.title());
+                    let selected = self.page == page;
+                    if nav_item(ui, &look, selected, icons::page_icon(page), page.title()).clicked()
+                    {
+                        self.page = page;
+                    }
                 }
             });
     }
 
     fn bottom_panel(&mut self, ctx: &egui::Context) -> Option<ButtonAction> {
+        let look = self.look;
+        let p = look.palette;
         let mut action = None;
-        egui::TopBottomPanel::bottom("buttons").show(ctx, |ui| {
-            ui.add_space(6.0);
-            if let Some(feedback) = &self.feedback {
-                let color = match feedback.kind {
-                    FeedbackKind::Success => ui.visuals().text_color(),
-                    FeedbackKind::Warning => ui.visuals().warn_fg_color,
-                    FeedbackKind::Error => ui.visuals().error_fg_color,
+        egui::TopBottomPanel::bottom("buttons")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.window)
+                    .inner_margin(egui::Margin::symmetric(PAGE_MARGIN_X, 12)),
+            )
+            .show(ctx, |ui| {
+                let buttons_width = if self.stale_prompt {
+                    BUTTONS_WIDTH + STALE_BUTTONS_WIDTH
+                } else {
+                    BUTTONS_WIDTH
                 };
-                ui.colored_label(color, &feedback.text);
-            }
-            if self.stale_prompt {
+                let total = ui.available_width();
                 ui.horizontal(|ui| {
-                    if ui.button("重新载入").clicked() {
-                        action = Some(ButtonAction::Reload);
-                    }
-                    if ui.button("仍然覆盖").clicked() {
-                        action = Some(ButtonAction::Overwrite);
-                    }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2((total - buttons_width - 12.0).max(80.0), 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if let Some(feedback) = &self.feedback {
+                                let color = match feedback.kind {
+                                    FeedbackKind::Success => p.text_dim,
+                                    FeedbackKind::Warning => p.warn,
+                                    FeedbackKind::Error => p.error,
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&feedback.text)
+                                            .size(FONT_DESC)
+                                            .color(color),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if secondary_button(ui, &look, "取消").clicked() {
+                                action = Some(ButtonAction::Cancel);
+                            }
+                            if secondary_button(ui, &look, "应用").clicked() {
+                                action = Some(ButtonAction::Apply);
+                            }
+                            if primary_button(ui, &look, "确定").clicked() {
+                                action = Some(ButtonAction::Ok);
+                            }
+                            if self.stale_prompt {
+                                ui.add_space(12.0);
+                                if secondary_button(ui, &look, "仍然覆盖").clicked() {
+                                    action = Some(ButtonAction::Overwrite);
+                                }
+                                if secondary_button(ui, &look, "重新载入").clicked() {
+                                    action = Some(ButtonAction::Reload);
+                                }
+                            }
+                        },
+                    );
                 });
-            }
-            ui.horizontal(|ui| {
-                if ui.button("确定").clicked() {
-                    action = Some(ButtonAction::Ok);
-                }
-                if ui.button("应用").clicked() {
-                    action = Some(ButtonAction::Apply);
-                }
-                if ui.button("取消").clicked() {
-                    action = Some(ButtonAction::Cancel);
-                }
             });
-            ui.add_space(6.0);
-        });
         action
     }
 
     fn banners(&self, ui: &mut egui::Ui) {
-        if !self.font_loaded {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
+        let look = self.look;
+        if !self.fonts.chinese {
+            banner(
+                ui,
+                &look,
+                BannerKind::Warn,
                 "未找到系统中文字体，中文可能显示为方块",
             );
         }
         if let Some(error) = &self.load_error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+            banner(ui, &look, BannerKind::Error, error);
         }
     }
 }
@@ -576,37 +822,81 @@ fn response_label(kind: ResponseKind) -> &'static str {
     }
 }
 
-/// 四个修饰键复选框加一个主键下拉框。
-fn hotkey_editor(ui: &mut egui::Ui, id: &str, choice: &mut HotkeyChoice, keys: &[Key]) {
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut choice.ctrl, "Ctrl");
-        ui.checkbox(&mut choice.alt, "Alt");
-        ui.checkbox(&mut choice.shift, "Shift");
-        ui.checkbox(&mut choice.win, "Win");
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(choice.key.to_string())
-            .show_ui(ui, |ui| {
-                for key in keys {
-                    ui.selectable_value(&mut choice.key, *key, key.to_string());
-                }
-            });
-    });
+/// 快捷键卡片：右侧是按键小方块预览，下方是四个修饰键开关加主键下拉框。
+fn hotkey_card(
+    ui: &mut egui::Ui,
+    look: &Look,
+    keys: &[Key],
+    id: &str,
+    title: &str,
+    error: Option<&str>,
+    choice: &mut HotkeyChoice,
+) {
+    let labels = hotkey_cap_labels(choice);
+    Card::new(title)
+        .icon(icons::KEYBOARD)
+        .desc("点按下方修饰键并选择主键")
+        .error(error)
+        .right_width(260.0)
+        .show_wide(
+            ui,
+            look,
+            |ui| key_caps(ui, look, &labels),
+            |ui| {
+                ui.horizontal(|ui| {
+                    modifier_chip(ui, look, &mut choice.ctrl, "Ctrl");
+                    modifier_chip(ui, look, &mut choice.alt, "Alt");
+                    modifier_chip(ui, look, &mut choice.shift, "Shift");
+                    modifier_chip(ui, look, &mut choice.win, "Win");
+                    egui::ComboBox::from_id_salt(id)
+                        .width(90.0)
+                        .height(320.0)
+                        .selected_text(choice.key.to_string())
+                        .show_ui(ui, |ui| {
+                            for key in keys {
+                                ui.selectable_value(&mut choice.key, *key, key.to_string());
+                            }
+                        });
+                });
+            },
+        );
 }
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_theme(ctx);
+        let p = self.look.palette;
         self.side_panel(ctx);
         let action = self.bottom_panel(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.banners(ui);
-            egui::ScrollArea::vertical().show(ui, |ui| match self.page {
-                Page::General => self.general_page(ui),
-                Page::Hotkeys => self.hotkeys_page(ui),
-                Page::SearchUpload => self.search_upload_page(ui),
-                Page::Screenshot => self.screenshot_page(ui),
-                Page::About => self.about_page(ui),
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.content)
+                    .inner_margin(egui::Margin {
+                        left: PAGE_MARGIN_X,
+                        right: PAGE_MARGIN_X,
+                        top: 16,
+                        bottom: 0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = CARD_GAP;
+                let look = self.look;
+                page_title(ui, &look, self.page.title());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.banners(ui);
+                        match self.page {
+                            Page::General => self.general_page(ui),
+                            Page::Hotkeys => self.hotkeys_page(ui),
+                            Page::SearchUpload => self.search_upload_page(ui),
+                            Page::Screenshot => self.screenshot_page(ui),
+                            Page::About => self.about_page(ui),
+                        }
+                        ui.add_space(12.0);
+                    });
             });
-        });
         match action {
             Some(ButtonAction::Apply) => {
                 self.apply(false);
