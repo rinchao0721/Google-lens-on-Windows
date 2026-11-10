@@ -1,0 +1,32 @@
+// 资源脚本：图标、manifest、版本信息。版本宏由 build.rs 从 Cargo.toml 传入。
+1 ICON "assets/lenswin.ico"
+1 24 "lenswin.manifest"
+
+1 VERSIONINFO
+FILEVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+PRODUCTVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName", ""
+            VALUE "FileDescription", "lenswin"
+            VALUE "FileVersion", VERSION_STRING
+            VALUE "InternalName", "lenswin"
+            VALUE "LegalCopyright", "Copyright (c) 2026 LinYU"
+            VALUE "OriginalFilename", "lenswin.exe"
+            VALUE "ProductName", "lenswin"
+            VALUE "ProductVersion", VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

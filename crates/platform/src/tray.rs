@@ -1,13 +1,15 @@
 //! 托盘图标与右键菜单。
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, GetCursorPos, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+    AppendMenuW, GetCursorPos, GetSystemMetrics, HICON, IDI_APPLICATION, IMAGE_ICON, LR_SHARED,
+    LoadIconW, LoadImageW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW,
+    SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_NULL,
 };
 use windows::core::PCWSTR;
 
@@ -56,6 +58,33 @@ impl MenuItem {
             checked: false,
             enabled: true,
         }
+    }
+}
+
+/// exe 内嵌图标的资源编号，与 `app/lenswin.rc` 一致。
+const APP_ICON_RESOURCE_ID: usize = 1;
+
+/// 加载 exe 内嵌的托盘尺寸图标；没有内嵌资源（如测试进程）时退回系统默认图标。
+fn load_app_icon() -> Result<HICON, PlatformError> {
+    // SAFETY: 传入 None 取当前模块句柄。
+    let module = unsafe { GetModuleHandleW(None) }.map_err(win32("GetModuleHandleW"))?;
+    // SAFETY: 无前置条件。
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    // SAFETY: 资源编号用 MAKEINTRESOURCE 约定编码为指针值；LR_SHARED 返回的共享句柄无需销毁。
+    let loaded = unsafe {
+        LoadImageW(
+            Some(HINSTANCE(module.0)),
+            PCWSTR(std::ptr::without_provenance::<u16>(APP_ICON_RESOURCE_ID)),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_SHARED,
+        )
+    };
+    match loaded {
+        Ok(handle) => Ok(HICON(handle.0)),
+        // SAFETY: 传入 None 加载系统预置图标，返回共享句柄，无需销毁。
+        Err(_) => unsafe { LoadIconW(None, IDI_APPLICATION) }.map_err(win32("LoadIconW")),
     }
 }
 
@@ -154,9 +183,7 @@ impl TrayIcon {
     }
 
     fn shell_add(&self) -> Result<(), PlatformError> {
-        // 暂用系统默认图标，应用图标在分发阶段嵌入资源后替换
-        // SAFETY: 传入 None 加载系统预置图标，返回共享句柄，无需销毁。
-        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.map_err(win32("LoadIconW"))?;
+        let icon = load_app_icon()?;
         let mut nid = self.base_data();
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;

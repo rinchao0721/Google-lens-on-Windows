@@ -31,6 +31,10 @@ pub enum SettingsError {
 
 /// 窗口初始逻辑尺寸。
 const WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
+/// 窗口图标：64x64 的 RGBA 原始像素，由 `assets/icon-64.rgba` 嵌入。
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
+/// 窗口图标边长。
+const WINDOW_ICON_SIDE: u32 = 64;
 /// 窗口最小逻辑尺寸。
 const WINDOW_MIN_SIZE: [f32; 2] = [560.0, 420.0];
 
@@ -48,6 +52,11 @@ pub fn run() -> Result<(), SettingsError> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_WINDOW_TITLE)
+            .with_icon(egui::IconData {
+                rgba: WINDOW_ICON_RGBA.to_vec(),
+                width: WINDOW_ICON_SIDE,
+                height: WINDOW_ICON_SIDE,
+            })
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(WINDOW_MIN_SIZE),
         ..Default::default()
@@ -61,4 +70,15 @@ pub fn run() -> Result<(), SettingsError> {
         }),
     )
     .map_err(|e| SettingsError::Window(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_icon_has_exact_rgba_length() {
+        let expected = usize::try_from(WINDOW_ICON_SIDE * WINDOW_ICON_SIDE * 4).expect("尺寸");
+        assert_eq!(WINDOW_ICON_RGBA.len(), expected);
+    }
 }

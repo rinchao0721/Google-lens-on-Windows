@@ -401,11 +401,12 @@ impl<'a> Dispatcher<'a> {
         if config.privacy.is_acknowledged(&summary.host) {
             return true;
         }
-        let text = format!(
-            "截图将上传到 {}（{}）。\n\n任何拿到链接的人都能看到这张图片。\n是否继续上传？",
-            summary.host, summary.retention
+        let heading = format!("截图将上传到 {}", summary.host);
+        let body = format!(
+            "{}\n\n任何拿到链接的人都能看到这张图片。",
+            summary.retention
         );
-        match dialog::confirm("lenswin 隐私提示", &text) {
+        match dialog::ask("lenswin 隐私提示", &heading, &body, "继续上传", "取消") {
             Ok(true) => {
                 self.apply_change(|c| c.privacy.acknowledged_host = summary.host);
                 true

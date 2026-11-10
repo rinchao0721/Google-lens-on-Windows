@@ -19,6 +19,8 @@ publish = false
 [workspace.dependencies]
 # 设置窗口专用；关闭默认特性，只开 glow 后端、内置字体与无障碍支持
 eframe = { version = "0.32.3", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+# 构建期嵌入图标、manifest 和版本信息，只被 app 的 build.rs 使用
+embed-resource = "3.0.12"
 # 内部 crate
 lenswin-core = { path = "crates/core" }
 lenswin-platform = { path = "crates/platform" }
@@ -51,6 +53,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
