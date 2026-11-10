@@ -19,12 +19,12 @@ use lenswin_actions::ActionRegistry;
 use lenswin_core::ipc::{SETTINGS_ARG, TRAY_MUTEX_NAME, TRAY_WINDOW_CLASS};
 use lenswin_platform::clipboard::ClipboardOwner;
 use lenswin_platform::dialog;
+use lenswin_platform::message_loop;
 use lenswin_platform::notify::NotifyLevel;
 use lenswin_platform::paths::{AppPaths, Mode};
 use lenswin_platform::single_instance::{self, Acquired};
 use lenswin_platform::tray::TrayIcon;
 use lenswin_platform::window::{MessageWindow, clear_copydata_handler, set_copydata_handler};
-use lenswin_platform::{dpi, message_loop};
 
 use crate::config_store::ConfigStore;
 use crate::dispatcher::Dispatcher;
@@ -52,8 +52,7 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    // 必须早于任何窗口创建，之后所有坐标才是物理像素
-    let dpi_result = dpi::enable_per_monitor_v2();
+    // DPI 感知（PerMonitorV2）由内嵌 manifest 声明，坐标均为物理像素
     // 先抢互斥量再碰日志，避免第二个实例轮转或打开正被首个实例写入的日志
     let _instance =
         match single_instance::acquire(TRAY_MUTEX_NAME).context("创建单实例互斥量失败")? {
@@ -75,9 +74,6 @@ fn run() -> anyhow::Result<()> {
         paths.mode.label(),
         paths.config_dir.display()
     );
-    if let Err(e) = dpi_result {
-        log::debug!("设置 DPI 感知未生效（可能已由 manifest 声明）：{e}");
-    }
 
     let window = MessageWindow::create(TRAY_WINDOW_CLASS).context("创建消息窗口失败")?;
     let notifier = window.task_notifier();

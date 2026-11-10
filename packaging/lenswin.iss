@@ -57,23 +57,52 @@ Name: "{autoprograms}\lenswin"; Filename: "{app}\lenswin.exe"
 Name: "{autodesktop}\lenswin"; Filename: "{app}\lenswin.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\lenswin.exe"; Description: "启动 lenswin"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "{app}\lenswin.exe"; Description: "Launch lenswin"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  RunValue = 'lenswin';
+
+// 取命令行里的 exe 路径：去掉首尾空白和引号，忽略后面的参数
+function ExePathOfCommand(Command: String): String;
+var
+  Rest: String;
+  QuoteEnd: Integer;
+begin
+  Rest := Trim(Command);
+  if (Length(Rest) > 0) and (Rest[1] = '"') then
+  begin
+    Delete(Rest, 1, 1);
+    QuoteEnd := Pos('"', Rest);
+    if QuoteEnd > 0 then
+      Rest := Copy(Rest, 1, QuoteEnd - 1);
+  end;
+  Result := Rest;
+end;
+
+// 自启项指向本次卸载的安装目录时才算「属于安装版」
+function RunValueBelongsToThisInstall: Boolean;
+var
+  Command: String;
+begin
+  Result := False;
+  if RegQueryStringValue(HKCU, RunKey, RunValue, Command) then
+    Result := CompareText(ExePathOfCommand(Command), ExpandConstant('{app}\lenswin.exe')) = 0;
+end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
-    // 开机自启项由程序写入当前用户的注册表，卸载时一并清理；不存在时无影响
-    RegDeleteValue(HKCU, RunKey, 'lenswin');
+    // 自启项由程序写入当前用户的注册表；指向别处（如便携版）的不能删
+    if RunValueBelongsToThisInstall then
+      RegDeleteValue(HKCU, RunKey, RunValue);
   if CurUninstallStep = usPostUninstall then
   begin
     // 只能处理执行卸载的这个用户的数据，其他用户的配置不动
     if not UninstallSilent then
-      if MsgBox('是否同时删除当前用户的 lenswin 配置和日志？' + #13#10#13#10 +
-                '其他用户的配置不会被删除。', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      if MsgBox('Also delete the current user''s lenswin settings and logs?' + #13#10#13#10 +
+                'Settings of other users are not removed.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
       begin
         DelTree(ExpandConstant('{userappdata}\lenswin'), True, True, True);
         DelTree(ExpandConstant('{localappdata}\lenswin'), True, True, True);
