@@ -224,6 +224,25 @@ pub fn modifier_chip(ui: &mut Ui, look: &Look, on: &mut bool, label: &str) -> Re
     response
 }
 
+/// 快捷键录制按钮：录制中为强调色底并提示按键。
+pub fn record_button(ui: &mut Ui, look: &Look, recording: bool) -> Response {
+    let label = if recording {
+        "请按组合键，Esc 取消"
+    } else {
+        "录制"
+    };
+    pill(
+        ui,
+        look,
+        label,
+        PillStyle::Chip {
+            selected: recording,
+        },
+        26.0,
+        72.0,
+    )
+}
+
 /// 一组按键小方块，如 Ctrl、Alt、F13。
 pub fn key_caps(ui: &mut Ui, look: &Look, labels: &[String]) {
     let p = &look.palette;

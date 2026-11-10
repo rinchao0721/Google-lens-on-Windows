@@ -301,6 +301,39 @@ impl HotkeyChoice {
     }
 }
 
+/// 已知会被 Windows 抢先处理的组合及其用途；这类组合有的能注册成功，试注册测不出来。
+const WINDOWS_RESERVED: [(&str, &str); 18] = [
+    ("Win+L", "锁屏"),
+    ("Win+D", "显示桌面"),
+    ("Win+E", "文件资源管理器"),
+    ("Win+R", "运行"),
+    ("Win+I", "设置"),
+    ("Win+S", "搜索"),
+    ("Win+A", "快速设置"),
+    ("Win+N", "通知中心"),
+    ("Win+V", "剪贴板历史"),
+    ("Win+X", "快速链接菜单"),
+    ("Win+Tab", "任务视图"),
+    ("Win+Shift+S", "截图"),
+    ("Win+PrintScreen", "截图并保存"),
+    ("Alt+Tab", "切换窗口"),
+    ("Alt+F4", "关闭窗口"),
+    ("Ctrl+Shift+Escape", "任务管理器"),
+    ("Ctrl+Escape", "开始菜单"),
+    ("Ctrl+Alt+Delete", "安全选项"),
+];
+
+/// 命中 Windows 保留组合时返回其用途，供界面提示「可能被系统占用」。
+pub fn reserved_by_windows(hotkey: &Hotkey) -> Option<&'static str> {
+    if hotkey.modifiers == Modifiers::WIN && matches!(hotkey.key, Key::Digit(_)) {
+        return Some("打开任务栏程序");
+    }
+    WINDOWS_RESERVED
+        .iter()
+        .find(|(text, _)| text.parse::<Hotkey>().is_ok_and(|h| h == *hotkey))
+        .map(|(_, usage)| *usage)
+}
+
 fn parse_modifier(token: &str) -> Option<Modifiers> {
     match token.to_ascii_lowercase().as_str() {
         "ctrl" | "control" => Some(Modifiers::CTRL),
@@ -499,6 +532,33 @@ mod tests {
         choice.ctrl = false;
         assert_eq!(choice.to_text(), Err(HotkeyError::NoModifier));
         assert!(choice.modifiers().is_empty());
+    }
+
+    #[test]
+    fn reserved_table_entries_all_parse() {
+        for (text, _) in WINDOWS_RESERVED {
+            assert!(parse(text).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn reserved_combinations_are_detected() {
+        let usage = |s: &str| reserved_by_windows(&parse(s).expect("解析"));
+        assert_eq!(usage("Win+L"), Some("锁屏"));
+        assert_eq!(usage("shift+win+s"), Some("截图"));
+        assert_eq!(usage("Ctrl+Shift+Esc"), Some("任务管理器"));
+        assert_eq!(usage("Win+1"), Some("打开任务栏程序"));
+        assert_eq!(usage("Win+0"), Some("打开任务栏程序"));
+    }
+
+    #[test]
+    fn extra_or_missing_modifier_is_not_reserved() {
+        let usage = |s: &str| reserved_by_windows(&parse(s).expect("解析"));
+        assert_eq!(usage("Ctrl+Win+L"), None);
+        assert_eq!(usage("Win+Shift+1"), None);
+        assert_eq!(usage("Ctrl+S"), None);
+        assert_eq!(usage("Shift+Win+Z"), None);
+        assert_eq!(usage("Win+F1"), None);
     }
 
     #[test]

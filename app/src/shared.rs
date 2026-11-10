@@ -3,11 +3,12 @@
 use std::cell::RefCell;
 
 use lenswin_core::config::HotkeysConfig;
-use lenswin_core::ipc::{IpcResult, decode_apply_config};
+use lenswin_core::hotkey::Hotkey;
+use lenswin_core::ipc::{IpcResult, MessageKind, decode_apply_config, decode_probe_hotkey};
 use lenswin_platform::window::WindowHandle;
 
 use crate::config_store::{ConfigStore, SyncApplyError};
-use crate::hotkeys::{HotkeySet, ReplaceReport};
+use crate::hotkeys::{HotkeySet, ReplaceReport, probe};
 
 /// 主线程内共享的状态；回调与分发器各持有一份 `Rc`。
 ///
@@ -60,17 +61,58 @@ pub fn handle_submission<T>(
     hotkey_result(&replace(&mut held, &hotkeys))
 }
 
+/// 处理设置进程的快捷键探测：本程序自己占着的算可用，否则试注册一次。
+///
+/// 只读借用热键集合，借不到返回 [`IpcResult::Busy`]；`owns` 与 `try_register`
+/// 由调用方提供，便于脱离 Win32 测试。
+pub fn handle_probe<T>(
+    slot: &RefCell<T>,
+    owns: impl FnOnce(&T, &Hotkey) -> bool,
+    try_register: impl FnOnce(&Hotkey) -> Result<(), String>,
+    kind: u32,
+    payload: &[u8],
+) -> IpcResult {
+    let hotkey = match decode_probe_hotkey(kind, payload) {
+        Ok(hotkey) => hotkey,
+        Err(result) => return result,
+    };
+    let Ok(held) = slot.try_borrow() else {
+        return IpcResult::Busy;
+    };
+    if owns(&held, &hotkey) {
+        return IpcResult::Ok;
+    }
+    drop(held);
+    match try_register(&hotkey) {
+        Ok(()) => IpcResult::Ok,
+        Err(reason) => {
+            log::debug!("探测快捷键 {hotkey} 不可用：{reason}");
+            IpcResult::HotkeyConflict
+        }
+    }
+}
+
 impl AppShared {
-    /// 供窗口过程回调使用：返回结果码数值。
-    pub fn on_submission(&self, kind: u32, payload: &[u8]) -> u32 {
-        handle_submission(
-            &self.store,
-            &self.hotkeys,
-            |set, hotkeys| set.replace(self.window, hotkeys),
-            kind,
-            payload,
-        )
-        .code()
+    /// 供窗口过程回调使用：按消息类型分流，返回结果码数值。
+    pub fn on_message(&self, kind: u32, payload: &[u8]) -> u32 {
+        let result = match MessageKind::from_code(kind) {
+            Some(MessageKind::ApplyConfig) => handle_submission(
+                &self.store,
+                &self.hotkeys,
+                |set, hotkeys| set.replace(self.window, hotkeys),
+                kind,
+                payload,
+            ),
+            Some(MessageKind::ProbeHotkey) => handle_probe(
+                &self.hotkeys,
+                HotkeySet::owns,
+                |hotkey| probe(self.window, hotkey),
+                kind,
+                payload,
+            ),
+            None => IpcResult::InvalidMessage,
+        };
+        result.code()
     }
 }
 
@@ -80,7 +122,7 @@ mod tests {
     use crate::dispatcher::Command;
     use crate::hotkeys::Failure;
     use lenswin_core::config::Config;
-    use lenswin_core::ipc::{MAX_PAYLOAD_BYTES, MessageKind};
+    use lenswin_core::ipc::MAX_PAYLOAD_BYTES;
     use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -223,5 +265,78 @@ mod tests {
         };
         assert_eq!(hotkey_result(&report), IpcResult::Ok);
         assert_eq!(hotkey_result(&conflict()), IpcResult::HotkeyConflict);
+    }
+
+    const PROBE: u32 = 2;
+
+    #[test]
+    fn probe_message_kind_matches_wire_value() {
+        assert_eq!(MessageKind::ProbeHotkey.code(), PROBE);
+    }
+
+    #[test]
+    fn probe_of_own_hotkey_is_ok_without_registering() {
+        let slot = RefCell::new(());
+        let tried = Cell::new(false);
+        let result = handle_probe(
+            &slot,
+            |_, _| true,
+            |_| {
+                tried.set(true);
+                Err("不应调用".to_string())
+            },
+            PROBE,
+            b"Win+Shift+A",
+        );
+        assert_eq!(result, IpcResult::Ok);
+        assert!(!tried.get());
+    }
+
+    #[test]
+    fn probe_reports_register_outcome() {
+        let slot = RefCell::new(());
+        let free = handle_probe(&slot, |_, _| false, |_| Ok(()), PROBE, b"Ctrl+Alt+K");
+        assert_eq!(free, IpcResult::Ok);
+        let taken = handle_probe(
+            &slot,
+            |_, _| false,
+            |_| Err("占用".to_string()),
+            PROBE,
+            b"Ctrl+Alt+K",
+        );
+        assert_eq!(taken, IpcResult::HotkeyConflict);
+    }
+
+    #[test]
+    fn probe_rejects_bad_messages_before_touching_state() {
+        let slot = RefCell::new(());
+        let touched = Cell::new(false);
+        let check = |kind: u32, payload: &[u8]| {
+            handle_probe(
+                &slot,
+                |_, _| {
+                    touched.set(true);
+                    false
+                },
+                |_| {
+                    touched.set(true);
+                    Ok(())
+                },
+                kind,
+                payload,
+            )
+        };
+        assert_eq!(check(APPLY, b"Ctrl+A"), IpcResult::InvalidMessage);
+        assert_eq!(check(PROBE, b"Ctrl+"), IpcResult::ParseFailed);
+        assert_eq!(check(PROBE, &[b'a'; 65]), IpcResult::PayloadTooLarge);
+        assert!(!touched.get());
+    }
+
+    #[test]
+    fn probe_while_hotkeys_borrowed_is_busy() {
+        let slot = RefCell::new(());
+        let _held = slot.borrow_mut();
+        let result = handle_probe(&slot, |_, _| false, |_| Ok(()), PROBE, b"Ctrl+A");
+        assert_eq!(result, IpcResult::Busy);
     }
 }

@@ -17,15 +17,16 @@ use lenswin_platform::paths::AppPaths;
 use crate::client;
 use crate::fonts::FontStatus;
 use crate::form::{
-    Draft, Feedback, FeedbackKind, HotkeyField, Page, Staleness, changed_hotkeys,
-    config_from_file_text, hotkey_cap_labels, hotkey_clash, hotkey_display, page_of_field,
-    staleness,
+    Draft, Feedback, FeedbackKind, HotkeyField, HotkeyStatus, Page, ProbeState, Staleness,
+    changed_hotkeys, config_from_file_text, hotkey_cap_labels, hotkey_clash, hotkey_status,
+    page_of_field, staleness,
 };
 use crate::icons;
+use crate::recorder::{self, Capture};
 use crate::theme::{self, CARD_GAP, FONT_DESC, Look, NAV_WIDTH, PAGE_MARGIN_X, Palette, ThemeKind};
 use crate::widgets::{
     BannerKind, Card, banner, group_label, key_caps, modifier_chip, nav_item, page_title,
-    primary_button, secondary_button, text_input, toggle,
+    primary_button, record_button, secondary_button, text_input, toggle,
 };
 
 /// 上传大小上限的界面范围（MiB），与 `MAX_BYTES_RANGE` 的上下界一致。
@@ -108,6 +109,10 @@ pub struct SettingsApp {
     autostart_stale: bool,
     exe: Option<PathBuf>,
     keys: Vec<Key>,
+    recording: Option<HotkeyField>,
+    probes: Vec<(String, ProbeState)>,
+    pointer_clicked: bool,
+    record_clicked: bool,
 }
 
 /// 点击底部按钮后要执行的动作。
@@ -159,6 +164,10 @@ impl SettingsApp {
             autostart_stale,
             exe: startup.exe,
             keys: selectable_keys(),
+            recording: None,
+            probes: Vec::new(),
+            pointer_clicked: false,
+            record_clicked: false,
         }
     }
 
@@ -193,6 +202,7 @@ impl SettingsApp {
                 self.baseline = config;
                 self.issues.clear();
                 self.conflicts.clear();
+                self.probes.clear();
                 self.stale_prompt = false;
                 self.set_feedback(FeedbackKind::Success, "已重新载入配置文件");
             }
@@ -258,6 +268,8 @@ impl SettingsApp {
         // 成功或「已保存但热键冲突」时文件内容就是刚提交的配置，作为新的比较基准
         if feedback.kind != FeedbackKind::Error {
             self.baseline = config;
+            // 托盘的热键已变，旧的探测结论作废
+            self.probes.clear();
         }
         self.feedback = Some(feedback);
         ok
@@ -333,40 +345,104 @@ impl SettingsApp {
             );
         }
         let keys = self.keys.clone();
-        for (field, id, title, issue_field, choice) in [
+        for (field, other_field, id, title, issue_field) in [
             (
                 HotkeyField::Search,
+                HotkeyField::Screenshot,
                 "hotkey-search",
                 "圈选搜索",
                 "hotkeys.search",
-                self.draft.search_hotkey,
             ),
             (
                 HotkeyField::Screenshot,
+                HotkeyField::Search,
                 "hotkey-shot",
                 "截屏到剪贴板",
                 "hotkeys.screenshot_copy",
-                self.draft.screenshot_hotkey,
             ),
         ] {
-            let conflict = self
+            let choice = *self.hotkey_mut(field);
+            let other = *self.hotkey_mut(other_field);
+            let applied_conflict = self
                 .conflicts
                 .iter()
-                .any(|(f, c)| *f == field && *c == choice)
-                .then(|| format!("{} 已被其它程序占用", hotkey_display(&choice)));
-            let error = self.issue(issue_field).or(conflict);
-            let target = match field {
-                HotkeyField::Search => &mut self.draft.search_hotkey,
-                HotkeyField::Screenshot => &mut self.draft.screenshot_hotkey,
+                .any(|(f, c)| *f == field && *c == choice);
+            let probe = self.probe_cached(&choice);
+            let status = hotkey_status(
+                &choice,
+                &other,
+                self.issue(issue_field),
+                applied_conflict,
+                probe.as_ref(),
+            );
+            let recording = self.recording == Some(field);
+            let card = HotkeyCard {
+                id,
+                title,
+                status: &status,
+                recording,
             };
-            hotkey_card(ui, &look, &keys, id, title, error.as_deref(), target);
+            if hotkey_card(ui, &look, &keys, &card, self.hotkey_mut(field)) {
+                self.record_clicked = true;
+                self.recording = if recording { None } else { Some(field) };
+            }
         }
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("快捷键至少要选一个修饰键；被其它程序占用时会保存但不生效")
-                .size(FONT_DESC)
-                .color(look.palette.text_dim),
+            egui::RichText::new(
+                "Win 键录不到，请用按钮切换；PrintScreen、Esc 可在「更多按键」里选。被其它程序占用时仍会保存，但不生效",
+            )
+            .size(FONT_DESC)
+            .color(look.palette.text_dim),
         );
+    }
+
+    fn hotkey_mut(&mut self, field: HotkeyField) -> &mut HotkeyChoice {
+        match field {
+            HotkeyField::Search => &mut self.draft.search_hotkey,
+            HotkeyField::Screenshot => &mut self.draft.screenshot_hotkey,
+        }
+    }
+
+    /// 探测结论按快捷键文字缓存，组合不变就不重复询问托盘；没有修饰键时不探测。
+    fn probe_cached(&mut self, choice: &HotkeyChoice) -> Option<ProbeState> {
+        let text = choice.to_text().ok()?;
+        if let Some((_, state)) = self.probes.iter().find(|(t, _)| *t == text) {
+            return Some(state.clone());
+        }
+        let state = client::probe(&text);
+        self.probes.push((text, state.clone()));
+        Some(state)
+    }
+
+    /// 录制态下先于所有控件截获本帧按键；失焦即取消。
+    fn capture_keys(&mut self, ctx: &egui::Context) {
+        self.pointer_clicked = false;
+        self.record_clicked = false;
+        let Some(field) = self.recording else {
+            return;
+        };
+        let (capture, focused, clicked) = ctx.input_mut(|i| {
+            let current = i.modifiers;
+            (
+                recorder::take_capture(&mut i.events, current),
+                i.focused,
+                i.pointer.any_click(),
+            )
+        });
+        self.pointer_clicked = clicked;
+        if !focused {
+            self.recording = None;
+            return;
+        }
+        match capture {
+            Some(Capture::Recorded { key, modifiers }) => {
+                recorder::apply_capture(self.hotkey_mut(field), key, modifiers);
+                self.recording = None;
+            }
+            Some(Capture::Cancelled) => self.recording = None,
+            None => {}
+        }
     }
 
     fn search_upload_page(&mut self, ui: &mut egui::Ui) {
@@ -822,21 +898,35 @@ fn response_label(kind: ResponseKind) -> &'static str {
     }
 }
 
-/// 快捷键卡片：右侧是按键小方块预览，下方是四个修饰键开关加主键下拉框。
+/// 一张快捷键卡片的展示参数。
+struct HotkeyCard<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: &'a HotkeyStatus,
+    recording: bool,
+}
+
+/// 快捷键卡片：右侧是按键小方块预览，下方是修饰键开关、录制按钮、兜底下拉和状态行。
+/// 返回本帧是否点了录制按钮。
 fn hotkey_card(
     ui: &mut egui::Ui,
     look: &Look,
     keys: &[Key],
-    id: &str,
-    title: &str,
-    error: Option<&str>,
+    card: &HotkeyCard<'_>,
     choice: &mut HotkeyChoice,
-) {
+) -> bool {
+    let p = look.palette;
     let labels = hotkey_cap_labels(choice);
-    Card::new(title)
+    let status_color = match card.status {
+        HotkeyStatus::Invalid(_) | HotkeyStatus::Occupied => p.error,
+        HotkeyStatus::Reserved(_) => p.warn,
+        HotkeyStatus::Available => p.ok,
+        HotkeyStatus::Unknown(_) => p.text_dim,
+    };
+    let mut record_clicked = false;
+    Card::new(card.title)
         .icon(icons::KEYBOARD)
-        .desc("点按下方修饰键并选择主键")
-        .error(error)
+        .desc("点「录制」后按下组合键，修饰键可单独点选调整")
         .right_width(260.0)
         .show_wide(
             ui,
@@ -848,23 +938,32 @@ fn hotkey_card(
                     modifier_chip(ui, look, &mut choice.alt, "Alt");
                     modifier_chip(ui, look, &mut choice.shift, "Shift");
                     modifier_chip(ui, look, &mut choice.win, "Win");
-                    egui::ComboBox::from_id_salt(id)
+                    ui.add_space(8.0);
+                    record_clicked = record_button(ui, look, card.recording).clicked();
+                    egui::ComboBox::from_id_salt(card.id)
                         .width(90.0)
                         .height(320.0)
-                        .selected_text(choice.key.to_string())
+                        .selected_text("更多按键")
                         .show_ui(ui, |ui| {
                             for key in keys {
                                 ui.selectable_value(&mut choice.key, *key, key.to_string());
                             }
                         });
                 });
+                ui.label(
+                    egui::RichText::new(card.status.text())
+                        .size(FONT_DESC)
+                        .color(status_color),
+                );
             },
         );
+    record_clicked
 }
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_theme(ctx);
+        self.capture_keys(ctx);
         let p = self.look.palette;
         self.side_panel(ctx);
         let action = self.bottom_panel(ctx);
@@ -897,6 +996,13 @@ impl eframe::App for SettingsApp {
                         ui.add_space(12.0);
                     });
             });
+        // 录制中点了录制按钮以外的地方，视为放弃
+        if self.pointer_clicked && !self.record_clicked {
+            self.recording = None;
+        }
+        if self.page != Page::Hotkeys {
+            self.recording = None;
+        }
         match action {
             Some(ButtonAction::Apply) => {
                 self.apply(false);

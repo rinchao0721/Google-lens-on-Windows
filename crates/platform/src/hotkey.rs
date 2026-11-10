@@ -64,6 +64,13 @@ pub fn register(
     }
 }
 
+impl HotkeyGuard {
+    /// 注册时使用的热键编号。
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+}
+
 impl Drop for HotkeyGuard {
     fn drop(&mut self) {
         // Drop 中无法上报错误，注销失败时热键会随窗口销毁一并释放

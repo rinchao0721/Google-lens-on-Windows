@@ -92,7 +92,7 @@ fn run() -> anyhow::Result<()> {
         window: window.handle(),
     });
     let callback_shared = Rc::clone(&shared);
-    set_copydata_handler(move |kind, payload| callback_shared.on_submission(kind, payload));
+    set_copydata_handler(move |kind, payload| callback_shared.on_message(kind, payload));
     let dispatcher = Dispatcher::new(&tray, &paths, shared, registry, window.task_notifier());
     if let Some(text) = notice {
         log::warn!("{text}");

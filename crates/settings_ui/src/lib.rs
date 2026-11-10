@@ -9,6 +9,7 @@ mod client;
 mod fonts;
 mod form;
 mod icons;
+mod recorder;
 mod theme;
 mod widgets;
 

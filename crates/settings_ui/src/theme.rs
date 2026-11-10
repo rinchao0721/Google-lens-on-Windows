@@ -91,6 +91,8 @@ pub struct Palette {
     pub error: Color32,
     /// 警告。
     pub warn: Color32,
+    /// 成功、可用。
+    pub ok: Color32,
 }
 
 impl Palette {
@@ -112,6 +114,7 @@ impl Palette {
         accent_text: Color32::BLACK,
         error: Color32::from_rgb(0xff, 0x99, 0xa4),
         warn: Color32::from_rgb(0xff, 0xd3, 0x7a),
+        ok: Color32::from_rgb(0x6c, 0xcb, 0x5f),
     };
 
     /// 浅色配色。
@@ -132,6 +135,7 @@ impl Palette {
         accent_text: Color32::WHITE,
         error: Color32::from_rgb(0xc4, 0x2b, 0x1c),
         warn: Color32::from_rgb(0x9d, 0x5d, 0x00),
+        ok: Color32::from_rgb(0x0f, 0x7b, 0x0f),
     };
 
     /// 取主题对应的配色。
@@ -303,6 +307,7 @@ mod tests {
             assert!(contrast_ratio(p.text_dim, p.card) >= 4.5, "{kind:?} 说明");
             assert!(contrast_ratio(p.error, p.card) >= 4.5, "{kind:?} 错误");
             assert!(contrast_ratio(p.warn, p.card) >= 4.5, "{kind:?} 警告");
+            assert!(contrast_ratio(p.ok, p.card) >= 4.5, "{kind:?} 可用");
             assert!(contrast_ratio(p.text, p.button) >= 4.5, "{kind:?} 次级按钮");
         }
     }

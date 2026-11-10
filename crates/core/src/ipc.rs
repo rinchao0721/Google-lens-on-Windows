@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::error::ConfigError;
+use crate::hotkey::Hotkey;
 
 /// 托盘进程隐藏消息窗口的窗口类名。
 pub const TRAY_WINDOW_CLASS: &str = "LenswinTrayWindow";
@@ -17,12 +18,16 @@ pub const SETTINGS_ARG: &str = "--settings";
 pub const SETTINGS_WINDOW_TITLE: &str = "lenswin 设置";
 /// 单条消息负载上限（1 MiB）。
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// 快捷键探测消息的负载上限；最长的合法写法也远小于此。
+pub const MAX_PROBE_BYTES: usize = 64;
 
 /// `WM_COPYDATA` 的 `dwData` 消息类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     /// 提交新配置，负载为 UTF-8 的 TOML 文本。
     ApplyConfig,
+    /// 探测快捷键能否注册，负载为 UTF-8 的快捷键文字；只读，不改任何状态。
+    ProbeHotkey,
 }
 
 impl MessageKind {
@@ -30,6 +35,7 @@ impl MessageKind {
     pub const fn code(self) -> u32 {
         match self {
             MessageKind::ApplyConfig => 1,
+            MessageKind::ProbeHotkey => 2,
         }
     }
 
@@ -37,6 +43,7 @@ impl MessageKind {
     pub const fn from_code(code: u32) -> Option<Self> {
         match code {
             1 => Some(MessageKind::ApplyConfig),
+            2 => Some(MessageKind::ProbeHotkey),
             _ => None,
         }
     }
@@ -98,7 +105,7 @@ impl IpcResult {
 pub fn decode_apply_config(kind_code: u32, payload: &[u8]) -> Result<Config, IpcResult> {
     match MessageKind::from_code(kind_code) {
         Some(MessageKind::ApplyConfig) => {}
-        None => return Err(IpcResult::InvalidMessage),
+        Some(MessageKind::ProbeHotkey) | None => return Err(IpcResult::InvalidMessage),
     }
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(IpcResult::PayloadTooLarge);
@@ -110,11 +117,70 @@ pub fn decode_apply_config(kind_code: u32, payload: &[u8]) -> Result<Config, Ipc
     })
 }
 
+/// 解码并校验一条「探测快捷键」消息；任何失败都映射为结果码，不 panic。
+pub fn decode_probe_hotkey(kind_code: u32, payload: &[u8]) -> Result<Hotkey, IpcResult> {
+    match MessageKind::from_code(kind_code) {
+        Some(MessageKind::ProbeHotkey) => {}
+        Some(MessageKind::ApplyConfig) | None => return Err(IpcResult::InvalidMessage),
+    }
+    if payload.len() > MAX_PROBE_BYTES {
+        return Err(IpcResult::PayloadTooLarge);
+    }
+    let text = std::str::from_utf8(payload).map_err(|_| IpcResult::ParseFailed)?;
+    text.parse().map_err(|_| IpcResult::ParseFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const APPLY: u32 = 1;
+    const PROBE: u32 = 2;
+
+    #[test]
+    fn decodes_probe_hotkey() {
+        let expected: Hotkey = "Shift+Win+A".parse().expect("解析");
+        assert_eq!(decode_probe_hotkey(PROBE, b"Win+Shift+A"), Ok(expected));
+    }
+
+    #[test]
+    fn probe_rejects_wrong_kind() {
+        assert_eq!(
+            decode_probe_hotkey(APPLY, b"Win+A"),
+            Err(IpcResult::InvalidMessage)
+        );
+        assert_eq!(
+            decode_probe_hotkey(0, b"Win+A"),
+            Err(IpcResult::InvalidMessage)
+        );
+        assert_eq!(
+            decode_apply_config(PROBE, b""),
+            Err(IpcResult::InvalidMessage)
+        );
+    }
+
+    #[test]
+    fn probe_payload_limit_boundary() {
+        let mut at_limit = b"Ctrl+A".to_vec();
+        at_limit.resize(MAX_PROBE_BYTES, b' ');
+        assert!(decode_probe_hotkey(PROBE, &at_limit).is_ok());
+        at_limit.push(b' ');
+        assert_eq!(
+            decode_probe_hotkey(PROBE, &at_limit),
+            Err(IpcResult::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn probe_rejects_unparsable_text() {
+        for payload in [&b""[..], b"A", b"Ctrl+", b"Foo+A", &[0xFF, 0xFE]] {
+            assert_eq!(
+                decode_probe_hotkey(PROBE, payload),
+                Err(IpcResult::ParseFailed),
+                "{payload:?}"
+            );
+        }
+    }
 
     #[test]
     fn codes_roundtrip() {
@@ -135,6 +201,10 @@ mod tests {
         assert_eq!(
             MessageKind::from_code(MessageKind::ApplyConfig.code()),
             Some(MessageKind::ApplyConfig)
+        );
+        assert_eq!(
+            MessageKind::from_code(MessageKind::ProbeHotkey.code()),
+            Some(MessageKind::ProbeHotkey)
         );
     }
 

@@ -1,7 +1,7 @@
 //! 表单状态与纯逻辑：配置与界面草稿互转、校验问题归页、结果码说明。
 
 use lenswin_core::config::Config;
-use lenswin_core::hotkey::{HotkeyChoice, Modifiers};
+use lenswin_core::hotkey::{Hotkey, HotkeyChoice, Modifiers, reserved_by_windows};
 use lenswin_core::ipc::IpcResult;
 
 const MIB: u64 = 1024 * 1024;
@@ -219,6 +219,79 @@ pub enum HotkeyField {
     Screenshot,
 }
 
+/// 托盘进程对某个组合的探测结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeState {
+    /// 可以注册，或正由本程序使用。
+    Available,
+    /// 被其它程序占用。
+    Occupied,
+    /// 没能检测，附原因。
+    Unavailable(String),
+}
+
+/// 快捷键卡片底部状态行的内容，按严重程度排列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyStatus {
+    /// 不能保存的问题。
+    Invalid(String),
+    /// 被其它程序占用，可以保存但不生效。
+    Occupied,
+    /// 命中 Windows 保留组合，附用途。
+    Reserved(&'static str),
+    /// 检测通过。
+    Available,
+    /// 没能检测，附原因。
+    Unknown(String),
+}
+
+impl HotkeyStatus {
+    /// 状态行文字。
+    pub fn text(&self) -> String {
+        match self {
+            HotkeyStatus::Invalid(message) => message.clone(),
+            HotkeyStatus::Occupied => "已被其它程序占用，保存后不会生效".to_string(),
+            HotkeyStatus::Reserved(usage) => format!("可能被 Windows 占用（{usage}）"),
+            HotkeyStatus::Available => "可用".to_string(),
+            HotkeyStatus::Unknown(reason) => format!("无法检测占用：{reason}"),
+        }
+    }
+}
+
+/// 汇总一个快捷键卡片的状态：校验问题优先，其次占用，再次系统保留。
+///
+/// `invalid` 是提交时的校验文字；`other` 是另一个功能的快捷键，用于实时查重；
+/// `applied_conflict` 表示上次提交时托盘报告了该组合冲突。
+pub fn hotkey_status(
+    choice: &HotkeyChoice,
+    other: &HotkeyChoice,
+    invalid: Option<String>,
+    applied_conflict: bool,
+    probe: Option<&ProbeState>,
+) -> HotkeyStatus {
+    if let Some(message) = invalid {
+        return HotkeyStatus::Invalid(message);
+    }
+    let hotkey = match Hotkey::new(choice.modifiers(), choice.key) {
+        Ok(hotkey) => hotkey,
+        Err(_) => return HotkeyStatus::Invalid("至少要选一个修饰键".to_string()),
+    };
+    if let Some(message) = hotkey_clash(choice, other) {
+        return HotkeyStatus::Invalid(message.to_string());
+    }
+    if applied_conflict || probe == Some(&ProbeState::Occupied) {
+        return HotkeyStatus::Occupied;
+    }
+    if let Some(usage) = reserved_by_windows(&hotkey) {
+        return HotkeyStatus::Reserved(usage);
+    }
+    match probe {
+        Some(ProbeState::Unavailable(reason)) => HotkeyStatus::Unknown(reason.clone()),
+        Some(ProbeState::Available) => HotkeyStatus::Available,
+        Some(ProbeState::Occupied) | None => HotkeyStatus::Unknown("尚未检测".to_string()),
+    }
+}
+
 /// 按键小方块上的文字：Ctrl、Alt、Shift、Win 依次排在主键前。
 pub fn hotkey_cap_labels(choice: &HotkeyChoice) -> Vec<String> {
     [
@@ -232,11 +305,6 @@ pub fn hotkey_cap_labels(choice: &HotkeyChoice) -> Vec<String> {
     .map(|(_, name)| name.to_string())
     .chain(std::iter::once(choice.key.to_string()))
     .collect()
-}
-
-/// 热键的展示文字，如 `Win+Shift+A`。
-pub fn hotkey_display(choice: &HotkeyChoice) -> String {
-    hotkey_cap_labels(choice).join("+")
 }
 
 /// 提交后被托盘报告冲突时，推断是哪些热键改动导致：与旧配置相比变了的那些。
@@ -273,7 +341,7 @@ mod tests {
         assert_eq!(hotkey_cap_labels(&a), ["Ctrl", "Alt", "F13"]);
         let b = HotkeyChoice::parse("Shift+Win+A").expect("解析");
         assert_eq!(hotkey_cap_labels(&b), ["Shift", "Win", "A"]);
-        assert_eq!(hotkey_display(&b), "Shift+Win+A");
+        assert_eq!(hotkey_cap_labels(&b).join("+"), "Shift+Win+A");
         let c = HotkeyChoice::parse("Win+Ctrl+Alt+Shift+Space").expect("解析");
         assert_eq!(hotkey_cap_labels(&c).len(), 5);
         let none = HotkeyChoice {
@@ -295,7 +363,7 @@ mod tests {
         let changed = changed_hotkeys(&old, &new);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0, HotkeyField::Search);
-        assert_eq!(hotkey_display(&changed[0].1), "Ctrl+Alt+F13");
+        assert_eq!(changed[0].1.to_text().expect("生成"), "Ctrl+Alt+F13");
         new.hotkeys.screenshot_copy = "garbage".to_string();
         assert_eq!(changed_hotkeys(&old, &new).len(), 1);
     }
@@ -437,6 +505,75 @@ mod tests {
             staleness(&baseline, &Err("文件有误".to_string())),
             Staleness::Fresh
         );
+    }
+
+    fn choice(text: &str) -> HotkeyChoice {
+        HotkeyChoice::parse(text).expect("解析")
+    }
+
+    #[test]
+    fn status_prefers_invalid_over_everything() {
+        let a = choice("Ctrl+Alt+K");
+        let status = hotkey_status(
+            &a,
+            &choice("Ctrl+B"),
+            Some("坏了".to_string()),
+            true,
+            Some(&ProbeState::Occupied),
+        );
+        assert_eq!(status, HotkeyStatus::Invalid("坏了".to_string()));
+        let mut none = a;
+        none.ctrl = false;
+        none.alt = false;
+        assert!(matches!(
+            hotkey_status(&none, &choice("Ctrl+B"), None, false, None),
+            HotkeyStatus::Invalid(_)
+        ));
+        assert!(matches!(
+            hotkey_status(&a, &a, None, false, Some(&ProbeState::Available)),
+            HotkeyStatus::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn status_occupied_beats_reserved() {
+        let win_l = choice("Win+L");
+        let other = choice("Ctrl+B");
+        assert_eq!(
+            hotkey_status(&win_l, &other, None, false, Some(&ProbeState::Occupied)),
+            HotkeyStatus::Occupied
+        );
+        assert_eq!(
+            hotkey_status(&win_l, &other, None, false, Some(&ProbeState::Available)),
+            HotkeyStatus::Reserved("锁屏")
+        );
+        assert_eq!(
+            hotkey_status(&choice("Ctrl+K"), &other, None, true, None),
+            HotkeyStatus::Occupied
+        );
+    }
+
+    #[test]
+    fn status_reflects_probe_result() {
+        let a = choice("Ctrl+Alt+K");
+        let other = choice("Ctrl+B");
+        assert_eq!(
+            hotkey_status(&a, &other, None, false, Some(&ProbeState::Available)),
+            HotkeyStatus::Available
+        );
+        let unknown = hotkey_status(
+            &a,
+            &other,
+            None,
+            false,
+            Some(&ProbeState::Unavailable("未运行".to_string())),
+        );
+        assert_eq!(unknown, HotkeyStatus::Unknown("未运行".to_string()));
+        assert!(unknown.text().contains("未运行"));
+        assert!(matches!(
+            hotkey_status(&a, &other, None, false, None),
+            HotkeyStatus::Unknown(_)
+        ));
     }
 
     #[test]

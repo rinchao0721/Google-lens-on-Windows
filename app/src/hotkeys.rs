@@ -106,6 +106,26 @@ fn entries(config: &HotkeysConfig) -> [(Command, &str); 2] {
     ]
 }
 
+/// 纯逻辑：已注册的编号里，有没有哪个命令的生效文字就是 `hotkey`。
+fn owned_by(effective: &HotkeysConfig, registered_ids: &[i32], hotkey: &Hotkey) -> bool {
+    entries(effective).into_iter().any(|(command, text)| {
+        command
+            .hotkey_id()
+            .is_some_and(|id| registered_ids.contains(&id))
+            && text.parse::<Hotkey>().is_ok_and(|h| h == *hotkey)
+    })
+}
+
+/// 试注册后立即注销，判断组合是否被其它程序占用。
+pub fn probe(window: WindowHandle, hotkey: &Hotkey) -> Result<(), String> {
+    hotkey::register(window, PROBE_HOTKEY_ID, hotkey)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+/// 探测专用编号，与命令热键编号不重叠；应用程序可用范围为 0x0000–0xBFFF。
+const PROBE_HOTKEY_ID: i32 = 0x7F00;
+
 fn try_register(
     window: WindowHandle,
     command: Command,
@@ -172,6 +192,12 @@ impl HotkeySet {
     /// 实际在使用的热键文字，菜单据此显示。
     pub fn effective(&self) -> &HotkeysConfig {
         &self.effective
+    }
+
+    /// 该组合是否正由本程序注册着；生效文字相同但注册失败的不算。
+    pub fn owns(&self, hotkey: &Hotkey) -> bool {
+        let registered: Vec<i32> = self.guards.iter().map(HotkeyGuard::id).collect();
+        owned_by(&self.effective, &registered, hotkey)
     }
 
     /// 换成配置文件里的新热键，逐键处理：改了且成功就采用，改了但失败就退回旧值，
@@ -426,5 +452,31 @@ mod tests {
         let config = HotkeysConfig::default();
         let commands: Vec<_> = entries(&config).iter().map(|(c, _)| *c).collect();
         assert_eq!(commands, vec![Command::Search, Command::ScreenshotCopy]);
+    }
+
+    fn hk(text: &str) -> Hotkey {
+        text.parse().expect("解析")
+    }
+
+    #[test]
+    fn owned_only_when_registered_and_text_matches() {
+        let effective = keys("Win+Shift+A", "Win+Shift+C");
+        assert!(owned_by(&effective, &[1, 2], &hk("shift+win+a")));
+        assert!(owned_by(&effective, &[1, 2], &hk("Win+Shift+C")));
+        assert!(!owned_by(&effective, &[1, 2], &hk("Win+Shift+B")));
+        // 截屏热键启动时注册失败，组合被别的程序占着
+        assert!(!owned_by(&effective, &[1], &hk("Win+Shift+C")));
+        assert!(!owned_by(&effective, &[], &hk("Win+Shift+A")));
+    }
+
+    #[test]
+    fn unparsable_effective_text_is_never_owned() {
+        let effective = keys("garbage", "Win+Shift+C");
+        assert!(!owned_by(&effective, &[1, 2], &hk("Win+Shift+A")));
+    }
+
+    #[test]
+    fn probe_id_does_not_collide_with_commands() {
+        assert_eq!(Command::from_hotkey_id(PROBE_HOTKEY_ID), None);
     }
 }
