@@ -14,6 +14,9 @@ const CHINESE_FONT_FILES: [(&str, u32); 6] = [
     ("mingliu.ttc", 0),
 ];
 
+/// 图标字体候选：Win11 的 Segoe Fluent Icons 在前，Win10 的 Segoe MDL2 Assets 在后。
+const ICON_FONT_FILES: [&str; 2] = ["SegoeIcons.ttf", "segmdl2.ttf"];
+
 /// 一个可尝试加载的字体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontCandidate {
@@ -53,6 +56,24 @@ pub fn chinese_font_candidates() -> Vec<FontCandidate> {
         .unwrap_or_default()
 }
 
+/// 在 `dir` 下按优先级列出图标字体候选（不检查文件是否存在）。
+pub fn icon_font_candidates_in(dir: &Path) -> Vec<FontCandidate> {
+    ICON_FONT_FILES
+        .iter()
+        .map(|name| FontCandidate {
+            path: dir.join(name),
+            index: 0,
+        })
+        .collect()
+}
+
+/// 系统字体目录下的图标字体候选；取不到目录时为空。
+pub fn icon_font_candidates() -> Vec<FontCandidate> {
+    system_font_dir()
+        .map(|dir| icon_font_candidates_in(&dir))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +85,20 @@ mod tests {
         assert_eq!(first.path, Path::new(r"C:\Windows\Fonts\msyh.ttc"));
         assert_eq!(first.index, 0);
         assert!(list.len() >= 3);
+    }
+
+    #[test]
+    fn icon_candidates_prefer_fluent_then_mdl2() {
+        let list = icon_font_candidates_in(Path::new(r"C:\Windows\Fonts"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list.first().map(|c| c.path.clone()),
+            Some(Path::new(r"C:\Windows\Fonts\SegoeIcons.ttf").to_path_buf())
+        );
+        assert_eq!(
+            list.get(1).map(|c| c.path.clone()),
+            Some(Path::new(r"C:\Windows\Fonts\segmdl2.ttf").to_path_buf())
+        );
     }
 
     #[test]
