@@ -1,6 +1,6 @@
 //! 隐藏的消息窗口：接收热键、托盘与跨进程通知，转成 [`WindowEvent`] 排队。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,8 +11,8 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassExW,
-    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_COPYDATA, WM_HOTKEY,
-    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_COPYDATA, WM_HOTKEY, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -27,6 +27,12 @@ pub(crate) const WM_SECOND_INSTANCE: u32 = WM_APP + SECOND_INSTANCE_MESSAGE_OFFS
 
 /// 后台任务完成的通知消息。
 pub(crate) const WM_TASK_DONE: u32 = WM_APP + 3;
+
+/// 唤醒消息循环去处理已入队事件。
+///
+/// 托盘回调是同步送入窗口过程的，`GetMessageW` 处理完不会返回，
+/// 不另投一条消息的话，事件会一直留在队列里。
+pub(crate) const WM_EVENT_PENDING: u32 = WM_APP + 4;
 
 /// 资源管理器重启后系统广播的消息号，创建窗口时注册。
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -60,6 +66,8 @@ type CopyDataHandler = Rc<dyn Fn(u32, &[u8]) -> u32>;
 
 thread_local! {
     static EVENTS: RefCell<VecDeque<WindowEvent>> = const { RefCell::new(VecDeque::new()) };
+    /// 已投递但窗口过程尚未收到的唤醒消息，避免重复投递。
+    static WAKE_PENDING: Cell<bool> = const { Cell::new(false) };
     static COPYDATA_HANDLER: RefCell<Option<CopyDataHandler>> = const { RefCell::new(None) };
 }
 
@@ -115,14 +123,62 @@ fn handle_copydata(lparam: LPARAM) -> u32 {
     }
 }
 
+/// 入队；队列里已有未处理的右键时丢弃重复的右键，保证连点只弹一次菜单。
+fn push_coalesced(queue: &mut VecDeque<WindowEvent>, event: WindowEvent) {
+    let right_click = WindowEvent::Tray(TrayMouse::RightClick);
+    if event == right_click && queue.contains(&right_click) {
+        return;
+    }
+    queue.push_back(event);
+}
+
+/// 托盘回调 lparam 低 16 位对应的鼠标动作。
+///
+/// 右键只认 `WM_RBUTTONUP`：未设置 `NOTIFYICON_VERSION_4` 时系统只发鼠标消息，
+/// 不发 `WM_CONTEXTMENU`；两者都收，一次点击就可能触发两次菜单。
+fn classify_tray_mouse(message: u32) -> Option<TrayMouse> {
+    match message {
+        WM_LBUTTONUP => Some(TrayMouse::LeftClick),
+        WM_RBUTTONUP => Some(TrayMouse::RightClick),
+        _ => None,
+    }
+}
+
+/// 尚无在途唤醒消息时返回 `true`，并把状态记为在途。
+fn claim_wake(pending: &Cell<bool>) -> bool {
+    !pending.replace(true)
+}
+
 fn enqueue(event: WindowEvent) {
     let result = EVENTS.try_with(|queue| {
         if let Ok(mut queue) = queue.try_borrow_mut() {
-            queue.push_back(event);
+            push_coalesced(&mut queue, event);
         }
     });
     match result {
         Ok(()) | Err(_) => {} // 线程退出阶段产生的事件无需处理
+    }
+}
+
+fn set_wake_pending(value: bool) {
+    match WAKE_PENDING.try_with(|pending| pending.set(value)) {
+        Ok(()) | Err(_) => {} // 线程退出阶段无状态可更新
+    }
+}
+
+/// 入队并确保消息循环会被唤醒。
+fn enqueue_and_wake(hwnd: HWND, event: WindowEvent) {
+    enqueue(event);
+    // 线程退出阶段读不到状态时直接投递
+    if !WAKE_PENDING.try_with(claim_wake).unwrap_or(true) {
+        return;
+    }
+    // SAFETY: hwnd 是正在处理消息的本窗口；PostMessageW 失败只返回错误。
+    let posted = unsafe { PostMessageW(Some(hwnd), WM_EVENT_PENDING, WPARAM(0), LPARAM(0)) };
+    if let Err(error) = posted {
+        // 撤销在途标记，下个事件才能重试
+        set_wake_pending(false);
+        log::warn!("唤醒消息循环失败，事件会延迟到下一条消息：{error}");
     }
 }
 
@@ -289,27 +345,28 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_HOTKEY => {
             if let Ok(id) = i32::try_from(wparam.0) {
-                enqueue(WindowEvent::Hotkey(id));
+                enqueue_and_wake(hwnd, WindowEvent::Hotkey(id));
             }
         }
         WM_TRAY => {
             // 传统托盘回调的鼠标消息在 lparam 低 16 位
-            match u32::try_from(lparam.0 & 0xFFFF) {
-                Ok(WM_LBUTTONUP) => enqueue(WindowEvent::Tray(TrayMouse::LeftClick)),
-                Ok(WM_RBUTTONUP | WM_CONTEXTMENU) => {
-                    enqueue(WindowEvent::Tray(TrayMouse::RightClick));
-                }
-                _ => {}
+            let mouse = u32::try_from(lparam.0 & 0xFFFF)
+                .ok()
+                .and_then(classify_tray_mouse);
+            if let Some(mouse) = mouse {
+                enqueue_and_wake(hwnd, WindowEvent::Tray(mouse));
             }
         }
         WM_COPYDATA => {
             let code = handle_copydata(lparam);
             return LRESULT(isize::try_from(code).unwrap_or(0));
         }
-        WM_SECOND_INSTANCE => enqueue(WindowEvent::SecondInstance),
-        WM_TASK_DONE => enqueue(WindowEvent::TaskDone),
+        WM_SECOND_INSTANCE => enqueue_and_wake(hwnd, WindowEvent::SecondInstance),
+        WM_TASK_DONE => enqueue_and_wake(hwnd, WindowEvent::TaskDone),
+        // 消息循环在本条消息分发后处理队列，这里只需清掉在途标记
+        WM_EVENT_PENDING => set_wake_pending(false),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
-            enqueue(WindowEvent::TaskbarCreated);
+            enqueue_and_wake(hwnd, WindowEvent::TaskbarCreated);
         }
         _ => {}
     }
@@ -320,6 +377,58 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_right_button_up_opens_menu() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU;
+        assert_eq!(
+            classify_tray_mouse(WM_RBUTTONUP),
+            Some(TrayMouse::RightClick)
+        );
+        assert_eq!(
+            classify_tray_mouse(WM_LBUTTONUP),
+            Some(TrayMouse::LeftClick)
+        );
+        assert_eq!(classify_tray_mouse(WM_CONTEXTMENU), None);
+        assert_eq!(classify_tray_mouse(0), None);
+    }
+
+    #[test]
+    fn claim_wake_posts_once_until_cleared() {
+        let pending = Cell::new(false);
+        assert!(claim_wake(&pending));
+        assert!(!claim_wake(&pending));
+        pending.set(false);
+        assert!(claim_wake(&pending));
+    }
+
+    #[test]
+    fn duplicate_right_clicks_are_coalesced() {
+        let mut queue = VecDeque::new();
+        push_coalesced(&mut queue, WindowEvent::Tray(TrayMouse::RightClick));
+        push_coalesced(&mut queue, WindowEvent::Tray(TrayMouse::RightClick));
+        push_coalesced(&mut queue, WindowEvent::Tray(TrayMouse::LeftClick));
+        push_coalesced(&mut queue, WindowEvent::TaskDone);
+        push_coalesced(&mut queue, WindowEvent::TaskDone);
+        assert_eq!(
+            Vec::from(queue),
+            vec![
+                WindowEvent::Tray(TrayMouse::RightClick),
+                WindowEvent::Tray(TrayMouse::LeftClick),
+                WindowEvent::TaskDone,
+                WindowEvent::TaskDone,
+            ]
+        );
+    }
+
+    #[test]
+    fn right_click_after_drain_is_accepted_again() {
+        let mut queue = VecDeque::new();
+        push_coalesced(&mut queue, WindowEvent::Tray(TrayMouse::RightClick));
+        queue.pop_front();
+        push_coalesced(&mut queue, WindowEvent::Tray(TrayMouse::RightClick));
+        assert_eq!(queue.len(), 1);
+    }
 
     #[test]
     fn retain_non_hotkeys_drops_only_hotkeys() {

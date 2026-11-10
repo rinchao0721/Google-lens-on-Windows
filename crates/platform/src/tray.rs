@@ -1,6 +1,6 @@
 //! 托盘图标与右键菜单。
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, POINT};
+use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, POINT, SetLastError, WIN32_ERROR};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -217,6 +217,9 @@ impl TrayIcon {
         // 不置前台的话点击菜单外部不会关闭菜单；失败也只是菜单关闭行为稍差
         // SAFETY: hwnd 是本进程的有效窗口。
         discard(unsafe { SetForegroundWindow(self.hwnd) });
+        // 取消与失败都返回 0，只能靠错误码区分，先清零
+        // SAFETY: 无前置条件。
+        unsafe { SetLastError(WIN32_ERROR(0)) };
         // SAFETY: 菜单与窗口均有效；TPM_RETURNCMD 下返回值即选中的命令号，0 表示取消或失败。
         let chosen = unsafe {
             TrackPopupMenu(
@@ -229,6 +232,13 @@ impl TrayIcon {
                 None,
             )
         };
+        if chosen.0 == 0 {
+            // SAFETY: 无前置条件，紧接 TrackPopupMenu 读取其留下的错误码。
+            let code = unsafe { GetLastError() };
+            if code.0 != 0 {
+                log::warn!("TrackPopupMenu 未能弹出菜单，错误码 {}", code.0);
+            }
+        }
         // 托盘菜单的标准收尾，使菜单能正确关闭；失败无影响
         // SAFETY: hwnd 是本进程的有效窗口。
         discard(unsafe {
