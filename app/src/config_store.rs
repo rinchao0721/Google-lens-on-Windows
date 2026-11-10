@@ -35,6 +35,8 @@ pub enum SyncApplyError {
     Invalid(String),
     /// 写盘失败，附带说明；内存中的配置已经生效。
     WriteFailed(String),
+    /// 配置正被占用，未做任何修改。
+    Busy,
 }
 
 /// 重新加载成功后的结果。
@@ -156,10 +158,23 @@ impl ConfigStore {
         self.current.borrow().clone()
     }
 
+    /// 换上新配置；配置正被借用时返回 `false`，不 panic。
+    fn try_set_current(&self, new: &Config) -> bool {
+        match self.current.try_borrow_mut() {
+            Ok(mut current) => {
+                *current = new.clone();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 校验并应用新配置，写盘交给工作线程；校验失败时保持旧配置。
     pub fn apply(&self, new: Config) -> Result<(), String> {
         validate(&new).map_err(|issues| describe_issues(&issues))?;
-        self.current.replace(new.clone());
+        if !self.try_set_current(&new) {
+            return Err("配置正忙，请稍后再试".to_string());
+        }
         self.send(Job::Write {
             config: Box::new(new),
             state: self.state.get(),
@@ -170,7 +185,9 @@ impl ConfigStore {
     /// 与 [`ConfigStore::apply`] 相同，但等写盘结果返回；用于需要把结果同步告知对方的场景。
     pub fn apply_sync(&self, new: Config) -> Result<(), SyncApplyError> {
         validate(&new).map_err(|issues| SyncApplyError::Invalid(describe_issues(&issues)))?;
-        self.current.replace(new.clone());
+        if !self.try_set_current(&new) {
+            return Err(SyncApplyError::Busy);
+        }
         let (ack, answer) = channel();
         self.send(Job::Write {
             config: Box::new(new),
@@ -200,7 +217,10 @@ impl ConfigStore {
                 .notice
                 .unwrap_or_else(|| "配置文件无法使用".to_string()));
         }
-        let previous = self.current.replace(loaded.config.clone());
+        let previous = match self.current.try_borrow_mut() {
+            Ok(mut current) => std::mem::replace(&mut *current, loaded.config.clone()),
+            Err(_) => return Err("配置正忙，请稍后再试".to_string()),
+        };
         self.state.set(loaded.state);
         Ok(Reloaded {
             previous,
@@ -298,6 +318,23 @@ mod tests {
         assert!(store.drain_failures().is_empty());
         drop(store);
         assert_eq!(fs::read_to_string(&path).expect("读取"), "garbage ===");
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn busy_store_refuses_instead_of_panicking() {
+        let dir = temp_dir("busy");
+        let (store, _) = open(dir.join("config.toml"));
+        let held = store.current.borrow();
+        assert_eq!(
+            store.apply_sync(Config::default()),
+            Err(SyncApplyError::Busy)
+        );
+        assert!(store.apply(Config::default()).is_err());
+        assert!(store.reload().is_err());
+        drop(held);
+        assert_eq!(store.apply_sync(Config::default()), Ok(()));
+        drop(store);
         fs::remove_dir_all(&dir).expect("清理");
     }
 

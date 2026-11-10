@@ -97,6 +97,7 @@ pub fn describe_result(result: IpcResult) -> Feedback {
         IpcResult::WriteFailed => {
             Feedback::new(FeedbackKind::Error, "配置写入磁盘失败，重启后会丢失")
         }
+        IpcResult::Busy => Feedback::new(FeedbackKind::Error, "主程序正忙，请稍后再试"),
         IpcResult::ParseFailed => Feedback::new(FeedbackKind::Error, "主程序无法解析提交的配置"),
         IpcResult::PayloadTooLarge => Feedback::new(FeedbackKind::Error, "配置数据过大"),
         IpcResult::InvalidMessage => Feedback::new(
@@ -111,6 +112,23 @@ pub fn config_from_file_text(text: Option<&str>) -> Result<Config, String> {
     match text {
         None => Ok(Config::default()),
         Some(text) => Config::from_toml_str(text).map_err(|e| e.to_string()),
+    }
+}
+
+/// 提交前重新读取配置文件后，与打开窗口时读到的内容比较的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staleness {
+    /// 没有变化，或文件暂时读不出来（交给主程序判断）。
+    Fresh,
+    /// 文件内容已被别处修改（如托盘菜单切换了选项）。
+    ChangedElsewhere,
+}
+
+/// 比较打开窗口时的配置 `baseline` 与此刻文件里的配置 `now`。
+pub fn staleness(baseline: &Config, now: &Result<Config, String>) -> Staleness {
+    match now {
+        Ok(current) if current != baseline => Staleness::ChangedElsewhere,
+        Ok(_) | Err(_) => Staleness::Fresh,
     }
 }
 
@@ -292,6 +310,7 @@ mod tests {
             IpcResult::ValidationFailed,
             IpcResult::HotkeyConflict,
             IpcResult::WriteFailed,
+            IpcResult::Busy,
         ];
         let texts: Vec<_> = all.iter().map(|r| describe_result(*r).text).collect();
         let mut sorted = texts.clone();
@@ -314,6 +333,25 @@ mod tests {
         assert_eq!(config_from_file_text(None), Ok(Config::default()));
         assert!(config_from_file_text(Some("garbage ===")).is_err());
         assert!(config_from_file_text(Some("")).is_ok());
+    }
+
+    #[test]
+    fn staleness_detects_only_real_changes() {
+        let baseline = Config::default();
+        assert_eq!(
+            staleness(&baseline, &Ok(Config::default())),
+            Staleness::Fresh
+        );
+        let mut changed = Config::default();
+        changed.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
+        assert_eq!(
+            staleness(&baseline, &Ok(changed)),
+            Staleness::ChangedElsewhere
+        );
+        assert_eq!(
+            staleness(&baseline, &Err("文件有误".to_string())),
+            Staleness::Fresh
+        );
     }
 
     #[test]

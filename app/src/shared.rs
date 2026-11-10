@@ -32,14 +32,20 @@ fn hotkey_result(report: &ReplaceReport) -> IpcResult {
 
 /// 处理设置进程提交的配置：校验、写盘、替换热键。
 ///
-/// `replace_hotkeys` 由调用方提供，便于脱离 Win32 测试。被占用的键仍把用户填的值写入文件，
+/// 运行在窗口过程里，任何失败都只能返回结果码，不能 panic：`slot` 借不到（说明主线程正在
+/// 使用热键）时返回 [`IpcResult::Busy`]，且先于任何修改检查，保证不会只改一半。
+/// `replace` 由调用方提供，便于脱离 Win32 测试。被占用的键仍把用户填的值写入文件，
 /// 当前继续使用旧热键，通过 [`IpcResult::HotkeyConflict`] 告知设置窗口。
-pub fn handle_submission(
+pub fn handle_submission<T>(
     store: &ConfigStore,
-    replace_hotkeys: impl FnOnce(&HotkeysConfig) -> ReplaceReport,
+    slot: &RefCell<T>,
+    replace: impl FnOnce(&mut T, &HotkeysConfig) -> ReplaceReport,
     kind: u32,
     payload: &[u8],
 ) -> IpcResult {
+    let Ok(mut held) = slot.try_borrow_mut() else {
+        return IpcResult::Busy;
+    };
     let config = match decode_apply_config(kind, payload) {
         Ok(config) => config,
         Err(result) => return result,
@@ -49,8 +55,9 @@ pub fn handle_submission(
         Ok(()) => {}
         Err(SyncApplyError::Invalid(_)) => return IpcResult::ValidationFailed,
         Err(SyncApplyError::WriteFailed(_)) => return IpcResult::WriteFailed,
+        Err(SyncApplyError::Busy) => return IpcResult::Busy,
     }
-    hotkey_result(&replace_hotkeys(&hotkeys))
+    hotkey_result(&replace(&mut held, &hotkeys))
 }
 
 impl AppShared {
@@ -58,7 +65,8 @@ impl AppShared {
     pub fn on_submission(&self, kind: u32, payload: &[u8]) -> u32 {
         handle_submission(
             &self.store,
-            |hotkeys| self.hotkeys.borrow_mut().replace(self.window, hotkeys),
+            &self.hotkeys,
+            |set, hotkeys| set.replace(self.window, hotkeys),
             kind,
             payload,
         )
@@ -118,7 +126,8 @@ mod tests {
         let dir = temp_dir("bad");
         let store = store(&dir);
         let called = Cell::new(false);
-        let replace = |_: &HotkeysConfig| {
+        let slot = RefCell::new(());
+        let replace = |_: &mut (), _: &HotkeysConfig| {
             called.set(true);
             clean()
         };
@@ -129,23 +138,23 @@ mod tests {
         let oversized = vec![b'#'; MAX_PAYLOAD_BYTES + 1];
 
         assert_eq!(
-            handle_submission(&store, replace, 99, valid.as_bytes()),
+            handle_submission(&store, &slot, replace, 99, valid.as_bytes()),
             IpcResult::InvalidMessage
         );
         assert_eq!(
-            handle_submission(&store, replace, APPLY, &oversized),
+            handle_submission(&store, &slot, replace, APPLY, &oversized),
             IpcResult::PayloadTooLarge
         );
         assert_eq!(
-            handle_submission(&store, replace, APPLY, &[0xFF, 0xFE]),
+            handle_submission(&store, &slot, replace, APPLY, &[0xFF, 0xFE]),
             IpcResult::ParseFailed
         );
         assert_eq!(
-            handle_submission(&store, replace, APPLY, b"not toml ==="),
+            handle_submission(&store, &slot, replace, APPLY, b"not toml ==="),
             IpcResult::ParseFailed
         );
         assert_eq!(
-            handle_submission(&store, replace, APPLY, invalid_text.as_bytes()),
+            handle_submission(&store, &slot, replace, APPLY, invalid_text.as_bytes()),
             IpcResult::ValidationFailed
         );
         assert!(!called.get());
@@ -163,9 +172,11 @@ mod tests {
         let text = next.to_toml_string().expect("序列化");
 
         let seen = RefCell::new(None);
+        let slot = RefCell::new(());
         let result = handle_submission(
             &store,
-            |hotkeys| {
+            &slot,
+            |_, hotkeys| {
                 seen.replace(Some(hotkeys.clone()));
                 clean()
             },
@@ -177,12 +188,30 @@ mod tests {
         assert_eq!(store.snapshot(), next);
 
         // 冲突时配置仍已写入，只是结果码提示热键未生效
-        let result = handle_submission(&store, |_| conflict(), APPLY, text.as_bytes());
+        let result = handle_submission(&store, &slot, |_, _| conflict(), APPLY, text.as_bytes());
         assert_eq!(result, IpcResult::HotkeyConflict);
         assert_eq!(store.snapshot(), next);
         drop(store);
         let saved = fs::read_to_string(dir.join("config.toml")).expect("读取");
         assert_eq!(Config::from_toml_str(&saved).expect("解析"), next);
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn busy_hotkey_slot_returns_busy_before_touching_anything() {
+        let dir = temp_dir("busy");
+        let store = store(&dir);
+        let slot = RefCell::new(());
+        let text = Config::default().to_toml_string().expect("序列化");
+        let held = slot.borrow_mut();
+        let result = handle_submission(&store, &slot, |_, _| clean(), APPLY, text.as_bytes());
+        assert_eq!(result, IpcResult::Busy);
+        drop(held);
+        assert_eq!(
+            handle_submission(&store, &slot, |_, _| clean(), APPLY, text.as_bytes()),
+            IpcResult::Ok
+        );
+        drop(store);
         fs::remove_dir_all(&dir).expect("清理");
     }
 

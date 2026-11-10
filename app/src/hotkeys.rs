@@ -38,8 +38,16 @@ enum KeyOutcome {
     Reverted,
 }
 
+/// 两段快捷键文字是否是同一个组合：先按修饰键加主键比较，任一边解析不了再比较去掉首尾空白的原文。
+fn same_hotkey(a: &str, b: &str) -> bool {
+    match (a.parse::<Hotkey>(), b.parse::<Hotkey>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.trim() == b.trim(),
+    }
+}
+
 fn outcome(old: &str, new: &str, new_registered: bool) -> KeyOutcome {
-    if old == new {
+    if same_hotkey(old, new) {
         KeyOutcome::Unchanged
     } else if new_registered {
         KeyOutcome::Adopted
@@ -319,6 +327,42 @@ mod tests {
         let r = resolve(&old, &new, registered(false, false));
         assert_eq!(r.effective, old);
         assert_eq!(r.reverted, vec![Command::Search, Command::ScreenshotCopy]);
+    }
+
+    #[test]
+    fn respelling_alone_counts_as_unchanged() {
+        assert!(same_hotkey("Win+Shift+A", "Shift+Win+A"));
+        assert!(same_hotkey("Win+Shift+A", "shift+win+a"));
+        assert!(same_hotkey(" Ctrl+F13 ", "ctrl + f13"));
+        assert!(!same_hotkey("Win+Shift+A", "Win+Shift+B"));
+        assert!(!same_hotkey("Win+Shift+A", "Ctrl+Shift+A"));
+    }
+
+    #[test]
+    fn unparsable_text_falls_back_to_trimmed_comparison() {
+        assert!(same_hotkey(" oops ", "oops"));
+        assert!(!same_hotkey("oops", "Ctrl+A"));
+        assert!(!same_hotkey("oops", "nope"));
+        assert!(same_hotkey("", "  "));
+    }
+
+    #[test]
+    fn respelled_conflicting_keys_are_not_reverted() {
+        // 用户机器上两个默认键都被占用：设置窗口只是换了写法，不应触发回退
+        let old = keys("Win+Shift+A", "Win+Shift+C");
+        let new = keys("Shift+Win+A", "Shift+Win+C");
+        let r = resolve(&old, &new, registered(false, false));
+        assert!(r.reverted.is_empty());
+        assert_eq!(r.effective, old);
+    }
+
+    #[test]
+    fn real_change_is_still_detected_next_to_respelled_key() {
+        let old = keys("Win+Shift+A", "Win+Shift+C");
+        let new = keys("Shift+Win+A", "Ctrl+Alt+F13");
+        let r = resolve(&old, &new, registered(false, true));
+        assert_eq!(r.effective, keys("Win+Shift+A", "Ctrl+Alt+F13"));
+        assert!(r.reverted.is_empty());
     }
 
     #[test]

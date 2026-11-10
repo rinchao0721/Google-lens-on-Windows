@@ -16,7 +16,8 @@ use lenswin_platform::paths::AppPaths;
 
 use crate::client;
 use crate::form::{
-    Draft, Feedback, FeedbackKind, Page, config_from_file_text, hotkey_clash, page_of_field,
+    Draft, Feedback, FeedbackKind, Page, Staleness, config_from_file_text, hotkey_clash,
+    page_of_field, staleness,
 };
 
 /// 上传大小上限的界面范围（MiB），与 `MAX_BYTES_RANGE` 的上下界一致。
@@ -86,7 +87,10 @@ pub struct SettingsApp {
     issues: Vec<ValidationIssue>,
     feedback: Option<Feedback>,
     font_loaded: bool,
+    config_path: Option<PathBuf>,
     config_path_text: String,
+    baseline: Config,
+    stale_prompt: bool,
     mode_label: String,
     load_error: Option<String>,
     autostart_enabled: bool,
@@ -101,6 +105,8 @@ enum ButtonAction {
     Ok,
     Apply,
     Cancel,
+    Reload,
+    Overwrite,
 }
 
 impl SettingsApp {
@@ -114,6 +120,9 @@ impl SettingsApp {
             issues: Vec::new(),
             feedback: None,
             font_loaded,
+            baseline: startup.config.clone(),
+            stale_prompt: false,
+            config_path: startup.config_path.clone(),
             config_path_text: startup
                 .config_path
                 .as_ref()
@@ -147,9 +156,32 @@ impl SettingsApp {
         });
     }
 
-    /// 校验并提交；返回是否完全成功。
-    fn apply(&mut self) -> bool {
+    /// 此刻文件里的配置；没有路径时返回错误。
+    fn read_current(&self) -> Result<Config, String> {
+        match &self.config_path {
+            Some(path) => read_config(path),
+            None => Err("无法确定配置位置".to_string()),
+        }
+    }
+
+    /// 重新读取配置文件并丢弃当前草稿里的修改（自启勾选保留）。
+    fn reload_from_file(&mut self) {
+        match self.read_current() {
+            Ok(config) => {
+                self.draft = Draft::from_config(&config, self.draft.autostart);
+                self.baseline = config;
+                self.issues.clear();
+                self.stale_prompt = false;
+                self.set_feedback(FeedbackKind::Success, "已重新载入配置文件");
+            }
+            Err(message) => self.set_feedback(FeedbackKind::Error, message),
+        }
+    }
+
+    /// 校验并提交；`force` 为真时跳过「配置已在别处修改」的检查。返回是否完全成功。
+    fn apply(&mut self, force: bool) -> bool {
         self.issues.clear();
+        self.stale_prompt = false;
         let config = match self.draft.to_config() {
             Ok(config) => config,
             Err(message) => {
@@ -177,6 +209,17 @@ impl SettingsApp {
             );
             return false;
         }
+        if !force {
+            let now = self.read_current();
+            if staleness(&self.baseline, &now) == Staleness::ChangedElsewhere {
+                self.stale_prompt = true;
+                self.set_feedback(
+                    FeedbackKind::Warning,
+                    "配置已在别处修改（例如托盘菜单），直接应用会覆盖那些修改",
+                );
+                return false;
+            }
+        }
         let mut feedback = client::submit(&config);
         if let Some(problem) = self.apply_autostart() {
             feedback = Feedback {
@@ -185,6 +228,10 @@ impl SettingsApp {
             };
         }
         let ok = feedback.kind == FeedbackKind::Success;
+        // 成功或「已保存但热键冲突」时文件内容就是刚提交的配置，作为新的比较基准
+        if feedback.kind != FeedbackKind::Error {
+            self.baseline = config;
+        }
         self.feedback = Some(feedback);
         ok
     }
@@ -476,6 +523,16 @@ impl SettingsApp {
                 };
                 ui.colored_label(color, &feedback.text);
             }
+            if self.stale_prompt {
+                ui.horizontal(|ui| {
+                    if ui.button("重新载入").clicked() {
+                        action = Some(ButtonAction::Reload);
+                    }
+                    if ui.button("仍然覆盖").clicked() {
+                        action = Some(ButtonAction::Overwrite);
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 if ui.button("确定").clicked() {
                     action = Some(ButtonAction::Ok);
@@ -552,13 +609,22 @@ impl eframe::App for SettingsApp {
         });
         match action {
             Some(ButtonAction::Apply) => {
-                self.apply();
+                self.apply(false);
             }
             Some(ButtonAction::Ok) => {
-                if self.apply() {
+                if self.apply(false) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+            Some(ButtonAction::Overwrite) => {
+                if self.apply(true) {
+                    self.feedback = Some(Feedback {
+                        kind: FeedbackKind::Success,
+                        text: "已应用，别处的修改已被覆盖".to_string(),
+                    });
+                }
+            }
+            Some(ButtonAction::Reload) => self.reload_from_file(),
             Some(ButtonAction::Cancel) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             None => {}
         }

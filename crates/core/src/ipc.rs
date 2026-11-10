@@ -59,6 +59,8 @@ pub enum IpcResult {
     HotkeyConflict,
     /// 写盘失败。
     WriteFailed,
+    /// 主程序内部状态正被占用，稍后重试。
+    Busy,
 }
 
 impl IpcResult {
@@ -72,6 +74,7 @@ impl IpcResult {
             IpcResult::ValidationFailed => 4,
             IpcResult::HotkeyConflict => 5,
             IpcResult::WriteFailed => 6,
+            IpcResult::Busy => 7,
         }
     }
 
@@ -85,6 +88,7 @@ impl IpcResult {
             4 => Some(IpcResult::ValidationFailed),
             5 => Some(IpcResult::HotkeyConflict),
             6 => Some(IpcResult::WriteFailed),
+            7 => Some(IpcResult::Busy),
             _ => None,
         }
     }
@@ -122,6 +126,7 @@ mod tests {
             IpcResult::ValidationFailed,
             IpcResult::HotkeyConflict,
             IpcResult::WriteFailed,
+            IpcResult::Busy,
         ] {
             assert_eq!(IpcResult::from_code(r.code()), Some(r));
         }
