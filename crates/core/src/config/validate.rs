@@ -3,8 +3,8 @@
 use std::ops::RangeInclusive;
 
 use super::{
-    Config, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, MAX_BYTES_RANGE, ResponseKind,
-    TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
+    Config, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, MAX_BYTES_RANGE,
+    ResponseKind, TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
 };
 use crate::hotkey::Hotkey;
 
@@ -184,6 +184,12 @@ fn check_selection(config: &Config, issues: &mut Vec<ValidationIssue>) {
         &LASSO_STROKE_WIDTH_RANGE,
         issues,
     );
+    check_range(
+        "screenshot.history_size",
+        config.screenshot.history_size,
+        &HISTORY_SIZE_RANGE,
+        issues,
+    );
 }
 
 fn check_misc(config: &Config, issues: &mut Vec<ValidationIssue>) {
@@ -291,6 +297,12 @@ mod tests {
             fields(&c),
             vec!["selection.lasso.padding", "selection.lasso.stroke_width"]
         );
+
+        let mut c = Config::default();
+        c.screenshot.history_size = 0;
+        assert!(fields(&c).is_empty());
+        c.screenshot.history_size = 51;
+        assert_eq!(fields(&c), vec!["screenshot.history_size"]);
     }
 
     #[test]

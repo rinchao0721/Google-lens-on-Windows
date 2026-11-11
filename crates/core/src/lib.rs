@@ -11,4 +11,5 @@ pub mod hotkey;
 pub mod ipc;
 pub mod monitor;
 pub mod selection;
+pub mod snip;
 pub mod url;

@@ -19,6 +19,8 @@ pub const MAX_BYTES_RANGE: RangeInclusive<u64> = 1024..=1_073_741_824;
 pub const LASSO_PADDING_RANGE: RangeInclusive<u32> = 0..=200;
 /// 套索线宽（像素）的合法范围。
 pub const LASSO_STROKE_WIDTH_RANGE: RangeInclusive<u32> = 1..=50;
+/// 历史选区条数的合法范围，0 表示关闭。
+pub const HISTORY_SIZE_RANGE: RangeInclusive<u32> = 0..=50;
 
 /// 搜索引擎模板中图片地址的占位符。
 pub const URL_PLACEHOLDER: &str = "{url}";
@@ -341,11 +343,31 @@ impl Default for LassoConfig {
 }
 
 /// `[screenshot]`。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScreenshotConfig {
-    /// 保存目录，为空则只复制到剪贴板。
+    /// 保存目录，为空则只复制到剪贴板，工具栏保存时弹另存为。
     pub save_dir: String,
+    /// 选区时显示放大镜。
+    pub magnifier: bool,
+    /// 矩形选区时吸附窗口。
+    pub window_snap: bool,
+    /// 记住的历史选区条数，0 表示关闭。
+    pub history_size: u32,
+    /// 选区时在屏幕角落显示快捷键提示。
+    pub show_hints: bool,
+}
+
+impl Default for ScreenshotConfig {
+    fn default() -> Self {
+        Self {
+            save_dir: String::new(),
+            magnifier: true,
+            window_snap: true,
+            history_size: 10,
+            show_hints: true,
+        }
+    }
 }
 
 /// `[privacy]`。
@@ -477,6 +499,10 @@ mod tests {
         config.upload.custom.json_pointer = String::new();
         config.selection.lasso.padding = 20;
         config.screenshot.save_dir = "D:\\shots".to_string();
+        config.screenshot.magnifier = false;
+        config.screenshot.window_snap = false;
+        config.screenshot.history_size = 3;
+        config.screenshot.show_hints = false;
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
         let text = config.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("反序列化"), config);

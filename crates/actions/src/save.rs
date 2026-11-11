@@ -8,6 +8,7 @@ use lenswin_core::action::{
     Action, ActionContext, ActionInput, ActionKind, ActionOutcome, InputKind,
 };
 use lenswin_core::error::ActionError;
+use lenswin_core::frame::CroppedImage;
 use lenswin_core::selection::SelectionMode;
 use lenswin_core::url::screenshot_file_name;
 use lenswin_platform::clock::local_now;
@@ -63,6 +64,24 @@ fn write_unique(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, ActionE
     ))
 }
 
+/// 按当前本地时间生成的默认截图文件名。
+pub fn default_file_name() -> String {
+    let now = local_now();
+    screenshot_file_name(
+        now.year, now.month, now.day, now.hour, now.minute, now.second,
+    )
+}
+
+/// 把图像保存到用户指定的路径（如另存为对话框的结果），已存在时覆盖。
+pub fn save_to(path: &Path, image: &CroppedImage) -> Result<(), ActionError> {
+    let bytes = encode_png(image)?;
+    let file =
+        fs::File::create(path).map_err(|e| ActionError::Failed(format!("创建文件失败：{e}")))?;
+    write_or_cleanup(file, path, &bytes)?;
+    log::info!("截图已保存：{}", path.display());
+    Ok(())
+}
+
 impl Action for SaveAction {
     fn kind(&self) -> ActionKind {
         ActionKind::Save
@@ -88,11 +107,7 @@ impl Action for SaveAction {
         fs::create_dir_all(dir)
             .map_err(|e| ActionError::Failed(format!("创建保存目录失败：{e}")))?;
         let bytes = encode_png(&image)?;
-        let now = local_now();
-        let name = screenshot_file_name(
-            now.year, now.month, now.day, now.hour, now.minute, now.second,
-        );
-        let path = write_unique(dir, &name, &bytes)?;
+        let path = write_unique(dir, &default_file_name(), &bytes)?;
         log::info!("截图已保存：{}", path.display());
         Ok(ActionOutcome::Done)
     }
@@ -102,7 +117,6 @@ impl Action for SaveAction {
 mod tests {
     use super::*;
     use lenswin_core::config::Config;
-    use lenswin_core::frame::CroppedImage;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lenswin-test-{tag}-{}", std::process::id()));
@@ -170,6 +184,30 @@ mod tests {
         let entries: Vec<_> = fs::read_dir(&dir).expect("读取目录").collect();
         assert_eq!(entries.len(), 1);
         fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn save_to_writes_png_at_given_path() {
+        let dir = temp_dir("save-to");
+        fs::create_dir_all(&dir).expect("创建目录");
+        let path = dir.join("shot.png");
+        let image = CroppedImage::new(1, 1, vec![1, 2, 3, 255]).expect("图像");
+        save_to(&path, &image).expect("保存");
+        let bytes = fs::read(&path).expect("读取");
+        assert_eq!(bytes.get(1..4), Some(&b"PNG"[..]));
+        fs::remove_dir_all(&dir).expect("清理");
+    }
+
+    #[test]
+    fn save_to_missing_dir_fails() {
+        let path = temp_dir("save-missing").join("no").join("shot.png");
+        let image = CroppedImage::new(1, 1, vec![1, 2, 3, 255]).expect("图像");
+        assert!(save_to(&path, &image).is_err());
+    }
+
+    #[test]
+    fn default_name_is_png() {
+        assert!(default_file_name().ends_with(".png"));
     }
 
     #[test]

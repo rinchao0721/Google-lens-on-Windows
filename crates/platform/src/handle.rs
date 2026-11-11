@@ -14,7 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu, HMEN
 
 use crate::error::{PlatformError, last_error, win32};
 use crate::text::to_wide;
-use windows::core::PCWSTR;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::core::{PCWSTR, PWSTR};
 
 /// 显式丢弃 `Drop` 中无法处理的返回值。
 pub(crate) fn discard<T>(_value: T) {}
@@ -213,6 +214,38 @@ impl Drop for GlobalMem {
             // Drop 中无法上报错误，释放失败只会泄漏一块内存
             // SAFETY: 句柄由 GlobalAlloc 分配且所有权仍在本对象手中。
             discard(unsafe { GlobalFree(Some(handle)) });
+        }
+    }
+}
+
+/// 由 COM 分配、需要 `CoTaskMemFree` 释放的宽字符串。
+pub struct CoTaskString(PWSTR);
+
+impl CoTaskString {
+    /// 接管一个由 COM 分配的字符串。
+    ///
+    /// # Safety
+    /// `raw` 必须为空或来自 COM 分配器，且调用方此后不再释放它。
+    pub unsafe fn from_raw(raw: PWSTR) -> Self {
+        Self(raw)
+    }
+
+    /// 转为 Rust 字符串；为空或不是合法 UTF-16 时返回错误。
+    pub fn to_string_lossless(&self) -> Result<String, PlatformError> {
+        if self.0.is_null() {
+            return Err(PlatformError::Invalid("系统返回了空字符串".to_string()));
+        }
+        // SAFETY: 指针非空，由 COM 返回的字符串以 NUL 结尾，生命周期由本对象管理。
+        unsafe { self.0.to_string() }
+            .map_err(|_| PlatformError::Invalid("系统返回的字符串不是合法 UTF-16".to_string()))
+    }
+}
+
+impl Drop for CoTaskString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: 字符串由 COM 分配器分配，所有权在本对象手中，仅释放一次。
+            unsafe { CoTaskMemFree(Some(self.0.0.cast_const().cast())) };
         }
     }
 }

@@ -1,4 +1,4 @@
-//! 剪贴板：把图像以 CF_DIB 写入。
+//! 剪贴板：把图像以 CF_DIB、文本以 CF_UNICODETEXT 写入。
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::CF_DIB;
+use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 use crate::error::{PlatformError, last_error, win32};
 use crate::handle::{GlobalMem, discard};
@@ -75,8 +75,26 @@ impl Drop for ClipboardGuard {
 /// 把图像写入剪贴板，会清空原有内容。
 pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), PlatformError> {
     let dib = rgba_to_dib(image)?;
+    set_data(owner, u32::from(CF_DIB.0), &dib)
+}
+
+/// 把文本写入剪贴板，会清空原有内容。
+pub fn set_text(owner: ClipboardOwner, text: &str) -> Result<(), PlatformError> {
+    set_data(owner, u32::from(CF_UNICODETEXT.0), &utf16_with_nul(text))
+}
+
+/// 文本转为以 NUL 结尾的 UTF-16 小端字节。
+fn utf16_with_nul(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+/// 把一块数据以指定格式写入剪贴板。
+fn set_data(owner: ClipboardOwner, format: u32, bytes: &[u8]) -> Result<(), PlatformError> {
     // 先备好全部数据，打开并清空剪贴板之后不再有会丢失原内容的失败路径
-    let mut mem = GlobalMem::alloc(dib.len())?;
+    let mut mem = GlobalMem::alloc(bytes.len())?;
     let handle = mem
         .raw()
         .ok_or_else(|| PlatformError::Invalid("全局内存句柄已失效".to_string()))?;
@@ -85,8 +103,8 @@ pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), Plat
     if ptr.is_null() {
         return Err(last_error("GlobalLock"));
     }
-    // SAFETY: 内存块大小等于 dib.len()，已锁定且与 dib 不重叠。
-    unsafe { std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr.cast::<u8>(), dib.len()) };
+    // SAFETY: 内存块大小等于 bytes.len()，已锁定且与 bytes 不重叠。
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
     // 数据已写入，解锁结果不影响后续
     // SAFETY: 与上面的 GlobalLock 配对。
     discard(unsafe { GlobalUnlock(handle) });
@@ -95,7 +113,7 @@ pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), Plat
     // SAFETY: 剪贴板已由当前线程打开。
     unsafe { EmptyClipboard() }.map_err(win32("EmptyClipboard"))?;
     // SAFETY: 剪贴板已打开且已清空，handle 为可移动内存；成功后所有权归系统。
-    unsafe { SetClipboardData(u32::from(CF_DIB.0), Some(HANDLE(handle.0))) }
+    unsafe { SetClipboardData(format, Some(HANDLE(handle.0))) }
         .map_err(win32("SetClipboardData"))?;
     mem.release();
     Ok(())
@@ -156,6 +174,13 @@ mod tests {
             0, 0, 255, 255, 255, 255, 255, 255,
         ];
         CroppedImage::new(2, 2, rgba).expect("构造图像")
+    }
+
+    #[test]
+    fn text_is_nul_terminated_utf16() {
+        assert_eq!(utf16_with_nul(""), vec![0, 0]);
+        assert_eq!(utf16_with_nul("#A"), vec![b'#', 0, b'A', 0, 0, 0]);
+        assert_eq!(utf16_with_nul("色"), vec![0x72, 0x82, 0, 0]);
     }
 
     #[test]

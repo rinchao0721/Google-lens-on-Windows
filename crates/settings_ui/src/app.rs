@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use lenswin_core::config::{
-    Config, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry, ResponseKind,
-    SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider, ValidationIssue,
-    validate,
+    Config, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry,
+    ResponseKind, SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider,
+    ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
 use lenswin_core::selection::SelectionMode;
@@ -735,6 +735,50 @@ impl SettingsApp {
                     text_input(ui, save_dir, width);
                 },
             );
+        group_label(ui, &look, "选区");
+        let error = self.issue("screenshot.magnifier");
+        let magnifier = &mut self.draft.config.screenshot.magnifier;
+        Card::new("放大镜")
+            .icon(icons::SEARCH)
+            .desc("在光标旁放大像素并显示颜色，按 C 复制颜色值")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, magnifier);
+            });
+        let error = self.issue("screenshot.window_snap");
+        let window_snap = &mut self.draft.config.screenshot.window_snap;
+        Card::new("吸附窗口")
+            .icon(icons::MOUSE)
+            .desc("矩形选区时悬停高亮窗口，单击即选中；选区中按 Tab 临时开关")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, window_snap);
+            });
+        let error = self.issue("screenshot.show_hints");
+        let show_hints = &mut self.draft.config.screenshot.show_hints;
+        Card::new("快捷键提示")
+            .icon(icons::KEYBOARD)
+            .desc("选区时在屏幕角落列出可用按键；选区中按 ? 或 F1 临时隐藏")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, show_hints);
+            });
+        let error = self.issue("screenshot.history_size");
+        Card::new("历史选区")
+            .icon(icons::CLOCK)
+            .desc("截屏时按 , 和 . 切换最近的选区；0 表示关闭")
+            .error(error.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.draft.config.screenshot.history_size)
+                        .range(HISTORY_SIZE_RANGE)
+                        .suffix(" 条"),
+                );
+            });
         group_label(ui, &look, "套索");
         let padding_error = self.issue("selection.lasso.padding");
         Card::new("外扩边距")

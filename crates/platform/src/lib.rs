@@ -21,5 +21,7 @@ pub mod shell;
 pub mod single_instance;
 pub mod tray;
 pub mod window;
+pub mod window_snapshot;
 
+mod com;
 mod text;

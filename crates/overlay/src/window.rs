@@ -2,26 +2,31 @@
 
 use std::cell::RefCell;
 
-use lenswin_core::geometry::Point;
+use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::MonitorInfo;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_A, VK_C, VK_CONTROL, VK_D,
+    VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT,
+    VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    HWND_TOPMOST, IDC_CROSS, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SWP_SHOWWINDOW,
-    SetCursor, SetForegroundWindow, SetWindowPos, TranslateMessage, UnregisterClassW,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
+    IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SWP_SHOWWINDOW,
+    SetCursor, SetCursorPos, SetForegroundWindow, SetWindowPos, TranslateMessage, UnregisterClassW,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::adjust::{Direction, NudgeMode};
 use crate::error::{OverlayError, win32};
-use crate::input::{Interaction, Outcome, point_from_lparam};
-use crate::render::{DrawStatus, Renderer, TargetResources};
+use crate::input::{CursorKind, Interaction, Key, KeyCommand, Outcome, point_from_lparam};
+use crate::layout;
+use crate::render::{DrawStatus, Renderer, Surface, TargetResources};
 
 /// 覆盖层窗口类名。
 const CLASS_NAME: PCWSTR = w!("LenswinOverlayWindow");
@@ -33,6 +38,7 @@ struct WindowSlot {
     hwnd: HWND,
     origin: Point,
     size: (u32, u32),
+    dpi: u32,
     bgra: Vec<u8>,
     target: Option<TargetResources>,
 }
@@ -88,6 +94,20 @@ impl Session {
         self.interaction.cancel();
     }
 
+    fn invalidate_windows(&self, indices: &[usize]) {
+        for index in indices {
+            self.invalidate_window(*index);
+        }
+    }
+
+    /// 读取虚拟桌面坐标处冻结帧的颜色。
+    fn pixel(&self, p: Point) -> Option<(u8, u8, u8)> {
+        self.windows.iter().find_map(|slot| {
+            let bounds = Rect::new(slot.origin.x, slot.origin.y, slot.size.0, slot.size.1);
+            layout::pixel_at(&slot.bgra, &bounds, p)
+        })
+    }
+
     fn paint(&mut self, index: usize) {
         let Some(slot) = self.windows.get_mut(index) else {
             return;
@@ -95,7 +115,7 @@ impl Session {
         if slot.target.is_none() {
             match self
                 .renderer
-                .create_target(slot.hwnd, slot.size, &slot.bgra)
+                .create_target(slot.hwnd, slot.size, &slot.bgra, slot.dpi)
             {
                 Ok(target) => slot.target = Some(target),
                 Err(e) => {
@@ -107,12 +127,13 @@ impl Session {
         let Some(target) = slot.target.as_ref() else {
             return;
         };
-        match target.draw(
-            slot.origin,
-            slot.size,
-            self.interaction.preview(),
-            self.stroke_width,
-        ) {
+        let surface = Surface {
+            origin: slot.origin,
+            size: slot.size,
+            bgra: &slot.bgra,
+            stroke_width: self.stroke_width,
+        };
+        match target.draw(&surface, &self.interaction.view(index)) {
             Ok(DrawStatus::Done) => {}
             Ok(DrawStatus::RecreateTarget) => {
                 slot.target = None;
@@ -126,52 +147,141 @@ impl Session {
 #[derive(Clone, Copy)]
 enum Mouse {
     Down,
+    DoubleClick,
     Move,
     Up,
 }
 
-fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
+/// 执行一次状态变更：前后有内容的窗口都要重绘，并按需捕获或释放鼠标。
+fn update(hwnd: HWND, change: impl FnOnce(&mut Session)) {
     with_session(|s| {
+        let before = s.interaction.painted_windows();
+        let was_capturing = s.interaction.is_capturing();
+        change(s);
+        let now_capturing = s.interaction.is_capturing();
+        if now_capturing && !was_capturing {
+            // 捕获鼠标，拖出窗口或跨显示器时仍能收到移动和松开消息
+            // SAFETY: hwnd 是本线程的有效窗口。
+            discard(unsafe { SetCapture(hwnd) });
+        } else if was_capturing && !now_capturing {
+            // 释放失败只会让捕获保留到下次点击，选区本身不受影响
+            // SAFETY: 无前置条件。
+            discard(unsafe { ReleaseCapture() });
+        }
+        s.invalidate_windows(&before);
+        s.invalidate_windows(&s.interaction.painted_windows());
+    });
+}
+
+fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
+    let local = point_from_lparam(lparam.0);
+    update(hwnd, |s| {
         let Some(index) = s.index_of(hwnd) else {
             return;
         };
-        let local = point_from_lparam(lparam.0);
-        let before = s.interaction.active_window();
         match event {
-            Mouse::Down => {
-                s.interaction.press(index, local);
-                if s.interaction.is_dragging() {
-                    // 捕获鼠标，拖出窗口或跨显示器时仍能收到移动和松开消息
-                    // SAFETY: hwnd 是本线程的有效窗口。
-                    discard(unsafe { SetCapture(hwnd) });
-                }
-            }
-            Mouse::Move => s.interaction.drag(index, local),
-            Mouse::Up => {
-                let was_dragging = s.interaction.is_dragging();
-                s.interaction.release(index, local);
-                if was_dragging {
-                    // 释放失败只会让捕获保留到下次点击，选区本身不受影响
-                    // SAFETY: 无前置条件。
-                    discard(unsafe { ReleaseCapture() });
-                }
-            }
-        }
-        // 预览只存在于按下时的显示器上，只重绘状态变化涉及的窗口
-        let after = s.interaction.active_window();
-        if let Some(i) = before {
-            s.invalidate_window(i);
-        }
-        if let Some(i) = after.filter(|i| Some(*i) != before) {
-            s.invalidate_window(i);
+            Mouse::Down => s.interaction.press(index, local),
+            Mouse::DoubleClick => s.interaction.double_click(index, local),
+            Mouse::Move => s.interaction.mouse_move(index, local),
+            Mouse::Up => s.interaction.release(index, local),
         }
     });
 }
 
-fn on_cancel() {
-    with_session(|s| {
-        s.interaction.cancel();
-    });
+/// 虚拟键码转为覆盖层按键。
+fn key_of(vk: VIRTUAL_KEY) -> Option<Key> {
+    let key = match vk {
+        VK_ESCAPE => Key::Escape,
+        VK_RETURN => Key::Enter,
+        VK_TAB => Key::Tab,
+        VK_LEFT => Key::Arrow(Direction::Left),
+        VK_RIGHT => Key::Arrow(Direction::Right),
+        VK_UP => Key::Arrow(Direction::Up),
+        VK_DOWN => Key::Arrow(Direction::Down),
+        VK_A => Key::CursorStep(Direction::Left),
+        VK_D => Key::CursorStep(Direction::Right),
+        VK_W => Key::CursorStep(Direction::Up),
+        VK_S => Key::CursorStep(Direction::Down),
+        VK_C => Key::CopyColor,
+        VK_SHIFT => Key::Shift,
+        VK_OEM_COMMA => Key::OlderHistory,
+        VK_OEM_PERIOD => Key::NewerHistory,
+        // 美式键盘上 ? 与 / 同键，另给 F1 作为不依赖布局的备选
+        VK_OEM_2 | VK_F1 => Key::ToggleHints,
+        _ => return None,
+    };
+    Some(key)
+}
+
+fn is_down(vk: VIRTUAL_KEY) -> bool {
+    // SAFETY: 无前置条件，只读取本线程的键盘状态。
+    let state = unsafe { GetKeyState(i32::from(vk.0)) };
+    // 最高位为 1 表示按下
+    state < 0
+}
+
+fn nudge_mode() -> NudgeMode {
+    if is_down(VK_CONTROL) {
+        NudgeMode::Grow
+    } else if is_down(VK_SHIFT) {
+        NudgeMode::Shrink
+    } else {
+        NudgeMode::Move
+    }
+}
+
+fn on_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let Some(key) = u16::try_from(wparam.0)
+        .ok()
+        .map(VIRTUAL_KEY)
+        .and_then(key_of)
+    else {
+        return;
+    };
+    // lparam 第 30 位为 1 表示按下前该键已处于按下状态，即自动重复
+    let repeat = (lparam.0 >> 30) & 1 == 1;
+    let mode = nudge_mode();
+    let mut command = None;
+    update(hwnd, |s| command = s.interaction.key(key, mode, repeat));
+    match command {
+        Some(KeyCommand::MoveCursor(dx, dy)) => move_cursor(dx, dy),
+        Some(KeyCommand::PickColor(p)) => update(hwnd, |s| {
+            // 光标不在任何冻结帧上时取不到颜色，保持覆盖层不变
+            if let Some(rgb) = s.pixel(p) {
+                s.interaction.finish_color(rgb);
+            }
+        }),
+        None => {}
+    }
+}
+
+fn move_cursor(dx: i32, dy: i32) {
+    let mut cursor = POINT::default();
+    // SAFETY: cursor 是有效的局部变量。
+    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
+        return;
+    }
+    // 移动失败只是这一步没动，用户可以再按一次
+    // SAFETY: 无前置条件，坐标超出屏幕时系统会自动限制。
+    discard(unsafe { SetCursorPos(cursor.x.saturating_add(dx), cursor.y.saturating_add(dy)) });
+}
+
+fn set_cursor() {
+    let kind = with_session(|s| s.interaction.cursor_kind()).unwrap_or(CursorKind::Cross);
+    let id = match kind {
+        CursorKind::Cross => IDC_CROSS,
+        CursorKind::Arrow => IDC_ARROW,
+        CursorKind::Move => IDC_SIZEALL,
+        CursorKind::SizeNs => IDC_SIZENS,
+        CursorKind::SizeWe => IDC_SIZEWE,
+        CursorKind::SizeNwse => IDC_SIZENWSE,
+        CursorKind::SizeNesw => IDC_SIZENESW,
+    };
+    // SAFETY: 加载系统预置光标，共享句柄无需释放。
+    if let Ok(cursor) = unsafe { LoadCursorW(None, id) } {
+        // SAFETY: cursor 是有效的光标句柄。
+        discard(unsafe { SetCursor(Some(cursor)) });
+    }
 }
 
 fn on_paint(hwnd: HWND) {
@@ -198,18 +308,22 @@ unsafe extern "system" fn wnd_proc(
         // 整个客户区都由 Direct2D 绘制，禁止系统擦除以免闪烁
         WM_ERASEBKGND => return LRESULT(1),
         WM_SETCURSOR => {
-            // SAFETY: 加载系统预置十字光标，共享句柄无需释放。
-            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_CROSS) } {
-                // SAFETY: cursor 是有效的光标句柄。
-                discard(unsafe { SetCursor(Some(cursor)) });
-            }
+            set_cursor();
             return LRESULT(1);
         }
         WM_LBUTTONDOWN => on_mouse(hwnd, lparam, Mouse::Down),
-        WM_MOUSEMOVE => on_mouse(hwnd, lparam, Mouse::Move),
+        WM_LBUTTONDBLCLK => on_mouse(hwnd, lparam, Mouse::DoubleClick),
+        WM_MOUSEMOVE => {
+            on_mouse(hwnd, lparam, Mouse::Move);
+            // 捕获鼠标期间系统不再发 WM_SETCURSOR，光标形状需在移动时自行更新
+            set_cursor();
+        }
         WM_LBUTTONUP => on_mouse(hwnd, lparam, Mouse::Up),
-        WM_RBUTTONDOWN => on_cancel(),
-        WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => on_cancel(),
+        WM_RBUTTONDOWN => update(hwnd, |s| s.interaction.right_click()),
+        WM_KEYDOWN => {
+            on_key(hwnd, wparam, lparam);
+            return LRESULT(0);
+        }
         _ => {}
     }
     // SAFETY: 参数原样来自系统传入的窗口消息。
@@ -244,6 +358,7 @@ fn register_class() -> Result<HINSTANCE, OverlayError> {
     let class = WNDCLASSEXW {
         cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>())
             .map_err(|_| OverlayError::InvalidInput("窗口类结构过大".to_string()))?,
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
         lpszClassName: CLASS_NAME,
@@ -314,12 +429,20 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
             hwnd,
             origin: Point::new(x, y),
             size: (w, h),
+            dpi: monitor.dpi,
             bgra,
             target: None,
         });
     }
 
-    let focus_index = focus_window_index(&monitors);
+    let cursor = cursor_position();
+    let focus_index = cursor
+        .and_then(|p| lenswin_core::monitor::index_at(&monitors, p))
+        .unwrap_or(0);
+    let mut interaction = interaction;
+    if let Some(p) = cursor {
+        interaction.set_hover(p);
+    }
     let placements: Vec<(HWND, i32, i32, i32, i32)> = slots
         .iter()
         .zip(&monitors)
@@ -365,14 +488,12 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
     }
 }
 
-/// 光标所在显示器对应的窗口序号，取不到时用第一个。
-fn focus_window_index(monitors: &[MonitorInfo]) -> usize {
+/// 当前光标的虚拟桌面坐标，取不到时返回 `None`。
+fn cursor_position() -> Option<Point> {
     let mut cursor = POINT::default();
     // SAFETY: cursor 是有效的局部变量。
-    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
-        return 0;
-    }
-    lenswin_core::monitor::index_at(monitors, Point::new(cursor.x, cursor.y)).unwrap_or(0)
+    unsafe { GetCursorPos(&mut cursor) }.ok()?;
+    Some(Point::new(cursor.x, cursor.y))
 }
 
 fn pump_until_finished() -> Result<(), OverlayError> {

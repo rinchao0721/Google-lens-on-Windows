@@ -1,23 +1,29 @@
-//! 选区覆盖层：只返回选区，不触发上传或动作。
+//! 选区覆盖层：只返回选区和用户选择的动作，不触发上传或动作。
 //!
 //! 进程须声明 Per-Monitor DPI 感知，所有坐标均为虚拟桌面物理像素。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod adjust;
 pub mod error;
+pub mod hint;
 pub mod input;
+pub mod layout;
 pub mod modes;
 
 mod render;
 mod window;
 
-use lenswin_core::config::LassoConfig;
+use lenswin_core::config::{LassoConfig, ScreenshotConfig};
 use lenswin_core::frame::Frame;
+use lenswin_core::geometry::Rect;
 use lenswin_core::monitor::MonitorInfo;
-use lenswin_core::selection::{Selection, SelectionMode};
+use lenswin_core::selection::SelectionMode;
+use lenswin_core::snip::{OverlayFlow, OverlayResult};
 
 pub use crate::error::OverlayError;
-use crate::input::{Interaction, Outcome};
+use crate::hint::HintState;
+use crate::input::{Interaction, Options, Outcome, SnapState};
 use crate::window::SessionInput;
 
 /// 一次选区请求。
@@ -28,8 +34,16 @@ pub struct SelectRequest<'a> {
     pub monitors: &'a [MonitorInfo],
     /// 选区模式。
     pub mode: SelectionMode,
+    /// 流程。
+    pub flow: OverlayFlow,
     /// 套索参数。
     pub lasso: &'a LassoConfig,
+    /// 放大镜、吸附等截屏选项。
+    pub screenshot: &'a ScreenshotConfig,
+    /// 冻结时刻的窗口范围，最上层在前；为空表示不吸附。
+    pub windows: &'a [Rect],
+    /// 历史选区，最新的在前。
+    pub history: &'a [Rect],
 }
 
 /// 校验帧与显示器一一对应。
@@ -59,13 +73,31 @@ fn validate(request: &SelectRequest<'_>) -> Result<(), OverlayError> {
 
 /// 冻结所有显示器并让用户选区。
 ///
-/// 用户完成选区返回 `Some`，按 Esc 或点右键取消返回 `None`。
+/// 用户完成选区或取色返回 `Some`，按 Esc 或右键取消返回 `None`。
 /// 必须在创建了消息循环的主线程调用；函数内部自带消息循环，返回前所有窗口已销毁。
-pub fn select(request: &SelectRequest<'_>) -> Result<Option<Selection>, OverlayError> {
+pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, OverlayError> {
     validate(request)?;
     let tool = modes::tool_for(request.mode, request.lasso);
+    let snap = match request.mode {
+        SelectionMode::Rect if request.screenshot.window_snap && !request.windows.is_empty() => {
+            SnapState::On
+        }
+        _ => SnapState::Unavailable,
+    };
+    let options = Options {
+        flow: request.flow,
+        magnifier: request.screenshot.magnifier,
+        snap,
+        windows: request.windows.to_vec(),
+        history: request.history.to_vec(),
+        hints: if request.screenshot.show_hints {
+            HintState::Shown
+        } else {
+            HintState::Hidden
+        },
+    };
     let input = SessionInput {
-        interaction: Interaction::new(tool, request.monitors.to_vec()),
+        interaction: Interaction::new(tool, request.monitors.to_vec(), options),
         monitors: request.monitors.to_vec(),
         bgra_frames: request
             .frames
@@ -74,16 +106,17 @@ pub fn select(request: &SelectRequest<'_>) -> Result<Option<Selection>, OverlayE
             .collect(),
         stroke_width: request.lasso.stroke_width,
     };
-    match window::run(input)? {
-        Outcome::Selected(selection) => Ok(Some(selection)),
-        Outcome::Cancelled => Ok(None),
-    }
+    Ok(match window::run(input)? {
+        Outcome::Selected(selection) => Some(OverlayResult::Selected(selection)),
+        Outcome::Action(selection, action) => Some(OverlayResult::Action(selection, action)),
+        Outcome::Color(text) => Some(OverlayResult::Color(text)),
+        Outcome::Cancelled => None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lenswin_core::geometry::Rect;
 
     fn monitor(x: i32) -> MonitorInfo {
         MonitorInfo {
@@ -101,42 +134,51 @@ mod tests {
         frames: &'a [Frame],
         monitors: &'a [MonitorInfo],
         lasso: &'a LassoConfig,
+        screenshot: &'a ScreenshotConfig,
     ) -> SelectRequest<'a> {
         SelectRequest {
             frames,
             monitors,
             mode: SelectionMode::Rect,
+            flow: OverlayFlow::Direct,
             lasso,
+            screenshot,
+            windows: &[],
+            history: &[],
         }
     }
 
     #[test]
     fn rejects_empty_input() {
         let lasso = LassoConfig::default();
-        assert!(validate(&request(&[], &[], &lasso)).is_err());
+        let shot = ScreenshotConfig::default();
+        assert!(validate(&request(&[], &[], &lasso, &shot)).is_err());
     }
 
     #[test]
     fn rejects_count_mismatch() {
         let lasso = LassoConfig::default();
+        let shot = ScreenshotConfig::default();
         let frames = [frame(0)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso)).is_err());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_err());
     }
 
     #[test]
     fn rejects_region_mismatch() {
         let lasso = LassoConfig::default();
+        let shot = ScreenshotConfig::default();
         let frames = [frame(0), frame(5)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso)).is_err());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_err());
     }
 
     #[test]
     fn accepts_aligned_input() {
         let lasso = LassoConfig::default();
+        let shot = ScreenshotConfig::default();
         let frames = [frame(0), frame(2)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso)).is_ok());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_ok());
     }
 }

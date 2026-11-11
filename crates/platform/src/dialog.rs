@@ -1,19 +1,24 @@
-//! 模态确认对话框。
+//! 模态确认对话框与另存为对话框。
 
-use windows::Win32::Foundation::{HWND, LPARAM, S_OK, WPARAM};
+use std::path::PathBuf;
+
+use windows::Win32::Foundation::{ERROR_CANCELLED, HWND, LPARAM, S_OK, WPARAM};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{
     TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0,
     TD_INFORMATION_ICON, TDF_ALLOW_DIALOG_CANCELLATION, TDN_CREATED,
 };
+use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH};
 use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
     MB_YESNO, MessageBoxW, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, s, w};
 
+use crate::com::ComScope;
 use crate::error::{PlatformError, last_error, win32};
-use crate::handle::discard;
+use crate::handle::{CoTaskString, discard};
 use crate::text::to_wide;
 
 /// 弹出「是 / 否」确认框，选「是」返回 `true`。
@@ -168,6 +173,38 @@ pub fn ask(
     .ok()
     .map_err(win32("TaskDialogIndirect"))?;
     Ok(is_yes(pressed))
+}
+
+/// 弹出「另存为」对话框选择 PNG 文件路径，用户取消返回 `None`。
+///
+/// 调用线程在用户作答前阻塞，只做选路径，不写文件。
+pub fn save_png_path(default_name: &str) -> Result<Option<PathBuf>, PlatformError> {
+    let _com = ComScope::enter();
+    // SAFETY: 本线程已初始化 COM，类标识为系统提供的另存为对话框。
+    let dialog: IFileSaveDialog =
+        unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER) }
+            .map_err(win32("CoCreateInstance(FileSaveDialog)"))?;
+    let name = to_wide(default_name);
+    // SAFETY: name 以 NUL 结尾且在调用期间有效。
+    unsafe { dialog.SetFileName(PCWSTR(name.as_ptr())) }
+        .map_err(win32("IFileSaveDialog::SetFileName"))?;
+    // SAFETY: 参数为静态字符串。
+    unsafe { dialog.SetDefaultExtension(w!("png")) }
+        .map_err(win32("IFileSaveDialog::SetDefaultExtension"))?;
+    // SAFETY: 无所有者窗口，对话框为模态。
+    match unsafe { dialog.Show(None) } {
+        Ok(()) => {}
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => return Ok(None),
+        Err(e) => return Err(win32("IFileSaveDialog::Show")(e)),
+    }
+    // SAFETY: Show 成功后才有结果。
+    let item = unsafe { dialog.GetResult() }.map_err(win32("IFileSaveDialog::GetResult"))?;
+    // SAFETY: item 有效；返回的字符串由 COM 分配，交给 CoTaskString 释放。
+    let raw = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }
+        .map_err(win32("IShellItem::GetDisplayName"))?;
+    // SAFETY: raw 由 GetDisplayName 分配，此后只由 CoTaskString 释放。
+    let path = unsafe { CoTaskString::from_raw(raw) }.to_string_lossless()?;
+    Ok(Some(PathBuf::from(path)))
 }
 
 #[cfg(test)]

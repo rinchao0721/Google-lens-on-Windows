@@ -1,15 +1,18 @@
 //! 热键、托盘事件到命令的路由。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use lenswin_actions::ActionRegistry;
+use lenswin_actions::{ActionRegistry, default_file_name, save_to};
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, TrayLeftClick};
 use lenswin_core::frame::{CroppedImage, Frame};
+use lenswin_core::geometry::Rect;
 use lenswin_core::ipc::SETTINGS_ARG;
-use lenswin_core::selection::{Selection, SelectionMode};
+use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
+use lenswin_core::snip::{OverlayFlow, OverlayResult, ToolbarAction, push_history};
 use lenswin_overlay::SelectRequest;
 use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::ScreenCapturer;
@@ -22,6 +25,7 @@ use lenswin_platform::paths::AppPaths;
 use lenswin_platform::shell;
 use lenswin_platform::tray::TrayIcon;
 use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_triggers};
+use lenswin_platform::window_snapshot;
 use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
@@ -97,6 +101,8 @@ pub struct Dispatcher<'a> {
     exe: Option<PathBuf>,
     results_tx: Sender<TaskResult>,
     results_rx: Receiver<TaskResult>,
+    /// 本次运行内的历史选区，最新的在前，不落盘。
+    history: RefCell<Vec<Rect>>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -125,6 +131,7 @@ impl<'a> Dispatcher<'a> {
             exe,
             results_tx,
             results_rx,
+            history: RefCell::new(Vec::new()),
         }
     }
 
@@ -356,9 +363,47 @@ impl<'a> Dispatcher<'a> {
     /// 圈选 → 隐私确认 → 在工作线程上传并打开搜索结果。
     fn search(&self) {
         let mode = self.shared.store.snapshot().search.selection_mode;
-        let Some(image) = self.pick_image(Command::Search, mode) else {
+        let Some((result, frames)) = self.pick(Command::Search, mode, OverlayFlow::Direct) else {
             return;
         };
+        match result {
+            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _) => {
+                if let Some(image) = self.crop(&selection, &frames) {
+                    self.upload_and_search(image);
+                }
+            }
+            OverlayResult::Color(text) => self.copy_color(&text),
+        }
+    }
+
+    /// 框选并调整 → 工具栏选择复制、保存或搜索；也可以直接取色。
+    fn screenshot_copy(&self) {
+        let Some((result, frames)) = self.pick(
+            Command::ScreenshotCopy,
+            SelectionMode::Rect,
+            OverlayFlow::Toolbar,
+        ) else {
+            return;
+        };
+        let (selection, action) = match result {
+            OverlayResult::Action(selection, action) => (selection, action),
+            OverlayResult::Selected(selection) => (selection, ToolbarAction::Copy),
+            OverlayResult::Color(text) => {
+                self.copy_color(&text);
+                return;
+            }
+        };
+        let Some(image) = self.crop(&selection, &frames) else {
+            return;
+        };
+        match action {
+            ToolbarAction::Copy => self.copy_image(image),
+            ToolbarAction::Save => self.save_image(image),
+            ToolbarAction::Search => self.upload_and_search(image),
+        }
+    }
+
+    fn upload_and_search(&self, image: CroppedImage) {
         if self.ensure_upload_acknowledged() {
             self.balloon(NotifyLevel::Info, "lenswin", "正在上传…");
             self.spawn(ActionKind::Search, "搜索", image);
@@ -367,20 +412,9 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 框选 → 复制到剪贴板；配置了保存目录时再到工作线程保存文件。
-    fn screenshot_copy(&self) {
-        let Some(image) = self.pick_image(Command::ScreenshotCopy, SelectionMode::Rect) else {
-            return;
-        };
-        let save = !self
-            .shared
-            .store
-            .snapshot()
-            .screenshot
-            .save_dir
-            .trim()
-            .is_empty();
-        let spare = save.then(|| image.clone());
+    /// 复制到剪贴板；配置了保存目录时再到工作线程保存文件。
+    fn copy_image(&self, image: CroppedImage) {
+        let spare = self.has_save_dir().then(|| image.clone());
         match self.registry.get(ActionKind::Copy) {
             Some(copy) => match copy.run(&self.context(), ActionInput::Image(image)) {
                 Ok(_) => log::info!("截图已复制到剪贴板"),
@@ -394,6 +428,54 @@ impl<'a> Dispatcher<'a> {
         if let Some(image) = spare {
             self.spawn(ActionKind::Save, "保存", image);
         }
+    }
+
+    /// 配置了保存目录时直接存入；否则弹另存为对话框，在工作线程写文件。
+    fn save_image(&self, image: CroppedImage) {
+        if self.has_save_dir() {
+            self.spawn(ActionKind::Save, "保存", image);
+            return;
+        }
+        let path = match dialog::save_png_path(&default_file_name()) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                log::info!("另存为已取消");
+                return;
+            }
+            Err(e) => {
+                log::error!("显示另存为对话框失败：{e}");
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("无法显示另存为：{e}"),
+                );
+                return;
+            }
+        };
+        self.spawn_task("保存", move || {
+            save_to(&path, &image).err().map(|e| e.to_string())
+        });
+    }
+
+    fn copy_color(&self, text: &str) {
+        match self.registry.copy_text(text) {
+            Ok(()) => log::info!("颜色值已复制：{text}"),
+            Err(e) => {
+                log::error!("复制颜色失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("复制颜色失败：{e}"));
+            }
+        }
+    }
+
+    fn has_save_dir(&self) -> bool {
+        !self
+            .shared
+            .store
+            .snapshot()
+            .screenshot
+            .save_dir
+            .trim()
+            .is_empty()
     }
 
     fn context(&self) -> ActionContext {
@@ -503,9 +585,8 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 冻结屏幕让用户选区，并裁出对应图像；取消或失败返回 `None`。
-    fn pick_image(&self, command: Command, mode: SelectionMode) -> Option<CroppedImage> {
-        let (selection, frames) = self.pick_region(command, mode)?;
+    /// 裁出选区对应的图像；失败时提示并返回 `None`。
+    fn crop(&self, selection: &Selection, frames: &[Frame]) -> Option<CroppedImage> {
         let Some(frame) = frames.get(selection.monitor_index()) else {
             log::error!(
                 "选区所在显示器序号 {} 没有对应截屏",
@@ -523,11 +604,13 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    fn pick_region(
+    /// 冻结屏幕让用户选区；取消或失败返回 `None`。
+    fn pick(
         &self,
         command: Command,
         mode: SelectionMode,
-    ) -> Option<(Selection, Vec<Frame>)> {
+        flow: OverlayFlow,
+    ) -> Option<(OverlayResult, Vec<Frame>)> {
         log::info!("触发命令：{}", command.label());
         let monitors = match monitor::enumerate() {
             Ok(list) => list,
@@ -544,24 +627,26 @@ impl<'a> Dispatcher<'a> {
                 return None;
             }
         };
-        let lasso = self.shared.store.snapshot().selection.lasso;
+        let config = self.shared.store.snapshot();
+        let windows = self.window_snapshot(mode, config.screenshot.window_snap);
+        let history = self.history.borrow().clone();
         let request = SelectRequest {
             frames: &frames,
             monitors: &monitors,
             mode,
-            lasso: &lasso,
+            flow,
+            lasso: &config.selection.lasso,
+            screenshot: &config.screenshot,
+            windows: &windows,
+            history: &history,
         };
         let outcome = lenswin_overlay::select(&request);
         // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
         discard_pending_triggers();
         match outcome {
-            Ok(Some(selection)) => {
-                log::info!(
-                    "选区完成：范围 {:?}，显示器 {}",
-                    selection.bounds(),
-                    selection.monitor_index()
-                );
-                Some((selection, frames))
+            Ok(Some(result)) => {
+                self.remember(&result, config.screenshot.history_size);
+                Some((result, frames))
             }
             Ok(None) => {
                 log::info!("选区已取消");
@@ -572,6 +657,37 @@ impl<'a> Dispatcher<'a> {
                 self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
                 None
             }
+        }
+    }
+
+    /// 矩形模式且开启吸附时拍下窗口快照；失败只是不能吸附。
+    fn window_snapshot(&self, mode: SelectionMode, enabled: bool) -> Vec<Rect> {
+        if mode != SelectionMode::Rect || !enabled {
+            return Vec::new();
+        }
+        match window_snapshot::visible_windows() {
+            Ok(list) => list,
+            Err(e) => {
+                log::warn!("获取窗口快照失败，本次不吸附窗口：{e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 把矩形选区记入历史。
+    fn remember(&self, result: &OverlayResult, capacity: u32) {
+        let selection = match result {
+            OverlayResult::Selected(s) | OverlayResult::Action(s, _) => s,
+            OverlayResult::Color(_) => return,
+        };
+        log::info!(
+            "选区完成：范围 {:?}，显示器 {}",
+            selection.bounds(),
+            selection.monitor_index()
+        );
+        if matches!(selection.shape(), SelectionShape::Rect) {
+            let capacity = usize::try_from(capacity).unwrap_or(0);
+            push_history(&mut self.history.borrow_mut(), selection.bounds(), capacity);
         }
     }
 
