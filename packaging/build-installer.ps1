@@ -9,6 +9,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDir) { $OutputDir = Join-Path $root 'dist' }
+# ISCC 把相对路径按 .iss 所在目录解析，这里先按当前目录转成绝对路径
+$OutputDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDir)
 
 $cargoToml = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw
 if ($cargoToml -notmatch '(?ms)\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
