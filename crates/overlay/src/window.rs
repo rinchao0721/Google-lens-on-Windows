@@ -1,7 +1,9 @@
 //! 每个显示器一个置顶无边框窗口，共享同一份会话状态，内嵌消息循环直到选区结束。
 
 use std::cell::RefCell;
+use std::time::Instant;
 
+use lenswin_core::config::GlowMode;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::MonitorInfo;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -15,21 +17,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SWP_SHOWWINDOW,
-    SetCursor, SetCursorPos, SetForegroundWindow, SetWindowPos, TranslateMessage, UnregisterClassW,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
+    SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
+    TranslateMessage, UnregisterClassW, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::adjust::{Direction, NudgeMode};
 use crate::error::{OverlayError, win32};
+use crate::glow;
 use crate::input::{CursorKind, Interaction, Key, KeyCommand, Outcome, point_from_lparam};
 use crate::layout;
-use crate::render::{DrawStatus, Renderer, Surface, TargetResources};
+use crate::render::{DrawStatus, Effects, Renderer, Surface, TargetResources};
 
 /// 覆盖层窗口类名。
 const CLASS_NAME: PCWSTR = w!("LenswinOverlayWindow");
+/// 辉光动画计时器的标识。
+const GLOW_TIMER_ID: usize = 1;
+/// 辉光动画的帧间隔（毫秒），约 60 帧每秒。
+const GLOW_FRAME_MS: u32 = 16;
 
 /// 显式丢弃无法处理的返回值。
 fn discard<T>(_value: T) {}
@@ -48,6 +56,9 @@ struct Session {
     interaction: Interaction,
     windows: Vec<WindowSlot>,
     stroke_width: u32,
+    show_lasso_bounds: bool,
+    visual: Visual,
+    started: Instant,
     error: Option<OverlayError>,
 }
 
@@ -108,7 +119,20 @@ impl Session {
         })
     }
 
+    fn elapsed_secs(&self) -> f32 {
+        self.started.elapsed().as_secs_f32()
+    }
+
+    fn effects(&self) -> Effects {
+        Effects {
+            glow: glow::glow_frame(self.visual.glow, self.elapsed_secs()),
+            dim: glow::dim_progress(self.visual.glow, self.elapsed_secs()),
+            colorful: self.visual.colorful,
+        }
+    }
+
     fn paint(&mut self, index: usize) {
+        let effects = self.effects();
         let Some(slot) = self.windows.get_mut(index) else {
             return;
         };
@@ -132,6 +156,8 @@ impl Session {
             size: slot.size,
             bgra: &slot.bgra,
             stroke_width: self.stroke_width,
+            show_lasso_bounds: self.show_lasso_bounds,
+            effects,
         };
         match target.draw(&surface, &self.interaction.view(index)) {
             Ok(DrawStatus::Done) => {}
@@ -284,6 +310,28 @@ fn set_cursor() {
     }
 }
 
+/// 辉光动画的一帧：全部窗口重绘，动画结束后停掉计时器，最后一次重绘停在静态状态。
+fn on_glow_tick(hwnd: HWND) {
+    with_session(|s| {
+        if !glow::is_animating(s.visual.glow, s.elapsed_secs()) {
+            // 停不掉只会多几次无变化的重绘，窗口销毁时计时器也会随之释放
+            // SAFETY: hwnd 是本线程创建的窗口，计时器由它持有。
+            discard(unsafe { KillTimer(Some(hwnd), GLOW_TIMER_ID) });
+        }
+        s.invalidate_all();
+    });
+}
+
+/// 需要动画时在 `hwnd` 上启动辉光计时器。
+fn start_glow_timer(hwnd: HWND, visual: Visual) {
+    if !glow::is_animating(visual.glow, 0.0) {
+        return;
+    }
+    // 启动失败时辉光停在首帧，鼠标移动引起的重绘仍会推进动画，选区不受影响
+    // SAFETY: hwnd 是本线程创建且已显示的窗口，不使用回调函数。
+    discard(unsafe { SetTimer(Some(hwnd), GLOW_TIMER_ID, GLOW_FRAME_MS, None) });
+}
+
 fn on_paint(hwnd: HWND) {
     with_session(|s| {
         if let Some(index) = s.index_of(hwnd) {
@@ -322,6 +370,10 @@ unsafe extern "system" fn wnd_proc(
         WM_RBUTTONDOWN => update(hwnd, |s| s.interaction.right_click()),
         WM_KEYDOWN => {
             on_key(hwnd, wparam, lparam);
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == GLOW_TIMER_ID => {
+            on_glow_tick(hwnd);
             return LRESULT(0);
         }
         _ => {}
@@ -375,12 +427,21 @@ fn register_class() -> Result<HINSTANCE, OverlayError> {
     Ok(instance)
 }
 
+/// 辉光与炫彩描边的设置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Visual {
+    pub glow: GlowMode,
+    pub colorful: bool,
+}
+
 /// 会话所需的输入。
 pub(crate) struct SessionInput {
     pub interaction: Interaction,
     pub monitors: Vec<MonitorInfo>,
     pub bgra_frames: Vec<Vec<u8>>,
     pub stroke_width: u32,
+    pub show_lasso_bounds: bool,
+    pub visual: Visual,
 }
 
 /// 显示覆盖层并运行消息循环，直到用户完成或取消选区。
@@ -390,6 +451,8 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
         monitors,
         bgra_frames,
         stroke_width,
+        show_lasso_bounds,
+        visual,
     } = input;
     let renderer = Renderer::new()?;
     let instance = register_class()?;
@@ -453,6 +516,7 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
         })
         .collect();
     let focus_hwnd = slots.get(focus_index).map(|s| s.hwnd);
+    let timer_hwnd = slots.first().map(|s| s.hwnd);
 
     SESSION
         .try_with(|cell| {
@@ -461,6 +525,9 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
                 interaction,
                 windows: slots,
                 stroke_width,
+                show_lasso_bounds,
+                visual,
+                started: Instant::now(),
                 error: None,
             });
         })
@@ -477,6 +544,11 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
         discard(unsafe { SetForegroundWindow(hwnd) });
         // SAFETY: 同上。
         discard(unsafe { SetFocus(Some(hwnd)) });
+    }
+    if let Some(hwnd) = timer_hwnd {
+        // 动画从窗口显示时算起，各显示器共用同一起点
+        with_session(|s| s.started = Instant::now());
+        start_glow_timer(hwnd, visual);
     }
 
     pump_until_finished()?;

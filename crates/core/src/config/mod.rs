@@ -173,6 +173,10 @@ pub struct SearchConfig {
     pub engine_url_template: String,
     /// 默认选区模式。
     pub selection_mode: SelectionMode,
+    /// 搜索覆盖层的屏幕边缘辉光。
+    pub glow: GlowMode,
+    /// 套索轨迹用谷歌蓝加笔尖光点、选框用四色渐变，关闭后为原来的单色。
+    pub colorful_stroke: bool,
 }
 
 impl Default for SearchConfig {
@@ -180,6 +184,35 @@ impl Default for SearchConfig {
         Self {
             engine_url_template: SEARCH_ENGINE_PRESETS[0].url_template.to_string(),
             selection_mode: SelectionMode::default(),
+            glow: GlowMode::default(),
+            colorful_stroke: true,
+        }
+    }
+}
+
+/// 搜索覆盖层的屏幕边缘辉光。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlowMode {
+    /// 打开时流动一段时间，之后保留静态弱辉光。
+    #[default]
+    Startup,
+    /// 覆盖层打开期间一直流动。
+    Always,
+    /// 不显示。
+    Off,
+}
+
+impl GlowMode {
+    /// 全部取值，供界面生成选项。
+    pub const ALL: [GlowMode; 3] = [GlowMode::Startup, GlowMode::Always, GlowMode::Off];
+
+    /// 面向用户的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            GlowMode::Startup => "仅启动时流动",
+            GlowMode::Always => "持续流动",
+            GlowMode::Off => "关闭",
         }
     }
 }
@@ -331,6 +364,8 @@ pub struct LassoConfig {
     pub padding: u32,
     /// 描边宽度像素。
     pub stroke_width: u32,
+    /// 圈选过程中显示外接矩形；关闭时只提亮套索围出的区域。
+    pub show_bounds: bool,
 }
 
 impl Default for LassoConfig {
@@ -338,6 +373,7 @@ impl Default for LassoConfig {
         Self {
             padding: 10,
             stroke_width: 4,
+            show_bounds: false,
         }
     }
 }
@@ -468,6 +504,35 @@ mod tests {
     }
 
     #[test]
+    fn glow_defaults_and_parses_every_value() {
+        let search = Config::default().search;
+        assert_eq!(search.glow, GlowMode::Startup);
+        assert!(search.colorful_stroke);
+        for (text, expected) in [
+            ("startup", GlowMode::Startup),
+            ("always", GlowMode::Always),
+            ("off", GlowMode::Off),
+        ] {
+            let toml = format!("[search]\nglow = \"{text}\"\ncolorful_stroke = false\n");
+            let parsed = Config::from_toml_str(&toml).expect("解析");
+            assert_eq!(parsed.search.glow, expected, "{text}");
+            assert!(!parsed.search.colorful_stroke);
+            let back = parsed.to_toml_string().expect("序列化");
+            assert!(back.contains(&format!("glow = \"{text}\"")), "{back}");
+        }
+        assert!(Config::from_toml_str("[search]\nglow = \"rainbow\"\n").is_err());
+        assert!(Config::from_toml_str("[search]\ncolorful_stroke = 1\n").is_err());
+    }
+
+    #[test]
+    fn glow_labels_are_distinct() {
+        let mut labels: Vec<_> = GlowMode::ALL.iter().map(|g| g.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), GlowMode::ALL.len());
+    }
+
+    #[test]
     fn default_config_is_valid() {
         assert_eq!(validate(&Config::default()), Ok(()));
     }
@@ -493,11 +558,14 @@ mod tests {
         let mut config = Config::default();
         config.hotkeys.search = "Ctrl+Alt+S".to_string();
         config.search.selection_mode = SelectionMode::Rect;
+        config.search.glow = GlowMode::Always;
+        config.search.colorful_stroke = false;
         config.upload.provider = UploadProvider::Custom;
         config.upload.litterbox.expiry = LitterboxExpiry::Hours72;
         config.upload.custom.response = ResponseKind::Text;
         config.upload.custom.json_pointer = String::new();
         config.selection.lasso.padding = 20;
+        config.selection.lasso.show_bounds = true;
         config.screenshot.save_dir = "D:\\shots".to_string();
         config.screenshot.magnifier = false;
         config.screenshot.window_snap = false;
@@ -521,6 +589,7 @@ mod tests {
         let config = Config::from_toml_str("[selection.lasso]\npadding = 30\n").expect("部分配置");
         assert_eq!(config.selection.lasso.padding, 30);
         assert_eq!(config.selection.lasso.stroke_width, 4);
+        assert!(!config.selection.lasso.show_bounds);
         assert_eq!(config.hotkeys, HotkeysConfig::default());
     }
 

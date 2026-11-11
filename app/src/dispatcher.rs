@@ -637,6 +637,7 @@ impl<'a> Dispatcher<'a> {
             flow,
             lasso: &config.selection.lasso,
             screenshot: &config.screenshot,
+            search: &config.search,
             windows: &windows,
             history: &history,
         };

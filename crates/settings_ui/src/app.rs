@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use lenswin_core::config::{
-    Config, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry,
-    ResponseKind, SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider,
-    ValidationIssue, validate,
+    Config, GlowMode, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE,
+    LitterboxExpiry, ResponseKind, SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick,
+    UploadProvider, ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
 use lenswin_core::selection::SelectionMode;
@@ -495,6 +495,33 @@ impl SettingsApp {
                         }
                     });
             });
+        let glow = self.draft.config.search.glow;
+        Card::new("边缘辉光")
+            .icon(icons::BRIGHTNESS)
+            .desc("圈选时屏幕边缘的谷歌四色光带")
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("search-glow")
+                    .width(COMBO_WIDTH)
+                    .selected_text(glow.label())
+                    .show_ui(ui, |ui| {
+                        for mode in GlowMode::ALL {
+                            ui.selectable_value(
+                                &mut self.draft.config.search.glow,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
+            });
+        let colorful = &mut self.draft.config.search.colorful_stroke;
+        Card::new("炫彩描边")
+            .icon(icons::COLOR)
+            .desc("圈选轨迹为谷歌蓝加笔尖光点，选框为四色渐变；关闭后为原来的单色")
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, colorful);
+            });
         let engine_error = self.issue("search.engine_url_template");
         let custom = self.draft.engine_custom;
         let selected = if custom {
@@ -805,6 +832,14 @@ impl SettingsApp {
                         .range(LASSO_STROKE_WIDTH_RANGE)
                         .suffix(" 像素"),
                 );
+            });
+        let show_bounds = &mut self.draft.config.selection.lasso.show_bounds;
+        Card::new("显示外接矩形")
+            .icon(icons::EDIT)
+            .desc("圈选时显示截取范围的方框；关闭后只提亮套索围出的区域")
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, show_bounds);
             });
     }
 

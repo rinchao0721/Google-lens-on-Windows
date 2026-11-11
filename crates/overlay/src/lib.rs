@@ -6,15 +6,17 @@
 
 pub mod adjust;
 pub mod error;
+pub mod glow;
 pub mod hint;
 pub mod input;
 pub mod layout;
 pub mod modes;
+pub mod stroke;
 
 mod render;
 mod window;
 
-use lenswin_core::config::{LassoConfig, ScreenshotConfig};
+use lenswin_core::config::{GlowMode, LassoConfig, ScreenshotConfig, SearchConfig};
 use lenswin_core::frame::Frame;
 use lenswin_core::geometry::Rect;
 use lenswin_core::monitor::MonitorInfo;
@@ -24,7 +26,7 @@ use lenswin_core::snip::{OverlayFlow, OverlayResult};
 pub use crate::error::OverlayError;
 use crate::hint::HintState;
 use crate::input::{Interaction, Options, Outcome, SnapState};
-use crate::window::SessionInput;
+use crate::window::{SessionInput, Visual};
 
 /// 一次选区请求。
 pub struct SelectRequest<'a> {
@@ -40,6 +42,8 @@ pub struct SelectRequest<'a> {
     pub lasso: &'a LassoConfig,
     /// 放大镜、吸附等截屏选项。
     pub screenshot: &'a ScreenshotConfig,
+    /// 辉光与炫彩描边，只在搜索流程生效。
+    pub search: &'a SearchConfig,
     /// 冻结时刻的窗口范围，最上层在前；为空表示不吸附。
     pub windows: &'a [Rect],
     /// 历史选区，最新的在前。
@@ -69,6 +73,20 @@ fn validate(request: &SelectRequest<'_>) -> Result<(), OverlayError> {
         ));
     }
     Ok(())
+}
+
+/// 截屏流程保持原来的单色样式，辉光和炫彩只给搜索流程。
+fn visual_for(flow: OverlayFlow, search: &SearchConfig) -> Visual {
+    match flow {
+        OverlayFlow::Direct => Visual {
+            glow: search.glow,
+            colorful: search.colorful_stroke,
+        },
+        OverlayFlow::Toolbar => Visual {
+            glow: GlowMode::Off,
+            colorful: false,
+        },
+    }
 }
 
 /// 冻结所有显示器并让用户选区。
@@ -105,6 +123,8 @@ pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, Over
             .map(|f| render::rgba_to_bgra(f.rgba()))
             .collect(),
         stroke_width: request.lasso.stroke_width,
+        show_lasso_bounds: request.lasso.show_bounds,
+        visual: visual_for(request.flow, request.search),
     };
     Ok(match window::run(input)? {
         Outcome::Selected(selection) => Some(OverlayResult::Selected(selection)),
@@ -135,6 +155,7 @@ mod tests {
         monitors: &'a [MonitorInfo],
         lasso: &'a LassoConfig,
         screenshot: &'a ScreenshotConfig,
+        search: &'a SearchConfig,
     ) -> SelectRequest<'a> {
         SelectRequest {
             frames,
@@ -143,6 +164,7 @@ mod tests {
             flow: OverlayFlow::Direct,
             lasso,
             screenshot,
+            search,
             windows: &[],
             history: &[],
         }
@@ -152,33 +174,60 @@ mod tests {
     fn rejects_empty_input() {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
-        assert!(validate(&request(&[], &[], &lasso, &shot)).is_err());
+        let search = SearchConfig::default();
+        assert!(validate(&request(&[], &[], &lasso, &shot, &search)).is_err());
     }
 
     #[test]
     fn rejects_count_mismatch() {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
+        let search = SearchConfig::default();
         let frames = [frame(0)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_err());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_err());
     }
 
     #[test]
     fn rejects_region_mismatch() {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
+        let search = SearchConfig::default();
         let frames = [frame(0), frame(5)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_err());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_err());
+    }
+
+    #[test]
+    fn screenshot_flow_keeps_plain_style() {
+        let search = SearchConfig {
+            glow: GlowMode::Always,
+            colorful_stroke: true,
+            ..SearchConfig::default()
+        };
+        assert_eq!(
+            visual_for(OverlayFlow::Toolbar, &search),
+            Visual {
+                glow: GlowMode::Off,
+                colorful: false
+            }
+        );
+        assert_eq!(
+            visual_for(OverlayFlow::Direct, &search),
+            Visual {
+                glow: GlowMode::Always,
+                colorful: true
+            }
+        );
     }
 
     #[test]
     fn accepts_aligned_input() {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
+        let search = SearchConfig::default();
         let frames = [frame(0), frame(2)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot)).is_ok());
+        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_ok());
     }
 }

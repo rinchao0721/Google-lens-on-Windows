@@ -32,6 +32,10 @@ pub const LINK: char = '\u{E71B}';
 pub const DOCUMENT: char = '\u{E8A5}';
 /// 鼠标。
 pub const MOUSE: char = '\u{E962}';
+/// 亮度。
+pub const BRIGHTNESS: char = '\u{E706}';
+/// 调色板。
+pub const COLOR: char = '\u{E790}';
 
 /// 导航项图标。
 pub const fn page_icon(page: Page) -> char {
