@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use eframe::egui;
 use lenswin_core::config::{
     Config, GlowMode, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE,
-    LitterboxExpiry, ResponseKind, SEARCH_ENGINE_PRESETS, TIMEOUT_SECS_RANGE, TrayLeftClick,
-    UploadProvider, ValidationIssue, validate,
+    LitterboxExpiry, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TIMEOUT_SECS_RANGE,
+    TrayLeftClick, UploadProvider, ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
 use lenswin_core::selection::SelectionMode;
@@ -469,13 +469,41 @@ impl SettingsApp {
 
     fn search_upload_page(&mut self, ui: &mut egui::Ui) {
         self.search_section(ui);
-        self.upload_section(ui);
+        let image_host = self.draft.config.search.backend == SearchBackend::ImageHost;
+        ui.add_enabled_ui(image_host, |ui| {
+            self.engine_cards(ui);
+            self.upload_section(ui);
+        });
         self.privacy_section(ui);
+    }
+
+    fn backend_card(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
+        let backend = self.draft.config.search.backend;
+        Card::new("搜索方式")
+            .icon(icons::SEARCH)
+            .desc("内置弹窗直接把截图交给 Google Lens；搜索引擎与上传设置仅图床方式生效")
+            .right_width(COMBO_WIDTH)
+            .show(ui, &look, |ui| {
+                egui::ComboBox::from_id_salt("search-backend")
+                    .width(COMBO_WIDTH)
+                    .selected_text(backend.label())
+                    .show_ui(ui, |ui| {
+                        for option in SearchBackend::ALL {
+                            ui.selectable_value(
+                                &mut self.draft.config.search.backend,
+                                option,
+                                option.label(),
+                            );
+                        }
+                    });
+            });
     }
 
     fn search_section(&mut self, ui: &mut egui::Ui) {
         let look = self.look;
         group_label(ui, &look, "搜索");
+        self.backend_card(ui);
         let current = self.draft.config.search.selection_mode;
         Card::new("选区模式")
             .icon(icons::EDIT)
@@ -522,6 +550,10 @@ impl SettingsApp {
             .show(ui, &look, |ui| {
                 toggle(ui, &look, colorful);
             });
+    }
+
+    fn engine_cards(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
         let engine_error = self.issue("search.engine_url_template");
         let custom = self.draft.engine_custom;
         let selected = if custom {
@@ -740,6 +772,20 @@ impl SettingsApp {
             .show(ui, &look, |ui| {
                 if secondary_button(ui, &look, "重置确认").clicked() {
                     self.draft.config.privacy.acknowledged_host.clear();
+                }
+            });
+        let lens_desc = if self.draft.config.privacy.lens_acknowledged {
+            "已确认截图会直接发送给 Google；重置后下次使用内置弹窗前会重新询问"
+        } else {
+            "尚未确认；下次使用内置弹窗前会询问"
+        };
+        Card::new("内置弹窗")
+            .icon(icons::LOCK)
+            .desc(lens_desc)
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                if secondary_button(ui, &look, "重置确认").clicked() {
+                    self.draft.config.privacy.lens_acknowledged = false;
                 }
             });
     }

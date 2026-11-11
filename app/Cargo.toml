@@ -11,6 +11,7 @@ lenswin-actions.workspace = true
 lenswin-core.workspace = true
 lenswin-overlay.workspace = true
 lenswin-platform.workspace = true
+lenswin-popup.workspace = true
 lenswin-settings-ui.workspace = true
 lenswin-upload.workspace = true
 log.workspace = true

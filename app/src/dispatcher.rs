@@ -1,16 +1,17 @@
 //! 热键、托盘事件到命令的路由。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use lenswin_actions::{ActionRegistry, default_file_name, save_to};
+use lenswin_actions::{ActionRegistry, default_file_name, prepare_lens_request, save_to};
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
-use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, TrayLeftClick};
+use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, SearchBackend, TrayLeftClick};
 use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::geometry::Rect;
 use lenswin_core::ipc::SETTINGS_ARG;
+use lenswin_core::lens::LensRequest;
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
 use lenswin_core::snip::{OverlayFlow, OverlayResult, ToolbarAction, push_history};
 use lenswin_overlay::SelectRequest;
@@ -26,6 +27,7 @@ use lenswin_platform::shell;
 use lenswin_platform::tray::TrayIcon;
 use lenswin_platform::window::{TaskNotifier, TrayMouse, WindowEvent, discard_pending_triggers};
 use lenswin_platform::window_snapshot;
+use lenswin_popup::{PopupEvent, PopupHost};
 use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
@@ -34,6 +36,16 @@ use crate::tray_menu::{self, MenuAction};
 
 /// 开机自启在注册表里的值名。
 const AUTOSTART_NAME: &str = autostart::VALUE_NAME;
+/// 微软官方的 WebView2 Runtime 下载页。
+const WEBVIEW2_DOWNLOAD_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
+/// 内置搜索弹窗及其回投的事件；弹窗初始化失败时 `host` 为空，搜索改走图床。
+pub struct PopupLink<'a> {
+    /// 弹窗。
+    pub host: Option<&'a PopupHost>,
+    /// 弹窗事件，由弹窗回调发送、主线程取出。
+    pub events: Receiver<PopupEvent>,
+}
 
 /// 托盘左键配置对应的命令；「无操作」返回 `None`。
 fn left_click_command(action: TrayLeftClick) -> Option<Command> {
@@ -85,6 +97,9 @@ impl Command {
     }
 }
 
+/// 工作线程准备好的直传请求，或失败原因。
+type LensResult = Result<LensRequest, String>;
+
 /// 后台任务的结果，由工作线程投递、主线程取出提示。
 struct TaskResult {
     label: &'static str,
@@ -101,6 +116,11 @@ pub struct Dispatcher<'a> {
     exe: Option<PathBuf>,
     results_tx: Sender<TaskResult>,
     results_rx: Receiver<TaskResult>,
+    popup: PopupLink<'a>,
+    lens_tx: Sender<(u64, LensResult)>,
+    lens_rx: Receiver<(u64, LensResult)>,
+    /// 最近一次内置弹窗搜索的序号。
+    lens_seq: Cell<u64>,
     /// 本次运行内的历史选区，最新的在前，不落盘。
     history: RefCell<Vec<Rect>>,
 }
@@ -113,8 +133,10 @@ impl<'a> Dispatcher<'a> {
         shared: Rc<AppShared>,
         registry: ActionRegistry,
         notifier: TaskNotifier,
+        popup: PopupLink<'a>,
     ) -> Self {
         let (results_tx, results_rx) = channel();
+        let (lens_tx, lens_rx) = channel();
         let exe = match std::env::current_exe() {
             Ok(path) => Some(path),
             Err(e) => {
@@ -131,6 +153,10 @@ impl<'a> Dispatcher<'a> {
             exe,
             results_tx,
             results_rx,
+            popup,
+            lens_tx,
+            lens_rx,
+            lens_seq: Cell::new(0),
             history: RefCell::new(Vec::new()),
         }
     }
@@ -233,6 +259,9 @@ impl<'a> Dispatcher<'a> {
             MenuAction::Run(command) => return self.run(command),
             MenuAction::SetSelectionMode(mode) => {
                 self.apply_change(|c| c.search.selection_mode = mode);
+            }
+            MenuAction::SetBackend(backend) => {
+                self.apply_change(|c| c.search.backend = backend);
             }
             MenuAction::SetSearchEngine(index) => match SEARCH_ENGINE_PRESETS.get(index) {
                 Some(preset) => {
@@ -360,7 +389,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 圈选 → 隐私确认 → 在工作线程上传并打开搜索结果。
+    /// 圈选 → 按搜索方式交给内置弹窗或图床。
     fn search(&self) {
         let mode = self.shared.store.snapshot().search.selection_mode;
         let Some((result, frames)) = self.pick(Command::Search, mode, OverlayFlow::Direct) else {
@@ -369,7 +398,7 @@ impl<'a> Dispatcher<'a> {
         match result {
             OverlayResult::Selected(selection) | OverlayResult::Action(selection, _) => {
                 if let Some(image) = self.crop(&selection, &frames) {
-                    self.upload_and_search(image);
+                    self.search_image(image, &selection.bounds());
                 }
             }
             OverlayResult::Color(text) => self.copy_color(&text),
@@ -399,7 +428,131 @@ impl<'a> Dispatcher<'a> {
         match action {
             ToolbarAction::Copy => self.copy_image(image),
             ToolbarAction::Save => self.save_image(image),
-            ToolbarAction::Search => self.upload_and_search(image),
+            ToolbarAction::Search => self.search_image(image, &selection.bounds()),
+        }
+    }
+
+    fn search_image(&self, image: CroppedImage, anchor: &Rect) {
+        match self.shared.store.snapshot().search.backend {
+            SearchBackend::Embedded => self.embedded_search(image, anchor),
+            SearchBackend::ImageHost => self.upload_and_search(image),
+        }
+    }
+
+    /// 弹出内置弹窗，工作线程准备好请求后由弹窗直接提交给 Lens。
+    fn embedded_search(&self, image: CroppedImage, anchor: &Rect) {
+        let Some(popup) = self.popup.host else {
+            self.fallback_to_image_host(image, "内置弹窗不可用");
+            return;
+        };
+        if PopupHost::runtime_version().is_none() {
+            log::warn!("未检测到 WebView2 Runtime，下载地址：{WEBVIEW2_DOWNLOAD_URL}");
+            let reason = format!("未安装 WebView2 Runtime（下载：{WEBVIEW2_DOWNLOAD_URL}）");
+            self.fallback_to_image_host(image, &reason);
+            return;
+        }
+        if !self.ensure_lens_acknowledged() {
+            log::info!("内置弹窗搜索未获确认，已丢弃截图");
+            return;
+        }
+        if let Err(e) = popup.show(anchor) {
+            log::error!("显示搜索弹窗失败：{e}");
+            self.balloon(
+                NotifyLevel::Error,
+                "lenswin",
+                &format!("无法显示搜索弹窗：{e}"),
+            );
+            return;
+        }
+        let config = self.shared.store.snapshot();
+        let tx = self.lens_tx.clone();
+        let seq = self.lens_seq.get().wrapping_add(1);
+        self.lens_seq.set(seq);
+        self.spawn_task("搜索", move || {
+            let prepared = prepare_lens_request(&config, image).map_err(|e| e.to_string());
+            let error = prepared.as_ref().err().cloned();
+            if tx.send((seq, prepared)).is_err() {
+                // 接收端随主线程销毁，只会发生在退出阶段
+                return None;
+            }
+            error
+        });
+    }
+
+    /// 内置弹窗不可用时改走图床；图床未确认过隐私则只提示，不再追加确认框。
+    fn fallback_to_image_host(&self, image: CroppedImage, reason: &str) {
+        let config = self.shared.store.snapshot();
+        let acknowledged = privacy_summary(&config.upload)
+            .map(|summary| config.privacy.is_acknowledged(&summary.host))
+            .unwrap_or(false);
+        if acknowledged {
+            self.balloon(
+                NotifyLevel::Warning,
+                "lenswin",
+                &format!("{reason}，本次改用图床方式"),
+            );
+            self.spawn(ActionKind::Search, "搜索", image);
+        } else {
+            self.balloon(
+                NotifyLevel::Warning,
+                "lenswin",
+                &format!("{reason}，可在设置里改用图床方式"),
+            );
+        }
+    }
+
+    /// 首次使用内置弹窗前弹确认；确认后记入配置。
+    fn ensure_lens_acknowledged(&self) -> bool {
+        if self.shared.store.snapshot().privacy.lens_acknowledged {
+            return true;
+        }
+        let body = "截图会直接提交到 lens.google.com，受 Google 隐私政策约束。\n\n\
+                    弹窗会在本机保存 Google 的 Cookie，用于保持登录和语言等设置。";
+        match dialog::ask(
+            "lenswin 隐私提示",
+            "截图将直接发送给 Google",
+            body,
+            "继续",
+            "取消",
+        ) {
+            Ok(true) => {
+                self.apply_change(|c| c.privacy.lens_acknowledged = true);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                log::error!("显示隐私确认框失败：{e}");
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("无法显示确认框：{e}"),
+                );
+                false
+            }
+        }
+    }
+
+    fn on_popup_event(&self, event: PopupEvent) {
+        match event {
+            PopupEvent::OpenExternal(url) => {
+                self.spawn_task("打开链接", move || {
+                    shell::open_url(&url).err().map(|e| e.to_string())
+                });
+            }
+            PopupEvent::CopyLink(url) => match self.registry.copy_text(&url) {
+                Ok(()) => self.balloon(NotifyLevel::Info, "lenswin", "链接已复制"),
+                Err(e) => {
+                    log::error!("复制链接失败：{e}");
+                    self.balloon(NotifyLevel::Error, "lenswin", &format!("复制链接失败：{e}"));
+                }
+            },
+            PopupEvent::LoadFailed(message) => {
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("内置弹窗：{message}"),
+                );
+            }
         }
     }
 
@@ -570,6 +723,22 @@ impl<'a> Dispatcher<'a> {
                 &format!("配置未能保存，重启后会丢失：{message}"),
             );
         }
+        while let Ok((seq, prepared)) = self.lens_rx.try_recv() {
+            // 慢的旧请求晚到时不能覆盖新的搜索
+            if seq != self.lens_seq.get() {
+                log::debug!("丢弃过期的搜索请求 #{seq}");
+                continue;
+            }
+            if let Some(popup) = self.popup.host {
+                match prepared {
+                    Ok(request) => popup.submit(request),
+                    Err(message) => popup.show_error(&message),
+                }
+            }
+        }
+        while let Ok(event) = self.popup.events.try_recv() {
+            self.on_popup_event(event);
+        }
         while let Ok(result) = self.results_rx.try_recv() {
             match result.error {
                 Some(message) => {
@@ -612,6 +781,12 @@ impl<'a> Dispatcher<'a> {
         flow: OverlayFlow,
     ) -> Option<(OverlayResult, Vec<Frame>)> {
         log::info!("触发命令：{}", command.label());
+        // 搜索前收起上一次的弹窗，免得被冻结进截图；截屏流程保留，用户可能要截它
+        if command == Command::Search
+            && let Some(popup) = self.popup.host
+        {
+            popup.hide();
+        }
         let monitors = match monitor::enumerate() {
             Ok(list) => list,
             Err(e) => {

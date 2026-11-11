@@ -20,6 +20,8 @@ const APP_DIR_NAME: &str = "lenswin";
 const CONFIG_FILE_NAME: &str = "config.toml";
 /// 便携版数据目录名。
 const PORTABLE_DATA_DIR: &str = "data";
+/// WebView2 用户数据目录名。
+const WEBVIEW_DIR_NAME: &str = "WebView2";
 /// 写入探测用的临时文件名。
 const WRITE_PROBE_NAME: &str = ".lenswin-write-test";
 
@@ -54,6 +56,8 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     /// 日志目录。
     pub log_dir: PathBuf,
+    /// 内置搜索弹窗的 WebView2 用户数据目录（Cookie、缓存）。
+    pub webview_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -91,6 +95,7 @@ pub fn resolve(
         mode,
         config_dir: roaming.join(APP_DIR_NAME),
         log_dir: local.join(APP_DIR_NAME).join("logs"),
+        webview_dir: local.join(APP_DIR_NAME).join(WEBVIEW_DIR_NAME),
     };
     match (has_marker, portable_writable) {
         (false, _) => installed(Mode::Installed),
@@ -100,6 +105,7 @@ pub fn resolve(
             AppPaths {
                 mode: Mode::Portable,
                 log_dir: data.join("logs"),
+                webview_dir: data.join(WEBVIEW_DIR_NAME),
                 config_dir: data,
             }
         }
@@ -160,6 +166,10 @@ mod tests {
             PathBuf::from(r"C:\Users\u\AppData\Local\lenswin\logs")
         );
         assert_eq!(
+            p.webview_dir,
+            PathBuf::from(r"C:\Users\u\AppData\Local\lenswin\WebView2")
+        );
+        assert_eq!(
             p.config_file(),
             PathBuf::from(r"C:\Users\u\AppData\Roaming\lenswin\config.toml")
         );
@@ -189,6 +199,10 @@ mod tests {
         assert_eq!(p.mode, Mode::Portable);
         assert_eq!(p.config_dir, PathBuf::from(r"D:\tools\lenswin\data"));
         assert_eq!(p.log_dir, PathBuf::from(r"D:\tools\lenswin\data\logs"));
+        assert_eq!(
+            p.webview_dir,
+            PathBuf::from(r"D:\tools\lenswin\data\WebView2")
+        );
     }
 
     #[test]

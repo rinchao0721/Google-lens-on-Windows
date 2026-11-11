@@ -7,6 +7,7 @@ members = [
     "crates/upload",
     "crates/actions",
     "crates/settings_ui",
+    "crates/popup",
     "app",
 ]
 
@@ -28,6 +29,7 @@ lenswin-overlay = { path = "crates/overlay" }
 lenswin-upload = { path = "crates/upload" }
 lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
+lenswin-popup = { path = "crates/popup" }
 
 # 外部依赖（均在 PLAN 第 8 节批准范围内）
 anyhow = "1.0.104"
@@ -63,6 +65,8 @@ windows = { version = "0.62.2", features = [
 ] }
 thiserror = "2.0.21"
 toml = "1.2.1"
+# 内置搜索弹窗的 WebView2 绑定，只被 popup 使用；与 windows 0.62 同版本
+webview2-com = "0.39.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

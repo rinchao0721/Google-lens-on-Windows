@@ -169,7 +169,9 @@ impl Default for HotkeysConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
-    /// 搜索引擎地址模板，必须恰好含一个 `{url}`。
+    /// 搜索方式。
+    pub backend: SearchBackend,
+    /// 搜索引擎地址模板，必须恰好含一个 `{url}`，只在图床方式下生效。
     pub engine_url_template: String,
     /// 默认选区模式。
     pub selection_mode: SelectionMode,
@@ -182,10 +184,35 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
+            backend: SearchBackend::default(),
             engine_url_template: SEARCH_ENGINE_PRESETS[0].url_template.to_string(),
             selection_mode: SelectionMode::default(),
             glow: GlowMode::default(),
             colorful_stroke: true,
+        }
+    }
+}
+
+/// 搜索方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// 图片直接提交给 Google Lens，结果显示在内置弹窗里。
+    #[default]
+    Embedded,
+    /// 上传图床后用默认浏览器打开搜索引擎。
+    ImageHost,
+}
+
+impl SearchBackend {
+    /// 全部取值，供界面生成选项。
+    pub const ALL: [SearchBackend; 2] = [SearchBackend::Embedded, SearchBackend::ImageHost];
+
+    /// 面向用户的中文名称。
+    pub const fn label(self) -> &'static str {
+        match self {
+            SearchBackend::Embedded => "内置弹窗（Google Lens）",
+            SearchBackend::ImageHost => "图床 + 浏览器",
         }
     }
 }
@@ -412,6 +439,8 @@ impl Default for ScreenshotConfig {
 pub struct PrivacyConfig {
     /// 用户已确认过的图床主机名，为空表示尚未确认。
     pub acknowledged_host: String,
+    /// 用户已确认内置弹窗方式会把截图直接发给 Google。
+    pub lens_acknowledged: bool,
 }
 
 impl PrivacyConfig {
@@ -430,6 +459,7 @@ mod tests {
     fn acknowledgement_matches_host_case_insensitively() {
         let privacy = PrivacyConfig {
             acknowledged_host: " Litterbox.Catbox.moe ".to_string(),
+            lens_acknowledged: false,
         };
         assert!(privacy.is_acknowledged("litterbox.catbox.moe"));
         assert!(!privacy.is_acknowledged("uguu.se"));
@@ -525,6 +555,63 @@ mod tests {
     }
 
     #[test]
+    fn backend_defaults_to_embedded_and_parses_every_value() {
+        assert_eq!(Config::default().search.backend, SearchBackend::Embedded);
+        assert!(!Config::default().privacy.lens_acknowledged);
+        for (text, expected) in [
+            ("embedded", SearchBackend::Embedded),
+            ("image_host", SearchBackend::ImageHost),
+        ] {
+            let toml = format!(
+                "[search]
+backend = \"{text}\"
+"
+            );
+            let parsed = Config::from_toml_str(&toml).expect("解析");
+            assert_eq!(parsed.search.backend, expected, "{text}");
+            let back = parsed.to_toml_string().expect("序列化");
+            assert!(back.contains(&format!("backend = \"{text}\"")), "{back}");
+        }
+        assert!(
+            Config::from_toml_str(
+                "[search]
+backend = \"browser\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::from_toml_str(
+                "[privacy]
+lens_acknowledged = \"yes\"
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_without_new_fields_still_parses() {
+        let old = "[search]
+engine_url_template = \"https://tineye.com/search?url={url}\"
+                   [privacy]
+acknowledged_host = \"uguu.se\"
+";
+        let parsed = Config::from_toml_str(old).expect("旧配置");
+        assert_eq!(parsed.search.backend, SearchBackend::Embedded);
+        assert!(!parsed.privacy.lens_acknowledged);
+        assert!(parsed.privacy.is_acknowledged("uguu.se"));
+    }
+
+    #[test]
+    fn backend_labels_are_distinct() {
+        let mut labels: Vec<_> = SearchBackend::ALL.iter().map(|b| b.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), SearchBackend::ALL.len());
+    }
+
+    #[test]
     fn glow_labels_are_distinct() {
         let mut labels: Vec<_> = GlowMode::ALL.iter().map(|g| g.label()).collect();
         labels.sort_unstable();
@@ -572,6 +659,8 @@ mod tests {
         config.screenshot.history_size = 3;
         config.screenshot.show_hints = false;
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
+        config.privacy.lens_acknowledged = true;
+        config.search.backend = SearchBackend::ImageHost;
         let text = config.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("反序列化"), config);
     }

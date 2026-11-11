@@ -1,7 +1,7 @@
 //! 根据配置生成托盘菜单，并记录菜单项与动作的对应关系。
 
 use lenswin_core::config::{
-    Config, LitterboxExpiry, SEARCH_ENGINE_PRESETS, UploadProvider, preset_index_of,
+    Config, LitterboxExpiry, SEARCH_ENGINE_PRESETS, SearchBackend, UploadProvider, preset_index_of,
 };
 use lenswin_core::selection::SelectionMode;
 use lenswin_platform::autostart::AutostartState;
@@ -16,6 +16,8 @@ pub enum MenuAction {
     Run(Command),
     /// 切换选区模式。
     SetSelectionMode(SelectionMode),
+    /// 切换搜索方式。
+    SetBackend(SearchBackend),
     /// 切换为第 n 个预置搜索引擎。
     SetSearchEngine(usize),
     /// 切换图片保留时间。
@@ -101,8 +103,31 @@ fn selection_mode_menu(builder: &mut Builder, config: &Config) -> MenuItem {
     }
 }
 
+fn backend_menu(builder: &mut Builder, config: &Config) -> MenuItem {
+    let items = SearchBackend::ALL
+        .iter()
+        .map(|backend| {
+            builder.add(
+                MenuAction::SetBackend(*backend),
+                backend.label().to_string(),
+                config.search.backend == *backend,
+                true,
+            )
+        })
+        .collect();
+    MenuItem::Submenu {
+        label: "搜索方式".to_string(),
+        items,
+    }
+}
+
+fn uses_image_host(config: &Config) -> bool {
+    config.search.backend == SearchBackend::ImageHost
+}
+
 fn search_engine_menu(builder: &mut Builder, config: &Config) -> MenuItem {
     let current = preset_index_of(&config.search.engine_url_template);
+    let enabled = uses_image_host(config);
     let mut items: Vec<MenuItem> = SEARCH_ENGINE_PRESETS
         .iter()
         .enumerate()
@@ -111,7 +136,7 @@ fn search_engine_menu(builder: &mut Builder, config: &Config) -> MenuItem {
                 MenuAction::SetSearchEngine(index),
                 preset.name.to_string(),
                 current == Some(index),
-                true,
+                enabled,
             )
         })
         .collect();
@@ -130,7 +155,7 @@ fn search_engine_menu(builder: &mut Builder, config: &Config) -> MenuItem {
 
 fn expiry_menu(builder: &mut Builder, config: &Config) -> MenuItem {
     // 保留时间只对 litterbox 有意义
-    let enabled = config.upload.provider == UploadProvider::Litterbox;
+    let enabled = uses_image_host(config) && config.upload.provider == UploadProvider::Litterbox;
     let items = LitterboxExpiry::ALL
         .iter()
         .map(|expiry| {
@@ -180,6 +205,7 @@ pub fn build(config: &Config, autostart: &AutostartState) -> Menu {
         b.command(Command::ScreenshotCopy, Some(&hotkeys.screenshot_copy)),
         MenuItem::Separator,
         selection_mode_menu(&mut b, config),
+        backend_menu(&mut b, config),
         search_engine_menu(&mut b, config),
         expiry_menu(&mut b, config),
         MenuItem::Separator,
@@ -283,9 +309,37 @@ mod tests {
         assert!(!checked.contains(&"Google Lens".to_string()));
     }
 
+    fn enabled_of(menu: &Menu, pick: impl Fn(MenuAction) -> bool) -> Vec<bool> {
+        flat(menu)
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Entry { id, enabled, .. } => {
+                    menu.action(*id).filter(|a| pick(*a)).map(|_| *enabled)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backend_menu_checks_current_and_gates_image_host_options() {
+        let embedded = build(&Config::default(), &AutostartState::Disabled);
+        assert!(checked_labels(&embedded).contains(&SearchBackend::Embedded.label().to_string()));
+        let engines = |a| matches!(a, MenuAction::SetSearchEngine(_) | MenuAction::SetExpiry(_));
+        assert!(enabled_of(&embedded, engines).iter().all(|e| !e));
+        let mut config = Config::default();
+        config.search.backend = SearchBackend::ImageHost;
+        let host = build(&config, &AutostartState::Disabled);
+        assert!(checked_labels(&host).contains(&SearchBackend::ImageHost.label().to_string()));
+        assert!(enabled_of(&host, engines).iter().all(|e| *e));
+        let backends = enabled_of(&host, |a| matches!(a, MenuAction::SetBackend(_)));
+        assert_eq!(backends, vec![true, true]);
+    }
+
     #[test]
     fn expiry_is_disabled_for_custom_provider() {
         let mut config = Config::default();
+        config.search.backend = SearchBackend::ImageHost;
         config.upload.provider = UploadProvider::Custom;
         let menu = build(&config, &AutostartState::Disabled);
         for item in flat(&menu) {

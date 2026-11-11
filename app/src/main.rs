@@ -13,6 +13,7 @@ mod tray_menu;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::channel;
 
 use anyhow::Context;
 use lenswin_actions::ActionRegistry;
@@ -25,9 +26,10 @@ use lenswin_platform::paths::{AppPaths, Mode};
 use lenswin_platform::single_instance::{self, Acquired};
 use lenswin_platform::tray::TrayIcon;
 use lenswin_platform::window::{MessageWindow, clear_copydata_handler, set_copydata_handler};
+use lenswin_popup::PopupHost;
 
 use crate::config_store::ConfigStore;
-use crate::dispatcher::Dispatcher;
+use crate::dispatcher::{Dispatcher, PopupLink};
 use crate::hotkeys::HotkeySet;
 use crate::shared::AppShared;
 
@@ -93,7 +95,35 @@ fn run() -> anyhow::Result<()> {
     });
     let callback_shared = Rc::clone(&shared);
     set_copydata_handler(move |kind, payload| callback_shared.on_message(kind, payload));
-    let dispatcher = Dispatcher::new(&tray, &paths, shared, registry, window.task_notifier());
+    let (popup_tx, popup_rx) = channel();
+    let popup_notifier = window.task_notifier();
+    let popup_host = match PopupHost::new(&paths.webview_dir, move |event| {
+        if popup_tx.send(event).is_err() {
+            // 接收端随分发器销毁，只会发生在退出阶段
+            return;
+        }
+        if let Err(e) = popup_notifier.notify() {
+            log::error!("投递弹窗事件失败：{e}");
+        }
+    }) {
+        Ok(host) => Some(host),
+        Err(e) => {
+            log::error!("初始化内置搜索弹窗失败，搜索将改走图床：{e}");
+            None
+        }
+    };
+    let popup = PopupLink {
+        host: popup_host.as_ref(),
+        events: popup_rx,
+    };
+    let dispatcher = Dispatcher::new(
+        &tray,
+        &paths,
+        shared,
+        registry,
+        window.task_notifier(),
+        popup,
+    );
     if let Some(text) = notice {
         log::warn!("{text}");
         dispatcher.balloon(NotifyLevel::Warning, "lenswin", &text);
