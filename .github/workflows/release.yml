@@ -120,11 +120,11 @@ jobs:
             if (-not (Test-Path -LiteralPath $file)) { throw "缺少产物 $file" }
             Copy-Item -LiteralPath $file -Destination release
           }
-          # sha256sum 兼容格式，便于 sha256sum -c 直接校验
+          # sha256sum 兼容格式；必须用 LF 换行，CRLF 会让 sha256sum -c 把 \r 当成文件名的一部分
           $lines = Get-ChildItem -LiteralPath release -File | Sort-Object Name | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
           }
-          Set-Content -LiteralPath release/SHA256SUMS.txt -Value $lines -Encoding utf8NoBOM
+          Set-Content -LiteralPath release/SHA256SUMS.txt -Value (($lines -join "`n") + "`n") -NoNewline -Encoding utf8NoBOM
           Get-Content -LiteralPath release/SHA256SUMS.txt
 
       - name: 上传产物
