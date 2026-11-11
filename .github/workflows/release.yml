@@ -1,0 +1,217 @@
+name: Release
+
+# 推送 v1.2.3 或 v1.2.3-beta.1 / -rc.1 形式的 tag 时触发，tag 必须打在 main 上。
+# 发布版本以 tag 为准，构建前写入 Cargo.toml，exe 版本信息与安装包文件名随之一致。
+# 手动运行为演练：按输入的版本号打包并作为 artifact 留存，不创建 Release
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '演练用版本号，如 0.1.0 或 0.1.0-beta.1（不带 v）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      # 校验 tag 所在分支需要完整历史与远端分支
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析版本号
+        id: version
+        env:
+          DRY_RUN_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          VERSION=${DRY_RUN_VERSION:-${GITHUB_REF_NAME#v}}
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "版本号格式不是 MAJOR.MINOR.PATCH[-beta.N|-rc.N]：$VERSION" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "版本 $VERSION，预发布：$PRERELEASE"
+
+      # 手动演练没有 tag，按所选分支构建，不做校验
+      - name: 校验 tag 位于 main
+        if: github.event_name == 'push'
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag $GITHUB_REF_NAME 指向的提交 $GITHUB_SHA 不在 main 分支上" >&2
+            exit 1
+          fi
+
+  build:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 只替换 [workspace.package] 下的 version，依赖的 version 字段不能动
+      - name: 写入版本号
+        run: |
+          $path = 'Cargo.toml'
+          $text = Get-Content -LiteralPath $path -Raw
+          $pattern = [regex]::new('(?ms)(\[workspace\.package\][^\[]*?^version\s*=\s*")[^"]+(")')
+          if (-not $pattern.IsMatch($text)) { throw 'Cargo.toml 中找不到 [workspace.package] version' }
+          $updated = $pattern.Replace($text, '${1}' + $env:VERSION + '${2}', 1)
+          Set-Content -LiteralPath $path -Value $updated -NoNewline -Encoding utf8NoBOM
+          Select-String -LiteralPath $path -Pattern '^version\s*=' | Select-Object -First 1
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+      # runner 镜像不一定预装 Inno Setup 6，缺失时用 choco 补装
+      - name: 准备 Inno Setup
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup 安装失败' }
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "找不到 $iscc" }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 打包便携版
+        run: ./packaging/build-portable.ps1 -OutputDir dist
+
+      - name: 打包安装版
+        run: ./packaging/build-installer.ps1 -OutputDir dist
+
+      - name: 整理产物并生成校验和
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          $files = @(
+            "dist/lenswin-$env:VERSION-portable-x64.zip",
+            "dist/lenswin-$env:VERSION-setup-x64.exe"
+          )
+          foreach ($file in $files) {
+            if (-not (Test-Path -LiteralPath $file)) { throw "缺少产物 $file" }
+            Copy-Item -LiteralPath $file -Destination release
+          }
+          # sha256sum 兼容格式，便于 sha256sum -c 直接校验
+          $lines = Get-ChildItem -LiteralPath release -File | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          }
+          Set-Content -LiteralPath release/SHA256SUMS.txt -Value $lines -Encoding utf8NoBOM
+          Get-Content -LiteralPath release/SHA256SUMS.txt
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lenswin-${{ needs.version.outputs.name }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      # 生成分类日志需要完整提交历史和全部 tag
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          name: lenswin-${{ needs.version.outputs.name }}
+          path: release
+
+      # 按提交信息的 <类型>(<范围>): 前缀分类
+      - name: 生成发布说明
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          RANGE="$GITHUB_REF_NAME"
+          [ -n "$PREV_TAG" ] && RANGE="$PREV_TAG..$GITHUB_REF_NAME"
+
+          declare -A TITLES=(
+            [feat]="✨ 新功能" [fix]="🐛 修复" [refactor]="♻️ 重构"
+            [perf]="⚡ 性能" [docs]="📝 文档" [test]="✅ 测试"
+            [build]="📦 构建" [ci]="🔧 CI" [chore]="🧹 杂项" [style]="🎨 样式"
+          )
+          ORDER=(feat fix refactor perf build docs test ci chore style)
+          declare -A BUCKETS
+          OTHER=""
+
+          # --pretty=format 末行没有换行符，不加 || 判断会漏掉最早的一条提交
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            TYPE=$(echo "$line" | grep -oE '^[a-z]+' || true)
+            if [ -n "$TYPE" ] && [ -n "${TITLES[$TYPE]:-}" ]; then
+              BUCKETS[$TYPE]="${BUCKETS[$TYPE]:-}"$'\n'"- $line"
+            else
+              OTHER="$OTHER"$'\n'"- $line"
+            fi
+          done < <(git log "$RANGE" --no-merges --pretty=format:'%s')
+
+          {
+            for t in "${ORDER[@]}"; do
+              if [ -n "${BUCKETS[$t]:-}" ]; then
+                echo "### ${TITLES[$t]}"
+                echo "${BUCKETS[$t]}"
+                echo ""
+              fi
+            done
+            if [ -n "$OTHER" ]; then
+              echo "### 📌 其他"
+              echo "$OTHER"
+              echo ""
+            fi
+            echo "### 💻 安装说明"
+            echo "- 支持 Windows 10 及以上 64 位系统"
+            echo "- \`setup.exe\`：安装版，安装时可选择「仅当前用户」或「所有用户」"
+            echo "- \`portable-x64.zip\`：便携版，解压即用，配置保存在程序目录的 data 文件夹"
+            echo "- 安装版支持静默安装：\`setup.exe /VERYSILENT /CURRENTUSER\`（所有用户改用 \`/ALLUSERS\`）"
+            echo "- 程序暂未做代码签名，首次运行若出现 SmartScreen 提示，点击「更多信息」→「仍要运行」即可"
+            echo "- 文件校验值见 \`SHA256SUMS.txt\`"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV_TAG...${GITHUB_REF_NAME}"
+            fi
+          } > release-notes.md
+
+          cat release-notes.md
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: lenswin ${{ needs.version.outputs.name }}
+          body_path: release-notes.md
+          prerelease: ${{ needs.version.outputs.prerelease }}
+          files: release/*
+          fail_on_unmatched_files: true
