@@ -9,16 +9,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, IDC_ARROW, IsWindowVisible,
-    KillTimer, LoadCursorW, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, UnregisterClassW,
-    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_MOVE, WM_SETFOCUS, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW,
+    IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+    UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_MOVE, WM_SETFOCUS,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::error::{PopupError, last_error, win32};
-use crate::{Placement, web, with_host};
+use crate::{Placement, PopupEvent, emit, web, with_host};
 
 const CLASS_NAME: PCWSTR = w!("LenswinLensPopup");
 const TITLE: PCWSTR = w!("Google 智能镜头");
@@ -108,6 +108,18 @@ fn to_rect(r: &RECT) -> Option<Rect> {
     )
 }
 
+/// 弹窗可见时的外框尺寸；隐藏或读取失败时返回 `None`。
+fn current_size(hwnd: HWND) -> Option<(u32, u32)> {
+    if !is_visible() {
+        return None;
+    }
+    let mut r = RECT::default();
+    // SAFETY: hwnd 由本模块创建且存活，r 为有效局部变量。
+    unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+    let rect = to_rect(&r)?;
+    Some((rect.width, rect.height)).filter(|(w, h)| *w > 0 && *h > 0)
+}
+
 fn scale(logical: u32, dpi: u32) -> u32 {
     u32::try_from(u64::from(logical).saturating_mul(u64::from(dpi)) / 96).unwrap_or(logical)
 }
@@ -138,14 +150,11 @@ pub(crate) fn place(hwnd: HWND, anchor: &Rect) -> Result<(), PopupError> {
     }
     let work =
         to_rect(&info.rcWork).ok_or_else(|| PopupError::Invalid("显示器工作区为空".to_string()))?;
-    let target = popup_placement(
-        anchor,
-        &work,
-        scale(LOGICAL_WIDTH, dpi_x),
-        scale(LOGICAL_HEIGHT, dpi_x),
-        scale(LOGICAL_GAP, dpi_x),
-    )
-    .ok_or_else(|| PopupError::Invalid("无法计算弹窗位置".to_string()))?;
+    // 已显示时沿用用户拖出来的尺寸，只换位置
+    let (width, height) =
+        current_size(hwnd).unwrap_or((scale(LOGICAL_WIDTH, dpi_x), scale(LOGICAL_HEIGHT, dpi_x)));
+    let target = popup_placement(anchor, &work, width, height, scale(LOGICAL_GAP, dpi_x))
+        .ok_or_else(|| PopupError::Invalid("无法计算弹窗位置".to_string()))?;
     with_host(|host| host.placement = Placement::Placing);
     // SAFETY: hwnd 由本模块创建且存活。
     let placed = unsafe {
@@ -182,10 +191,19 @@ pub(crate) fn hide(hwnd: HWND) {
     }
 }
 
+/// 用户关闭或异常收起：隐藏后告知调用方，调用方据此结束相关的覆盖层。
+pub(crate) fn close(hwnd: HWND) {
+    let was_visible = is_visible();
+    hide(hwnd);
+    if was_visible {
+        emit(PopupEvent::Closed);
+    }
+}
+
 /// WebView 创建失败或浏览器进程退出时收起，不留空白窗口。
 pub(crate) fn hide_current() {
     if let Some(hwnd) = with_host(|host| host.hwnd).flatten() {
-        hide(hwnd);
+        close(hwnd);
     }
 }
 
@@ -230,11 +248,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_SETFOCUS => web::focus(),
         WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
         WM_CLOSE => {
-            hide(hwnd);
+            close(hwnd);
             return LRESULT(0);
         }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
-            hide(hwnd);
+            close(hwnd);
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == IDLE_TIMER_ID => {

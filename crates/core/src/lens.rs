@@ -206,7 +206,19 @@ fn source_span(d: u32, dst: u32, src: u32) -> Option<(u32, u32)> {
     Some((start, end))
 }
 
-/// 弹窗位置：优先放在选区右侧，其次左侧，都放不下时在工作区内居中；尺寸超出工作区时收缩。
+/// 弹窗相对选区的摆放方向，按优先级排列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Right,
+    Left,
+    Below,
+    Above,
+}
+
+const SIDES: [Side; 4] = [Side::Right, Side::Left, Side::Below, Side::Above];
+
+/// 弹窗位置：依次尝试选区右、左、下、上，取第一个能完整放进工作区且不遮挡选区的位置；
+/// 都放不下时贴在剩余空间相对最大的一侧并限制在工作区内，允许部分遮挡；尺寸超出工作区时收缩。
 pub fn popup_placement(
     selection: &Rect,
     work_area: &Rect,
@@ -217,32 +229,60 @@ pub fn popup_placement(
     if work_area.width == 0 || work_area.height == 0 || width == 0 || height == 0 {
         return None;
     }
-    let w = width.min(work_area.width);
-    let h = height.min(work_area.height);
+    let w = i64::from(width.min(work_area.width));
+    let h = i64::from(height.min(work_area.height));
+    let gap = i64::from(gap);
     let (wl, wt, wr, wb) = (
         i64::from(work_area.x),
         i64::from(work_area.y),
         work_area.right(),
         work_area.bottom(),
     );
-    let (w64, h64, gap64) = (i64::from(w), i64::from(h), i64::from(gap));
-    let right_x = selection.right().checked_add(gap64)?;
-    let left_x = i64::from(selection.x)
-        .checked_sub(gap64)?
-        .checked_sub(w64)?;
-    let x = if right_x.checked_add(w64)? <= wr {
-        right_x
-    } else if left_x >= wl {
-        left_x
-    } else {
-        wl.checked_add(wr.checked_sub(wl)?.checked_sub(w64)? / 2)?
+    let (sl, st, sr, sb) = (
+        i64::from(selection.x),
+        i64::from(selection.y),
+        selection.right(),
+        selection.bottom(),
+    );
+    let free = |side: Side| match side {
+        Side::Right => wr.saturating_sub(sr.saturating_add(gap)),
+        Side::Left => sl.saturating_sub(gap).saturating_sub(wl),
+        Side::Below => wb.saturating_sub(sb.saturating_add(gap)),
+        Side::Above => st.saturating_sub(gap).saturating_sub(wt),
     };
-    let x = x.clamp(wl, wr.checked_sub(w64)?);
-    let center_y = i64::from(selection.y).checked_add(i64::from(selection.height) / 2)?;
-    let y = center_y
-        .checked_sub(h64 / 2)?
-        .clamp(wt, wb.checked_sub(h64)?);
-    Rect::from_edges(x, y, x.checked_add(w64)?, y.checked_add(h64)?)
+    let need = |side: Side| match side {
+        Side::Right | Side::Left => w,
+        Side::Below | Side::Above => h,
+    };
+    let side = SIDES
+        .into_iter()
+        .find(|s| free(*s) >= need(*s))
+        .or_else(|| {
+            // 比较能放下弹窗的比例，避免宽高差异让竖直方向总是吃亏
+            SIDES.into_iter().max_by(|a, b| {
+                let ra = i128::from(free(*a).max(0)) * i128::from(need(*b));
+                let rb = i128::from(free(*b).max(0)) * i128::from(need(*a));
+                // 比例相同时保留优先级靠前的方向
+                ra.cmp(&rb).then(std::cmp::Ordering::Greater)
+            })
+        })?;
+    let center_x = sl.checked_add(i64::from(selection.width) / 2)?;
+    let center_y = st.checked_add(i64::from(selection.height) / 2)?;
+    let (x, y) = match side {
+        Side::Right => (sr.checked_add(gap)?, center_y.checked_sub(h / 2)?),
+        Side::Left => (
+            sl.checked_sub(gap)?.checked_sub(w)?,
+            center_y.checked_sub(h / 2)?,
+        ),
+        Side::Below => (center_x.checked_sub(w / 2)?, sb.checked_add(gap)?),
+        Side::Above => (
+            center_x.checked_sub(w / 2)?,
+            st.checked_sub(gap)?.checked_sub(h)?,
+        ),
+    };
+    let x = x.clamp(wl, wr.checked_sub(w)?);
+    let y = y.clamp(wt, wb.checked_sub(h)?);
+    Rect::from_edges(x, y, x.checked_add(w)?, y.checked_add(h)?)
 }
 
 /// 弹窗内一次顶层导航的处理方式。
@@ -424,17 +464,50 @@ mod tests {
         }
     }
 
+    fn overlaps(a: &Rect, b: &Rect) -> bool {
+        a.intersect(b).is_some()
+    }
+
     #[test]
-    fn placement_prefers_right_then_left_then_center() {
+    fn placement_prefers_right_then_left() {
         let work = rect(0, 0, 1920, 1040);
-        let right = popup_placement(&rect(100, 100, 200, 200), &work, 460, 760, 16).expect("位置");
+        let sel = rect(100, 100, 200, 200);
+        let right = popup_placement(&sel, &work, 460, 760, 16).expect("位置");
         assert_eq!(right.x, 316);
-        let left = popup_placement(&rect(1500, 100, 300, 200), &work, 460, 760, 16).expect("位置");
+        assert!(!overlaps(&right, &sel));
+        let sel = rect(1500, 100, 300, 200);
+        let left = popup_placement(&sel, &work, 460, 760, 16).expect("位置");
         assert_eq!(left.x, 1500 - 16 - 460);
-        let center =
-            popup_placement(&rect(200, 100, 1500, 200), &work, 460, 760, 16).expect("位置");
-        assert_eq!(center.x, (1920 - 460) / 2);
-        assert!(center.y >= 0 && center.bottom() <= 1040);
+        assert!(!overlaps(&left, &sel));
+    }
+
+    #[test]
+    fn placement_falls_back_to_below_then_above() {
+        let work = rect(0, 0, 1920, 1080);
+        // 左右都放不下，下方有空间
+        let sel = rect(300, 50, 1400, 200);
+        let below = popup_placement(&sel, &work, 460, 760, 16).expect("位置");
+        assert_eq!(below.y, 266);
+        assert_eq!(below.x, 300 + 700 - 230);
+        assert!(!overlaps(&below, &sel));
+        // 左右和下方都放不下，上方有空间
+        let sel = rect(300, 900, 1400, 100);
+        let above = popup_placement(&sel, &work, 460, 760, 16).expect("位置");
+        assert_eq!(above.bottom(), 900 - 16);
+        assert!(!overlaps(&above, &sel));
+    }
+
+    #[test]
+    fn placement_overlaps_only_when_nothing_fits() {
+        let work = rect(0, 0, 1920, 1040);
+        let sel = rect(200, 100, 1500, 200);
+        let p = popup_placement(&sel, &work, 460, 760, 16).expect("位置");
+        // 下方剩余比例最大，贴着下方并限制在工作区内
+        assert_eq!(p.bottom(), 1040);
+        assert_eq!(p.x, 950 - 230);
+        assert!(p.y >= 0);
+        let full = popup_placement(&work, &work, 460, 760, 16).expect("位置");
+        assert!(full.x >= 0 && full.right() <= 1920 && full.bottom() <= 1040);
     }
 
     #[test]

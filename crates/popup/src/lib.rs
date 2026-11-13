@@ -38,6 +38,8 @@ pub enum PopupEvent {
     CopyLink(String),
     /// 弹窗加载失败，附带原因。
     LoadFailed(String),
+    /// 弹窗被用户（Esc、关闭按钮）或异常收起；调用方主动 [`PopupHost::hide`] 时不发。
+    Closed,
 }
 
 /// 已就绪的 WebView 组件，COM 指针可廉价克隆。

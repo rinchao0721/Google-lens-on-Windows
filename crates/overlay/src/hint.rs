@@ -41,6 +41,8 @@ pub enum Stage {
     Drawing,
     /// 矩形选区确定后的调整阶段。
     Adjusting,
+    /// 常驻选框搜索的调整阶段，松手即重新搜索。
+    LiveAdjusting,
 }
 
 /// 生成提示所需的可选功能。
@@ -88,6 +90,12 @@ pub fn hints(stage: Stage, features: Features) -> Vec<Hint> {
             out.push(hint("右键", "重新框选"));
             out.push(hint("Esc", "退出"));
         }
+        Stage::LiveAdjusting => {
+            out.push(hint("拖动边角", "缩放并重新搜索"));
+            out.push(hint("拖动选框", "移动并重新搜索"));
+            out.push(hint("框外拖动", "重新圈选"));
+            out.push(hint("右键 / Esc", "退出"));
+        }
     }
     out.push(hint("?", "隐藏提示"));
     out
@@ -129,8 +137,20 @@ mod tests {
     }
 
     #[test]
+    fn live_adjusting_has_no_nudge_or_copy() {
+        let list = keys(&hints(Stage::LiveAdjusting, ALL));
+        assert!(!list.contains(&"方向键") && !list.contains(&"Enter / 双击"));
+        assert!(list.contains(&"右键 / Esc"));
+    }
+
+    #[test]
     fn every_stage_ends_with_toggle_hint() {
-        for stage in [Stage::Idle, Stage::Drawing, Stage::Adjusting] {
+        for stage in [
+            Stage::Idle,
+            Stage::Drawing,
+            Stage::Adjusting,
+            Stage::LiveAdjusting,
+        ] {
             assert_eq!(hints(stage, ALL).last().map(|h| h.keys), Some("?"));
         }
     }

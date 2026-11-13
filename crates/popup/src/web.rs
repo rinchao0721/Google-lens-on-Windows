@@ -390,7 +390,7 @@ fn on_accelerator(args: &ICoreWebView2AcceleratorKeyPressedEventArgs) -> windows
         // SAFETY: 同上。
         unsafe { args.SetHandled(true) }?;
         if let Some(hwnd) = with_host(|host| host.hwnd).flatten() {
-            window::hide(hwnd);
+            window::close(hwnd);
         }
     }
     Ok(())

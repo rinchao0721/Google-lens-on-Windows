@@ -14,10 +14,11 @@ use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::geometry::Rect;
 use lenswin_core::ipc::SETTINGS_ARG;
 use lenswin_core::lens::LensRequest;
+use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
-use lenswin_core::snip::{OverlayFlow, OverlayResult, ToolbarAction, push_history};
+use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult, ToolbarAction, push_history};
 use lenswin_core::update::is_release_page_url;
-use lenswin_overlay::SelectRequest;
+use lenswin_overlay::{LiveSession, SelectRequest};
 use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::ScreenCapturer;
 use lenswin_platform::capture::gdi::GdiCapturer;
@@ -109,6 +110,26 @@ impl Command {
 /// 工作线程准备好的直传请求，或失败原因。
 type LensResult = Result<LensRequest, String>;
 
+/// 常驻选框事件，附带会话序号，用来丢弃已结束会话残留在队列里的事件。
+type LiveMessage = (u64, LiveEvent);
+
+/// 冻结时刻的屏幕、窗口快照与历史选区。
+struct Frozen {
+    monitors: Vec<MonitorInfo>,
+    frames: Vec<Frame>,
+    windows: Vec<Rect>,
+    history: Vec<Rect>,
+}
+
+/// 正在进行的常驻选框搜索；冻结帧随会话保存，每次调整都从中裁剪。
+struct LiveState {
+    id: u64,
+    _session: LiveSession,
+    frames: Vec<Frame>,
+    /// 最近一次搜索的选框，会话结束时记入历史。
+    last: Option<Rect>,
+}
+
 /// 后台任务的结果，由工作线程投递、主线程取出提示。
 struct TaskResult {
     label: &'static str,
@@ -136,6 +157,11 @@ pub struct Dispatcher<'a> {
     update_rx: Receiver<UpdateMessage>,
     /// 进行中检查的提示方式，`None` 表示空闲；同一时间只跑一个检查。
     update_running: Cell<Option<UpdateTrigger>>,
+    live: RefCell<Option<LiveState>>,
+    /// 最近一次常驻选框会话的序号。
+    live_seq: Cell<u64>,
+    live_tx: Sender<LiveMessage>,
+    live_rx: Receiver<LiveMessage>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -151,6 +177,7 @@ impl<'a> Dispatcher<'a> {
         let (results_tx, results_rx) = channel();
         let (lens_tx, lens_rx) = channel();
         let (update_tx, update_rx) = channel();
+        let (live_tx, live_rx) = channel();
         let exe = match std::env::current_exe() {
             Ok(path) => Some(path),
             Err(e) => {
@@ -175,6 +202,10 @@ impl<'a> Dispatcher<'a> {
             update_tx,
             update_rx,
             update_running: Cell::new(None),
+            live: RefCell::new(None),
+            live_seq: Cell::new(0),
+            live_tx,
+            live_rx,
         }
     }
 
@@ -423,6 +454,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn perform(&self, action: MenuAction) -> LoopControl {
+        self.end_live();
         match action {
             MenuAction::Run(command) => return self.run(command),
             MenuAction::SetSelectionMode(mode) => {
@@ -532,6 +564,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn run(&self, command: Command) -> LoopControl {
+        self.end_live();
         match command {
             Command::Search => {
                 self.search();
@@ -561,9 +594,14 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 圈选 → 按搜索方式交给内置弹窗或图床。
+    /// 圈选 → 按搜索方式交给内置弹窗或图床；内置弹窗可用时保留选框反复搜索。
     fn search(&self) {
-        let mode = self.shared.store.snapshot().search.selection_mode;
+        let config = self.shared.store.snapshot();
+        let mode = config.search.selection_mode;
+        if config.search.backend == SearchBackend::Embedded && self.embedded_available() {
+            self.live_search(mode);
+            return;
+        }
         let Some((result, frames)) = self.pick(Command::Search, mode, OverlayFlow::Direct) else {
             return;
         };
@@ -611,6 +649,142 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
+    /// 内置弹窗已初始化且装有 WebView2 Runtime。
+    fn embedded_available(&self) -> bool {
+        self.popup.host.is_some() && PopupHost::runtime_version().is_some()
+    }
+
+    /// 常驻选框搜索：先确认隐私再冻结，全屏覆盖层会挡住确认框。
+    fn live_search(&self, mode: SelectionMode) {
+        log::info!("触发命令：{}（常驻选框）", Command::Search.label());
+        if !self.ensure_lens_acknowledged() {
+            log::info!("内置弹窗搜索未获确认，不冻结屏幕");
+            return;
+        }
+        // 收起上一次的弹窗，免得被冻结进截图
+        if let Some(popup) = self.popup.host {
+            popup.hide();
+        }
+        let Some(frozen) = self.freeze(mode) else {
+            return;
+        };
+        let config = self.shared.store.snapshot();
+        let request = SelectRequest {
+            frames: &frozen.frames,
+            monitors: &frozen.monitors,
+            mode,
+            flow: OverlayFlow::Live,
+            lasso: &config.selection.lasso,
+            screenshot: &config.screenshot,
+            search: &config.search,
+            windows: &frozen.windows,
+            history: &frozen.history,
+        };
+        let id = self.live_seq.get().wrapping_add(1);
+        self.live_seq.set(id);
+        let tx = self.live_tx.clone();
+        let notifier = self.notifier;
+        // 回调在覆盖层窗口过程里执行，只入队，由 drain_results 统一处理，避免重入
+        let sink = move |event: LiveEvent| {
+            if tx.send((id, event)).is_err() {
+                // 接收端随分发器销毁，只会发生在退出阶段
+                return;
+            }
+            if let Err(e) = notifier.notify() {
+                log::error!("投递选框事件失败：{e}");
+            }
+        };
+        match LiveSession::begin(&request, sink) {
+            Ok(session) => {
+                self.live.replace(Some(LiveState {
+                    id,
+                    _session: session,
+                    frames: frozen.frames,
+                    last: None,
+                }));
+            }
+            Err(e) => {
+                log::error!("选区失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
+            }
+        }
+    }
+
+    fn on_live_message(&self, (id, event): LiveMessage) {
+        let current = self.live.borrow().as_ref().map(|state| state.id);
+        if current != Some(id) {
+            log::debug!("丢弃已结束会话 #{id} 的选框事件");
+            return;
+        }
+        match event {
+            LiveEvent::Committed(selection) => self.on_live_commit(&selection),
+            LiveEvent::Closed => {
+                log::info!("常驻选框已退出");
+                self.end_live();
+            }
+            LiveEvent::Failed(message) => {
+                log::error!("选区失败：{message}");
+                self.end_live();
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("选区失败：{message}"),
+                );
+            }
+        }
+    }
+
+    /// 选框落定或调整后：裁剪冻结帧，弹窗跟到选框旁重新搜索。
+    fn on_live_commit(&self, selection: &Selection) {
+        let bounds = selection.bounds();
+        log::info!(
+            "选框落定：范围 {bounds:?}，显示器 {}",
+            selection.monitor_index()
+        );
+        let image = {
+            let mut live = self.live.borrow_mut();
+            let Some(state) = live.as_mut() else {
+                return;
+            };
+            state.last = Some(bounds);
+            let Some(frame) = state.frames.get(selection.monitor_index()) else {
+                log::error!(
+                    "选区所在显示器序号 {} 没有对应截屏",
+                    selection.monitor_index()
+                );
+                return;
+            };
+            frame.crop(&bounds)
+        };
+        match image {
+            Ok(image) => {
+                if !self.show_and_submit(image, &bounds) {
+                    self.end_live();
+                }
+            }
+            Err(e) => {
+                log::error!("裁剪失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("裁剪失败：{e}"));
+            }
+        }
+    }
+
+    /// 结束常驻选框：销毁覆盖层、收起弹窗，最后一个选框记入历史；没有会话时什么也不做。
+    fn end_live(&self) {
+        let Some(state) = self.live.borrow_mut().take() else {
+            return;
+        };
+        if let Some(last) = state.last {
+            let capacity = self.shared.store.snapshot().screenshot.history_size;
+            let capacity = usize::try_from(capacity).unwrap_or(0);
+            push_history(&mut self.history.borrow_mut(), last, capacity);
+        }
+        drop(state);
+        if let Some(popup) = self.popup.host {
+            popup.hide();
+        }
+    }
+
     /// 弹出内置弹窗，工作线程准备好请求后由弹窗直接提交给 Lens。
     fn embedded_search(&self, image: CroppedImage, anchor: &Rect) {
         let Some(popup) = self.popup.host else {
@@ -627,15 +801,42 @@ impl<'a> Dispatcher<'a> {
             log::info!("内置弹窗搜索未获确认，已丢弃截图");
             return;
         }
-        if let Err(e) = popup.show(anchor) {
-            log::error!("显示搜索弹窗失败：{e}");
-            self.balloon(
-                NotifyLevel::Error,
-                "lenswin",
-                &format!("无法显示搜索弹窗：{e}"),
-            );
+        if !self.popup_shown(popup, anchor) {
             return;
         }
+        self.prepare_lens(image);
+    }
+
+    /// 在选框旁显示弹窗并准备请求；弹窗不可用或显示失败返回 `false`。
+    fn show_and_submit(&self, image: CroppedImage, anchor: &Rect) -> bool {
+        let Some(popup) = self.popup.host else {
+            return false;
+        };
+        if !self.popup_shown(popup, anchor) {
+            return false;
+        }
+        self.prepare_lens(image);
+        true
+    }
+
+    /// 显示弹窗；失败时写日志并提示，返回 `false`。
+    fn popup_shown(&self, popup: &PopupHost, anchor: &Rect) -> bool {
+        match popup.show(anchor) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("显示搜索弹窗失败：{e}");
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("无法显示搜索弹窗：{e}"),
+                );
+                false
+            }
+        }
+    }
+
+    /// 工作线程缩小、编码并组装直传请求，结果按序号回投，过期的丢弃。
+    fn prepare_lens(&self, image: CroppedImage) {
         let config = self.shared.store.snapshot();
         let tx = self.lens_tx.clone();
         let seq = self.lens_seq.get().wrapping_add(1);
@@ -724,6 +925,12 @@ impl<'a> Dispatcher<'a> {
                     "lenswin",
                     &format!("内置弹窗：{message}"),
                 );
+            }
+            PopupEvent::Closed => {
+                if self.live.borrow().is_some() {
+                    log::info!("弹窗已关闭，结束常驻选框");
+                }
+                self.end_live();
             }
         }
     }
@@ -908,6 +1115,9 @@ impl<'a> Dispatcher<'a> {
                 }
             }
         }
+        while let Ok(message) = self.live_rx.try_recv() {
+            self.on_live_message(message);
+        }
         while let Ok(event) = self.popup.events.try_recv() {
             self.on_popup_event(event);
         }
@@ -962,6 +1172,41 @@ impl<'a> Dispatcher<'a> {
         {
             popup.hide();
         }
+        let frozen = self.freeze(mode)?;
+        let config = self.shared.store.snapshot();
+        let request = SelectRequest {
+            frames: &frozen.frames,
+            monitors: &frozen.monitors,
+            mode,
+            flow,
+            lasso: &config.selection.lasso,
+            screenshot: &config.screenshot,
+            search: &config.search,
+            windows: &frozen.windows,
+            history: &frozen.history,
+        };
+        let outcome = lenswin_overlay::select(&request);
+        // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
+        discard_pending_triggers();
+        match outcome {
+            Ok(Some(result)) => {
+                self.remember(&result, config.screenshot.history_size);
+                Some((result, frozen.frames))
+            }
+            Ok(None) => {
+                log::info!("选区已取消");
+                None
+            }
+            Err(e) => {
+                log::error!("选区失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
+                None
+            }
+        }
+    }
+
+    /// 枚举显示器并截下所有屏幕，同时拍下窗口快照与历史选区；失败时提示并返回 `None`。
+    fn freeze(&self, mode: SelectionMode) -> Option<Frozen> {
         let monitors = match monitor::enumerate() {
             Ok(list) => list,
             Err(e) => {
@@ -978,37 +1223,12 @@ impl<'a> Dispatcher<'a> {
             }
         };
         let config = self.shared.store.snapshot();
-        let windows = self.window_snapshot(mode, config.screenshot.window_snap);
-        let history = self.history.borrow().clone();
-        let request = SelectRequest {
-            frames: &frames,
-            monitors: &monitors,
-            mode,
-            flow,
-            lasso: &config.selection.lasso,
-            screenshot: &config.screenshot,
-            search: &config.search,
-            windows: &windows,
-            history: &history,
-        };
-        let outcome = lenswin_overlay::select(&request);
-        // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
-        discard_pending_triggers();
-        match outcome {
-            Ok(Some(result)) => {
-                self.remember(&result, config.screenshot.history_size);
-                Some((result, frames))
-            }
-            Ok(None) => {
-                log::info!("选区已取消");
-                None
-            }
-            Err(e) => {
-                log::error!("选区失败：{e}");
-                self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
-                None
-            }
-        }
+        Some(Frozen {
+            windows: self.window_snapshot(mode, config.screenshot.window_snap),
+            history: self.history.borrow().clone(),
+            monitors,
+            frames,
+        })
     }
 
     /// 矩形模式且开启吸附时拍下窗口快照；失败只是不能吸附。

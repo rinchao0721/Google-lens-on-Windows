@@ -4,21 +4,23 @@ use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::snip::ColorFormat;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
-    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING,
-    D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F,
+    D2D1_COMPOSITE_MODE_SOURCE_OVER, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
+    D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    CLSID_D2D1GaussianBlur, D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-    D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush, ID2D1Brush, ID2D1Factory,
-    ID2D1HwndRenderTarget, ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle,
+    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_PROPERTY_TYPE_FLOAT, D2D1_QUADRATIC_BEZIER_SEGMENT,
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush, ID2D1Brush,
+    ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1LinearGradientBrush,
+    ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -28,13 +30,13 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::core::{BOOL, PCWSTR, w};
+use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::adjust;
 use crate::error::{OverlayError, win32};
 use crate::glow::{self, Edge, GlowFrame, Rgb};
 use crate::hint::Hint;
-use crate::input::View;
+use crate::input::{FrameStyle, View};
 use crate::layout::{self, MagnifierLayout, ToolbarButton};
 use crate::modes::Preview;
 use crate::stroke::{self, PointF, Segment};
@@ -65,6 +67,17 @@ const TRAIL_MIN_GAP: u32 = 3;
 const TIP_SCALE: f32 = 4.0;
 /// 笔尖光点的最小半径（96 DPI 下）。
 const TIP_MIN_RADIUS: u32 = 12;
+/// 角标的角点、第一段方向、第二段方向（窗口坐标，方向为单位向量）。
+type Corner = ((f32, f32), (f32, f32), (f32, f32));
+
+/// 常驻选框角标线宽（96 DPI 下）。
+const CORNER_LINE: u32 = 6;
+/// 常驻选框外侧光晕的宽度（96 DPI 下）。
+const BOX_GLOW_WIDTH: u32 = 28;
+/// 模糊前四色描边的线宽相对光晕宽度的比例。
+const BOX_GLOW_SOURCE: f32 = 0.6;
+/// 模糊前四色描边的不透明度。
+const BOX_GLOW_ALPHA: f32 = 0.95;
 /// 谷歌浅蓝 `#8AB4F8`，笔尖光点的过渡色。
 const TIP_MID: D2D1_COLOR_F = color(0.541, 0.706, 0.973, 0.85);
 
@@ -397,7 +410,7 @@ impl TargetResources {
             if let Some(r) = region {
                 // 选区内还原为原图亮度，源矩形与目标矩形相同即 1:1 贴图
                 self.bitmap_into(&r, &r, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                if !surface.effects.colorful {
+                if !surface.effects.colorful && view.frame != FrameStyle::Corners {
                     target.DrawRectangle(&r, &self.brushes.accent, self.px(OUTLINE_WIDTH), None);
                 }
             }
@@ -407,7 +420,14 @@ impl TargetResources {
         }
         let phase = surface.effects.glow.map_or(0.0, |g| g.phase);
         if let (true, Some(r)) = (surface.effects.colorful, region) {
-            self.draw_colorful_outline(&r, phase);
+            match view.frame {
+                FrameStyle::Corners => self.draw_box_glow(&r, phase),
+                FrameStyle::Plain | FrameStyle::Handles => {
+                    let width = self.px(OUTLINE_WIDTH);
+                    let passes = [(width * HALO_SCALE, HALO_ALPHA), (width, 1.0)];
+                    self.draw_colorful_outline(&r, phase, &passes);
+                }
+            }
         }
         if let Some(frame) = surface.effects.glow {
             self.draw_glow(frame, surface);
@@ -419,8 +439,12 @@ impl TargetResources {
                 self.draw_trail(trail, surface);
             }
         }
-        if let (true, Preview::Rect(r)) = (view.handles, view.preview) {
-            self.draw_handles(&r, surface.origin);
+        match (view.frame, view.preview) {
+            (FrameStyle::Handles, Preview::Rect(r)) => self.draw_handles(&r, surface.origin),
+            (FrameStyle::Corners, Preview::Rect(r)) => {
+                self.draw_corners(&r, surface.origin, surface.effects.colorful);
+            }
+            _ => {}
         }
         if let Some(r) = view.label {
             self.draw_label(&r, surface);
@@ -537,30 +561,7 @@ impl TargetResources {
         to: (f32, f32),
         stops: &[(f32, Rgb)],
     ) -> Result<ID2D1LinearGradientBrush, OverlayError> {
-        let stops: Vec<D2D1_GRADIENT_STOP> = stops
-            .iter()
-            .map(|(position, c)| D2D1_GRADIENT_STOP {
-                position: *position,
-                color: color(c.r, c.g, c.b, 1.0),
-            })
-            .collect();
-        // SAFETY: stops 在调用期间有效，枚举参数合法。
-        let collection = unsafe {
-            self.target
-                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-        }
-        .map_err(win32("CreateGradientStopCollection"))?;
-        let mut props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES::default();
-        props.startPoint.X = from.0;
-        props.startPoint.Y = from.1;
-        props.endPoint.X = to.0;
-        props.endPoint.Y = to.1;
-        // SAFETY: props 指向存活的局部变量，色标集合由同一目标创建。
-        unsafe {
-            self.target
-                .CreateLinearGradientBrush(&props, None, &collection)
-        }
-        .map_err(win32("CreateLinearGradientBrush"))
+        gradient_brush_on(&self.target, from, to, stops)
     }
 
     /// 屏幕四边由外向内渐隐的四色光带。
@@ -601,39 +602,9 @@ impl TargetResources {
         }
     }
 
-    /// 四色渐变选框，先画半透明光晕再画实线。
-    fn draw_colorful_outline(&self, r: &D2D_RECT_F, phase: f32) {
-        let w = r.right - r.left;
-        let h = r.bottom - r.top;
-        let offset = |p: (f32, f32)| (p.0 + r.left, p.1 + r.top);
-        // 炫彩只是装饰，画刷创建失败时跳过这条边，不影响选区
-        let edges: Vec<_> = Edge::ALL
-            .iter()
-            .filter_map(|edge| {
-                let stops = glow::edge_stops(w, h, *edge, phase, 1.0, OUTLINE_STOPS);
-                let (from, to) = edge.endpoints(w, h);
-                let (from, to) = (offset(from), offset(to));
-                self.gradient_brush(from, to, &stops)
-                    .ok()
-                    .map(|brush| (from, to, brush))
-            })
-            .collect();
-        let width = self.px(OUTLINE_WIDTH);
-        for (line_width, opacity) in [(width * HALO_SCALE, HALO_ALPHA), (width, 1.0)] {
-            for (from, to, brush) in &edges {
-                // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
-                unsafe {
-                    brush.SetOpacity(opacity);
-                    self.target.DrawLine(
-                        float_point(from.0, from.1).point,
-                        float_point(to.0, to.1).point,
-                        brush,
-                        line_width,
-                        &self.round_stroke,
-                    );
-                }
-            }
-        }
+    /// 四色渐变选框，按 `passes` 依次描边，每项为线宽与不透明度。
+    fn draw_colorful_outline(&self, r: &D2D_RECT_F, phase: f32, passes: &[(f32, f32)]) {
+        colorful_outline_on(&self.target, &self.round_stroke, r, phase, passes);
     }
 
     /// 平滑后的轨迹曲线（窗口坐标），点数不足两个时返回 `None`。
@@ -750,6 +721,159 @@ impl TargetResources {
         ellipse.radiusY = radius;
         // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，椭圆与画刷有效。
         unsafe { self.target.FillEllipse(&ellipse, &brush) };
+    }
+
+    /// 常驻选框外侧的四色光晕：一圈圈向外扩、逐层变淡，不压进选区。
+    fn draw_box_glow(&self, r: &D2D_RECT_F, phase: f32) {
+        // 柔光只是装饰，模糊失败时不画，选框照常可用
+        if self.soft_glow(r, phase).is_err() {
+            return;
+        }
+        // 模糊会向内渗，把选区还原成原图，光只留在外侧
+        self.bitmap_into(r, r, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
+
+    /// 在离屏位图上画出四色描边，高斯模糊后贴回选框周围。
+    fn soft_glow(&self, r: &D2D_RECT_F, phase: f32) -> windows::core::Result<()> {
+        let band = self.px(BOX_GLOW_WIDTH);
+        // 模糊半径约三倍标准差，四周留足边距，光晕不会被位图边缘截断
+        let pad = band * 2.0;
+        let (rw, rh) = (r.right - r.left, r.bottom - r.top);
+        if rw <= 0.0 || rh <= 0.0 {
+            return Ok(());
+        }
+        let size = D2D_SIZE_F {
+            width: rw + pad * 2.0,
+            height: rh + pad * 2.0,
+        };
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，size 为有效局部变量；兼容目标与本目标共享设备资源。
+        let layer = unsafe {
+            self.target.CreateCompatibleRenderTarget(
+                Some(&size),
+                None,
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )
+        }?;
+        let source_width = band * BOX_GLOW_SOURCE;
+        let reach = source_width / 2.0;
+        let ring = D2D_RECT_F {
+            left: pad - reach,
+            top: pad - reach,
+            right: pad + rw + reach,
+            bottom: pad + rh + reach,
+        };
+        // SAFETY: layer 刚创建，BeginDraw/EndDraw 成对调用，期间只在 layer 上绘制。
+        unsafe {
+            layer.BeginDraw();
+            layer.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+        }
+        colorful_outline_on(
+            &layer,
+            &self.round_stroke,
+            &ring,
+            phase,
+            &[(source_width, BOX_GLOW_ALPHA)],
+        );
+        // SAFETY: 与上面的 BeginDraw 配对。
+        unsafe { layer.EndDraw(None, None) }?;
+        // SAFETY: layer 已结束绘制，位图内容有效。
+        let bitmap = unsafe { layer.GetBitmap() }?;
+        let context: ID2D1DeviceContext = self.target.cast()?;
+        // SAFETY: 系统内置的高斯模糊效果，CLSID 为静态常量。
+        let blur = unsafe { context.CreateEffect(&CLSID_D2D1GaussianBlur) }?;
+        let sigma = band / 3.0;
+        let property = u32::try_from(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0).unwrap_or(0);
+        // SAFETY: 输入位图由同一设备创建；属性索引与类型匹配，数据为 f32 的原始字节。
+        unsafe {
+            blur.SetInput(0, &bitmap, true);
+            blur.SetValue(property, D2D1_PROPERTY_TYPE_FLOAT, &sigma.to_ne_bytes())?;
+        }
+        // SAFETY: 效果已配置完成。
+        let output = unsafe { blur.GetOutput() }?;
+        let offset = float_point(r.left - pad, r.top - pad).point;
+        // SAFETY: 在本目标的 BeginDraw 与 EndDraw 之间调用，图像由同一设备创建。
+        unsafe {
+            context.DrawImage(
+                &output,
+                Some(&offset),
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+        }
+        Ok(())
+    }
+
+    /// 常驻选框的四角圆角折线，描在选框外侧，不压住选区内容。
+    fn draw_corners(&self, rect: &Rect, origin: Point, colorful: bool) {
+        let (arm, radius) = layout::corner_arm(rect.width, rect.height, self.dpi);
+        if arm == 0 {
+            return;
+        }
+        let line = self.px(CORNER_LINE);
+        let half = line / 2.0;
+        let r = local_rect(rect, origin);
+        let (l, t, rt, b) = (r.left - half, r.top - half, r.right + half, r.bottom + half);
+        let arm = to_f32(i64::from(arm)) + half;
+        let radius = to_f32(i64::from(radius)) + half;
+        // 每个角：角点、第一段方向、第二段方向
+        let corners = [
+            ((l, t), (0.0, 1.0), (1.0, 0.0)),
+            ((rt, t), (-1.0, 0.0), (0.0, 1.0)),
+            ((rt, b), (0.0, -1.0), (-1.0, 0.0)),
+            ((l, b), (1.0, 0.0), (0.0, -1.0)),
+        ];
+        // 角标只是视觉提示，几何体创建失败时不画，选框仍可调整
+        let Ok(path) = self.corner_geometry(&corners, arm, radius) else {
+            return;
+        };
+        // 没有炫彩光晕衬底时垫一层浅阴影，亮色画面上白色角标也看得清
+        let shadow = (line + self.px(2), color(0.0, 0.0, 0.0, 0.25));
+        let white = (line, color(1.0, 1.0, 1.0, 1.0));
+        let passes: &[(f32, D2D1_COLOR_F)] = if colorful { &[white] } else { &[shadow, white] };
+        for &(width, brush_color) in passes {
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，几何体、画刷与线型有效。
+            unsafe {
+                self.brushes.paint.SetColor(&brush_color);
+                self.target
+                    .DrawGeometry(&path, &self.brushes.paint, width, &self.round_stroke);
+            }
+        }
+    }
+
+    /// 四个角各一段「直线 → 二次贝塞尔圆角 → 直线」的空心路径。
+    fn corner_geometry(
+        &self,
+        corners: &[Corner],
+        arm: f32,
+        radius: f32,
+    ) -> Result<ID2D1PathGeometry, OverlayError> {
+        // SAFETY: 工厂有效，无参数。
+        let path =
+            unsafe { self.factory.CreatePathGeometry() }.map_err(win32("CreatePathGeometry"))?;
+        // SAFETY: path 刚创建，只打开一次。
+        let sink = unsafe { path.Open() }.map_err(win32("ID2D1PathGeometry::Open"))?;
+        let at = |c: (f32, f32), d: (f32, f32), len: f32| {
+            float_point(c.0 + d.0 * len, c.1 + d.1 * len).point
+        };
+        for &(corner, first, second) in corners {
+            let bezier = D2D1_QUADRATIC_BEZIER_SEGMENT {
+                point1: float_point(corner.0, corner.1).point,
+                point2: at(corner, second, radius),
+            };
+            // SAFETY: sink 处于打开状态，BeginFigure 与 EndFigure 成对调用，贝塞尔结构为局部变量。
+            unsafe {
+                sink.BeginFigure(at(corner, first, arm), D2D1_FIGURE_BEGIN_HOLLOW);
+                sink.AddLine(at(corner, first, radius));
+                sink.AddQuadraticBezier(&bezier);
+                sink.AddLine(at(corner, second, arm));
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            }
+        }
+        // SAFETY: 与上面的 Open 配对。
+        unsafe { sink.Close() }.map_err(win32("ID2D1GeometrySink::Close"))?;
+        Ok(path)
     }
 
     fn draw_handles(&self, rect: &Rect, origin: Point) {
@@ -1074,6 +1198,75 @@ fn hint_obstacles(view: &View<'_>, surface: &Surface<'_>, dpi: u32) -> Vec<Rect>
         out.push(m.info);
     }
     out
+}
+
+/// 在任意渲染目标上按色标创建线性渐变画刷；只能在该目标的 BeginDraw 与 EndDraw 之间调用。
+fn gradient_brush_on(
+    target: &ID2D1RenderTarget,
+    from: (f32, f32),
+    to: (f32, f32),
+    stops: &[(f32, Rgb)],
+) -> Result<ID2D1LinearGradientBrush, OverlayError> {
+    let stops: Vec<D2D1_GRADIENT_STOP> = stops
+        .iter()
+        .map(|(position, c)| D2D1_GRADIENT_STOP {
+            position: *position,
+            color: color(c.r, c.g, c.b, 1.0),
+        })
+        .collect();
+    // SAFETY: stops 在调用期间有效，枚举参数合法。
+    let collection = unsafe {
+        target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+    }
+    .map_err(win32("CreateGradientStopCollection"))?;
+    let mut props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES::default();
+    props.startPoint.X = from.0;
+    props.startPoint.Y = from.1;
+    props.endPoint.X = to.0;
+    props.endPoint.Y = to.1;
+    // SAFETY: props 指向存活的局部变量，色标集合由同一目标创建。
+    unsafe { target.CreateLinearGradientBrush(&props, None, &collection) }
+        .map_err(win32("CreateLinearGradientBrush"))
+}
+
+/// 在任意渲染目标上画四色渐变矩形边框，按 `passes` 依次描边，每项为线宽与不透明度。
+fn colorful_outline_on(
+    target: &ID2D1RenderTarget,
+    stroke: &ID2D1StrokeStyle,
+    r: &D2D_RECT_F,
+    phase: f32,
+    passes: &[(f32, f32)],
+) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    let offset = |p: (f32, f32)| (p.0 + r.left, p.1 + r.top);
+    // 炫彩只是装饰，画刷创建失败时跳过这条边，不影响选区
+    let edges: Vec<_> = Edge::ALL
+        .iter()
+        .filter_map(|edge| {
+            let stops = glow::edge_stops(w, h, *edge, phase, 1.0, OUTLINE_STOPS);
+            let (from, to) = edge.endpoints(w, h);
+            let (from, to) = (offset(from), offset(to));
+            gradient_brush_on(target, from, to, &stops)
+                .ok()
+                .map(|brush| (from, to, brush))
+        })
+        .collect();
+    for &(line_width, opacity) in passes {
+        for (from, to, brush) in &edges {
+            // SAFETY: 在该目标的 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
+            unsafe {
+                brush.SetOpacity(opacity);
+                target.DrawLine(
+                    float_point(from.0, from.1).point,
+                    float_point(to.0, to.1).point,
+                    brush,
+                    line_width,
+                    stroke,
+                );
+            }
+        }
+    }
 }
 
 /// 预览是否要画外接矩形；隐藏时圈选只提亮套索围出的区域。

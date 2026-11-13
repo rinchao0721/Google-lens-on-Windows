@@ -10,6 +10,19 @@ pub enum OverlayFlow {
     Direct,
     /// 矩形选区可继续调整，由工具栏决定动作，如截屏。
     Toolbar,
+    /// 选区落定后保留为可调整的选框，每次调整回投一次，如内置弹窗搜索。
+    Live,
+}
+
+/// 常驻选框会话回投给调用方的事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveEvent {
+    /// 选框落定或调整后发生变化，需要重新搜索。
+    Committed(Selection),
+    /// 用户退出。
+    Closed,
+    /// 覆盖层出错，会话已不可用。
+    Failed(String),
 }
 
 /// 工具栏上可选的动作。

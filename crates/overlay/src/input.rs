@@ -107,13 +107,24 @@ pub struct Options {
     pub hints: HintState,
 }
 
+/// 矩形选区的边框装饰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStyle {
+    /// 不画装饰。
+    Plain,
+    /// 八个方形调整手柄（截屏流程）。
+    Handles,
+    /// 四角圆角折线（常驻选框）。
+    Corners,
+}
+
 /// 窗口层绘制某个显示器时需要的内容。
 #[derive(Debug, Clone, PartialEq)]
 pub struct View<'a> {
     /// 高亮区域或套索轨迹。
     pub preview: Preview<'a>,
-    /// 是否画调整手柄。
-    pub handles: bool,
+    /// 矩形选区的边框装饰。
+    pub frame: FrameStyle,
     /// 需要标注尺寸的矩形。
     pub label: Option<Rect>,
     /// 工具栏范围与悬停的按钮。
@@ -157,6 +168,10 @@ pub struct Interaction {
     history_index: Option<usize>,
     color_format: ColorFormat,
     outcome: Option<Outcome>,
+    /// 常驻选框最近一次回投的选框；重画只是单击时据此恢复，也用来跳过没有变化的松手。
+    committed: Option<Adjusting>,
+    /// 尚未取走的常驻选框回投。
+    commits: Vec<Selection>,
 }
 
 /// 窗口客户区坐标转虚拟桌面坐标；窗口左上角即显示器左上角。
@@ -213,7 +228,13 @@ impl Interaction {
             history_index: None,
             color_format: ColorFormat::default(),
             outcome: None,
+            committed: None,
+            commits: Vec::new(),
         }
+    }
+
+    fn is_live(&self) -> bool {
+        self.options.flow == OverlayFlow::Live
     }
 
     fn point(&self, window: usize, local: (i32, i32)) -> Option<Point> {
@@ -229,6 +250,9 @@ impl Interaction {
     }
 
     fn toolbar(&self, adj: &Adjusting) -> Option<Rect> {
+        if self.options.flow != OverlayFlow::Toolbar {
+            return None;
+        }
         let monitor = self.monitor_bounds(adj.monitor)?;
         Some(layout::toolbar_rect(
             &adj.rect,
@@ -277,7 +301,37 @@ impl Interaction {
                 self.finish(Outcome::Action(selection, ToolbarAction::Copy));
             }
             (OverlayFlow::Direct, _) => self.finish(Outcome::Selected(selection)),
+            // 套索也收成外接矩形，即送去搜索的范围
+            (OverlayFlow::Live, _) => self.settle(Adjusting {
+                rect: selection.bounds(),
+                monitor: selection.monitor_index(),
+                grab: None,
+            }),
         }
+    }
+
+    /// 常驻选框落定；与上次回投的不同才记一次回投。
+    fn settle(&mut self, adj: Adjusting) {
+        let adj = Adjusting { grab: None, ..adj };
+        self.phase = Phase::Adjusting(adj);
+        let unchanged = self
+            .committed
+            .is_some_and(|c| c.rect == adj.rect && c.monitor == adj.monitor);
+        if unchanged {
+            return;
+        }
+        if let Some(selection) = self.adjusted_selection(&adj) {
+            self.committed = Some(adj);
+            self.commits.push(selection);
+        }
+    }
+
+    /// 常驻选框的重画没有成形时恢复旧选框；否则回到空闲。
+    fn restore_or_idle(&mut self) {
+        self.phase = match (self.is_live(), self.committed) {
+            (true, Some(adj)) => Phase::Adjusting(adj),
+            _ => Phase::Idle,
+        };
     }
 
     fn adjusted_selection(&self, adj: &Adjusting) -> Option<Selection> {
@@ -327,6 +381,7 @@ impl Interaction {
             Phase::Idle => {}
         }
         let Some(monitor) = self.monitors.get(window) else {
+            self.restore_or_idle();
             return;
         };
         self.tool.press(p, monitor, window);
@@ -371,12 +426,14 @@ impl Interaction {
             Phase::Drawing { press, .. } => {
                 let Some(p) = self.point(window, local) else {
                     self.tool.reset();
-                    self.phase = Phase::Idle;
+                    self.restore_or_idle();
                     return;
                 };
                 self.phase = Phase::Idle;
+                // 常驻选框已有选框时，单击只是放弃重画，不吸附窗口
+                let can_snap = !(self.is_live() && self.committed.is_some());
                 // 先按空闲状态取吸附候选，再结束拖拽
-                let snapped = is_click(press, p)
+                let snapped = (can_snap && is_click(press, p))
                     .then(|| {
                         self.hover = Some(press);
                         self.snap_candidate()
@@ -388,13 +445,17 @@ impl Interaction {
                     Some((rect, index)) => Selection::new(SelectionShape::Rect, rect, index).ok(),
                     None => drawn.ok(),
                 };
-                if let Some(selection) = selection {
-                    self.accept(selection);
+                match selection {
+                    Some(selection) => self.accept(selection),
+                    None => self.restore_or_idle(),
                 }
             }
-            Phase::Adjusting(mut adj) => {
-                adj.grab = None;
-                self.phase = Phase::Adjusting(adj);
+            Phase::Adjusting(adj) => {
+                if self.is_live() && adj.grab.is_some() {
+                    self.settle(adj);
+                } else {
+                    self.phase = Phase::Adjusting(Adjusting { grab: None, ..adj });
+                }
             }
             Phase::Idle => {}
         }
@@ -403,6 +464,7 @@ impl Interaction {
     /// 双击：在调整中的选区内双击等同于复制，其余情况按普通按下处理。
     pub fn double_click(&mut self, window: usize, local: (i32, i32)) {
         if let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local))
+            && self.options.flow == OverlayFlow::Toolbar
             && adj.rect.contains(p)
             && self.toolbar_button_at(&adj, p).is_none()
         {
@@ -412,8 +474,12 @@ impl Interaction {
         self.press(window, local);
     }
 
-    /// 右键：放弃正在进行的选区；没有选区时取消整个覆盖层。
+    /// 右键：放弃正在进行的选区；没有选区时取消整个覆盖层。常驻选框直接退出。
     pub fn right_click(&mut self) {
+        if self.is_live() {
+            self.cancel();
+            return;
+        }
         match self.phase {
             Phase::Idle => self.cancel(),
             Phase::Drawing { .. } | Phase::Adjusting(_) => {
@@ -432,7 +498,9 @@ impl Interaction {
         match key {
             Key::Escape => self.cancel(),
             Key::Enter => {
-                if let Phase::Adjusting(adj) = self.phase {
+                if let (Phase::Adjusting(adj), OverlayFlow::Toolbar) =
+                    (self.phase, self.options.flow)
+                {
                     self.finish_with_action(adj, ToolbarAction::Copy);
                 }
             }
@@ -449,7 +517,8 @@ impl Interaction {
             }
             Key::Arrow(direction) => return self.arrow(direction, mode),
             Key::CopyColor => {
-                if self.magnifier_visible() {
+                // 常驻选框只回投选区，取色会结束会话却没有调用方接收颜色
+                if !self.is_live() && self.magnifier_visible() {
                     return self.hover.map(KeyCommand::PickColor);
                 }
             }
@@ -470,7 +539,8 @@ impl Interaction {
             let (dx, dy) = direction.delta();
             return Some(KeyCommand::MoveCursor(dx, dy));
         };
-        if adj.grab.is_some() {
+        // 常驻选框每次微调都会触发搜索，容易被限流，不支持键盘微调
+        if adj.grab.is_some() || self.is_live() {
             return None;
         }
         let monitor = self.monitor_bounds(adj.monitor)?;
@@ -555,7 +625,7 @@ impl Interaction {
         match self.phase {
             Phase::Idle => true,
             Phase::Drawing { .. } => matches!(self.tool.preview(), Preview::Rect(_)),
-            Phase::Adjusting(adj) => adj.grab.is_some(),
+            Phase::Adjusting(adj) => adj.grab.is_some() && !self.is_live(),
         }
     }
 
@@ -580,6 +650,7 @@ impl Interaction {
         let stage = match self.phase {
             Phase::Idle => Stage::Idle,
             Phase::Drawing { .. } => Stage::Drawing,
+            Phase::Adjusting(_) if self.is_live() => Stage::LiveAdjusting,
             Phase::Adjusting(_) => Stage::Adjusting,
         };
         let features = Features {
@@ -609,7 +680,7 @@ impl Interaction {
     pub fn view(&self, window: usize) -> View<'_> {
         let mut view = View {
             preview: Preview::None,
-            handles: false,
+            frame: FrameStyle::Plain,
             label: None,
             toolbar: None,
             magnifier: None,
@@ -634,9 +705,12 @@ impl Interaction {
                 }
             }
             Phase::Adjusting(adj) => {
-                if adj.monitor == window {
+                if adj.monitor == window && self.is_live() {
                     view.preview = Preview::Rect(adj.rect);
-                    view.handles = true;
+                    view.frame = FrameStyle::Corners;
+                } else if adj.monitor == window {
+                    view.preview = Preview::Rect(adj.rect);
+                    view.frame = FrameStyle::Handles;
                     view.label = Some(adj.rect);
                     if adj.grab.is_none() {
                         view.toolbar = self.toolbar(&adj).map(|bar| {
@@ -677,6 +751,16 @@ impl Interaction {
         }
         adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)))
             .map_or(CursorKind::Cross, cursor_for)
+    }
+
+    /// 取走常驻选框尚未回投的选区，按发生顺序排列。
+    pub fn take_commits(&mut self) -> Vec<Selection> {
+        std::mem::take(&mut self.commits)
+    }
+
+    /// 常驻选框是否已经回投过选区，即结果弹窗已在显示。
+    pub fn has_committed(&self) -> bool {
+        self.committed.is_some()
     }
 
     /// 已有结局。
@@ -834,7 +918,7 @@ mod tests {
         let it = adjusting();
         let view = it.view(1);
         assert_eq!(view.preview, Preview::Rect(Rect::new(100, 100, 400, 300)));
-        assert!(view.handles);
+        assert_eq!(view.frame, FrameStyle::Handles);
         assert_eq!(view.label, Some(Rect::new(100, 100, 400, 300)));
         assert!(view.toolbar.is_some());
         assert_eq!(it.view(0).preview, Preview::None);
@@ -1144,5 +1228,119 @@ mod tests {
         it.mouse_move(0, (10, 10));
         it.release(0, (20, 20));
         assert!(!it.is_finished());
+    }
+
+    /// 常驻选框：在主显示器上从 (100,100) 框到 (500,400)，取走首次回投。
+    fn live() -> Interaction {
+        let mut it = rect(OverlayFlow::Live);
+        it.press(1, (100, 100));
+        it.mouse_move(1, (300, 300));
+        it.release(1, (500, 400));
+        assert!(!it.is_finished());
+        let commits = it.take_commits();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits.first().map(Selection::bounds),
+            Some(Rect::new(100, 100, 400, 300))
+        );
+        it
+    }
+
+    fn commit_bounds(it: &mut Interaction) -> Vec<Rect> {
+        it.take_commits().iter().map(Selection::bounds).collect()
+    }
+
+    #[test]
+    fn live_settles_into_corner_frame_without_toolbar() {
+        let it = live();
+        let view = it.view(1);
+        assert_eq!(view.preview, Preview::Rect(Rect::new(100, 100, 400, 300)));
+        assert_eq!(view.frame, FrameStyle::Corners);
+        assert_eq!(view.label, None);
+        assert_eq!(view.toolbar, None);
+        assert!(it.has_committed());
+        let keys: Vec<_> = view.hints.iter().map(|h| h.keys).collect();
+        assert!(keys.contains(&"右键 / Esc") && !keys.contains(&"方向键"));
+    }
+
+    #[test]
+    fn live_resize_and_move_commit_on_release() {
+        let mut it = live();
+        it.press(1, (500, 400));
+        it.mouse_move(1, (600, 450));
+        assert!(it.take_commits().is_empty());
+        it.release(1, (600, 450));
+        assert_eq!(commit_bounds(&mut it), vec![Rect::new(100, 100, 500, 350)]);
+        it.press(1, (300, 250));
+        it.mouse_move(1, (310, 240));
+        it.release(1, (310, 240));
+        assert_eq!(commit_bounds(&mut it), vec![Rect::new(110, 90, 500, 350)]);
+    }
+
+    #[test]
+    fn live_release_without_change_does_not_commit() {
+        let mut it = live();
+        it.press(1, (300, 250));
+        it.release(1, (300, 250));
+        assert!(it.take_commits().is_empty());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+    }
+
+    #[test]
+    fn live_redraw_replaces_box_and_click_keeps_it() {
+        let mut it = live();
+        it.press(1, (1000, 800));
+        it.mouse_move(1, (1050, 850));
+        // 重画期间旧选框不再显示
+        assert_eq!(it.view(1).frame, FrameStyle::Plain);
+        it.release(1, (1100, 900));
+        assert_eq!(commit_bounds(&mut it), vec![Rect::new(1000, 800, 100, 100)]);
+        it.press(1, (10, 10));
+        it.release(1, (10, 10));
+        assert!(it.take_commits().is_empty());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(1000, 800, 100, 100)));
+        assert_eq!(it.view(1).frame, FrameStyle::Corners);
+    }
+
+    #[test]
+    fn live_lasso_becomes_bounding_box() {
+        let mut it = Interaction::new(
+            Box::new(LassoTool::new(10, 4)),
+            monitors(),
+            options(OverlayFlow::Live),
+        );
+        it.press(1, (100, 100));
+        it.mouse_move(1, (200, 100));
+        it.mouse_move(1, (200, 200));
+        it.release(1, (100, 200));
+        assert_eq!(commit_bounds(&mut it), vec![Rect::new(88, 88, 124, 124)]);
+        assert_eq!(it.view(1).frame, FrameStyle::Corners);
+        assert!(!it.is_finished());
+    }
+
+    #[test]
+    fn live_ignores_keyboard_confirm_nudge_and_color() {
+        let mut it = live();
+        assert_eq!(
+            it.key(Key::Arrow(Direction::Left), NudgeMode::Move, false),
+            None
+        );
+        it.key(Key::Enter, NudgeMode::Move, false);
+        it.key(Key::CopyColor, NudgeMode::Move, false);
+        it.double_click(1, (300, 250));
+        it.release(1, (300, 250));
+        assert!(!it.is_finished());
+        assert!(it.take_commits().is_empty());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+    }
+
+    #[test]
+    fn live_right_click_and_escape_close() {
+        let mut it = live();
+        it.right_click();
+        assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
+        let mut it = live();
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
     }
 }

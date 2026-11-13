@@ -1,4 +1,5 @@
-//! 选区覆盖层：只返回选区和用户选择的动作，不触发上传或动作。
+//! 选区覆盖层：只返回选区和用户选择的动作，不触发上传或动作；
+//! 常驻选框会话通过回调把选区回投给调用方。
 //!
 //! 进程须声明 Per-Monitor DPI 感知，所有坐标均为虚拟桌面物理像素。
 
@@ -16,12 +17,14 @@ pub mod stroke;
 mod render;
 mod window;
 
+use std::rc::Rc;
+
 use lenswin_core::config::{GlowMode, LassoConfig, ScreenshotConfig, SearchConfig};
 use lenswin_core::frame::Frame;
 use lenswin_core::geometry::Rect;
 use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::selection::SelectionMode;
-use lenswin_core::snip::{OverlayFlow, OverlayResult};
+use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult};
 
 pub use crate::error::OverlayError;
 use crate::hint::HintState;
@@ -78,7 +81,7 @@ fn validate(request: &SelectRequest<'_>) -> Result<(), OverlayError> {
 /// 截屏流程保持原来的单色样式，辉光和炫彩只给搜索流程。
 fn visual_for(flow: OverlayFlow, search: &SearchConfig) -> Visual {
     match flow {
-        OverlayFlow::Direct => Visual {
+        OverlayFlow::Direct | OverlayFlow::Live => Visual {
             glow: search.glow,
             colorful: search.colorful_stroke,
         },
@@ -94,6 +97,48 @@ fn visual_for(flow: OverlayFlow, search: &SearchConfig) -> Visual {
 /// 用户完成选区或取色返回 `Some`，按 Esc 或右键取消返回 `None`。
 /// 必须在创建了消息循环的主线程调用；函数内部自带消息循环，返回前所有窗口已销毁。
 pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, OverlayError> {
+    if request.flow == OverlayFlow::Live {
+        return Err(OverlayError::InvalidInput(
+            "常驻选框请使用 LiveSession".to_string(),
+        ));
+    }
+    let input = session_input(request, request.flow)?;
+    Ok(match window::run(input)? {
+        Outcome::Selected(selection) => Some(OverlayResult::Selected(selection)),
+        Outcome::Action(selection, action) => Some(OverlayResult::Action(selection, action)),
+        Outcome::Color(text) => Some(OverlayResult::Color(text)),
+        Outcome::Cancelled => None,
+    })
+}
+
+/// 常驻选框会话：选区落定后保留可调整的选框，每次落定或调整回投一次选区。
+///
+/// 只能在主线程创建和使用，窗口由调用方的消息循环驱动；销毁时关闭全部覆盖层窗口。
+/// 同一时间只能有一个覆盖层，已有会话时 [`select`] 和 [`LiveSession::begin`] 都会返回错误。
+pub struct LiveSession {
+    _windows: window::LiveWindows,
+}
+
+impl LiveSession {
+    /// 冻结画面并显示覆盖层后立即返回；`request.flow` 被忽略，一律按常驻选框处理。
+    ///
+    /// `sink` 在窗口过程里调用，调用前已释放覆盖层内部状态；实现应只做入队等轻量操作，
+    /// 不要在回调里销毁本会话。
+    pub fn begin(
+        request: &SelectRequest<'_>,
+        sink: impl Fn(LiveEvent) + 'static,
+    ) -> Result<Self, OverlayError> {
+        let input = session_input(request, OverlayFlow::Live)?;
+        let windows = window::open_live(input, Rc::new(sink))?;
+        Ok(Self { _windows: windows })
+    }
+}
+
+/// 校验请求并组装窗口层需要的会话输入。
+fn session_input(
+    request: &SelectRequest<'_>,
+    flow: OverlayFlow,
+) -> Result<SessionInput, OverlayError> {
     validate(request)?;
     let tool = modes::tool_for(request.mode, request.lasso);
     let snap = match request.mode {
@@ -103,7 +148,7 @@ pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, Over
         _ => SnapState::Unavailable,
     };
     let options = Options {
-        flow: request.flow,
+        flow,
         magnifier: request.screenshot.magnifier,
         snap,
         windows: request.windows.to_vec(),
@@ -114,7 +159,7 @@ pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, Over
             HintState::Hidden
         },
     };
-    let input = SessionInput {
+    Ok(SessionInput {
         interaction: Interaction::new(tool, request.monitors.to_vec(), options),
         monitors: request.monitors.to_vec(),
         bgra_frames: request
@@ -124,13 +169,7 @@ pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, Over
             .collect(),
         stroke_width: request.lasso.stroke_width,
         show_lasso_bounds: request.lasso.show_bounds,
-        visual: visual_for(request.flow, request.search),
-    };
-    Ok(match window::run(input)? {
-        Outcome::Selected(selection) => Some(OverlayResult::Selected(selection)),
-        Outcome::Action(selection, action) => Some(OverlayResult::Action(selection, action)),
-        Outcome::Color(text) => Some(OverlayResult::Color(text)),
-        Outcome::Cancelled => None,
+        visual: visual_for(flow, request.search),
     })
 }
 

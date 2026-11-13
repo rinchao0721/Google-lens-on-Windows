@@ -98,6 +98,20 @@ pub fn handle_size(dpi: u32) -> u32 {
     scaled(HANDLE_SIZE, dpi)
 }
 
+/// 常驻选框角标的臂长（96 DPI 下）。
+const CORNER_ARM: u32 = 36;
+/// 常驻选框角标的圆角半径（96 DPI 下）。
+const CORNER_ARC: u32 = 18;
+
+/// 常驻选框四角折线的臂长与圆角半径（像素）。
+/// 选框较小时臂长缩到短边的三分之一，同一条边上的两段之间始终留有空隙；为 0 表示不画。
+pub fn corner_arm(width: u32, height: u32, dpi: u32) -> (u32, u32) {
+    let short = width.min(height);
+    let arm = scaled(CORNER_ARM, dpi).min(short / 3);
+    let radius = scaled(CORNER_ARC, dpi).min(arm);
+    (arm, radius)
+}
+
 /// 工具栏范围：优先放在选区下方右对齐，放不下时放上方，再放不下时贴着选区内侧底部。
 pub fn toolbar_rect(selection: &Rect, monitor: &Rect, dpi: u32) -> Rect {
     let count = u32::try_from(ToolbarButton::ALL.len()).unwrap_or(0);
@@ -330,6 +344,16 @@ mod tests {
         assert_eq!(scaled(36, 144), 54);
         assert_eq!(scaled(0, 96), 1);
         assert_eq!(scaled(10, 0), 10);
+    }
+
+    #[test]
+    fn corner_arm_scales_and_shrinks_for_small_boxes() {
+        assert_eq!(corner_arm(400, 300, 96), (36, 18));
+        assert_eq!(corner_arm(400, 300, 192), (72, 36));
+        // 短边 30：臂长 10，两段之间留 10 像素
+        assert_eq!(corner_arm(30, 500, 96), (10, 10));
+        assert_eq!(corner_arm(2, 2, 96), (0, 0));
+        assert_eq!(corner_arm(0, 100, 96), (0, 0));
     }
 
     #[test]

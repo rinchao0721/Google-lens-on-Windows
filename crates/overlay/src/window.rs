@@ -1,11 +1,14 @@
-//! 每个显示器一个置顶无边框窗口，共享同一份会话状态，内嵌消息循环直到选区结束。
+//! 每个显示器一个置顶无边框窗口，共享同一份会话状态。
+//! 阻塞模式内嵌消息循环直到选区结束；常驻模式挂在调用方的消息循环上，通过回调回投事件。
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
 use lenswin_core::config::GlowMode;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::MonitorInfo;
+use lenswin_core::snip::LiveEvent;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -17,11 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos,
-    TranslateMessage, UnregisterClassW, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, PostQuitMessage,
+    RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetForegroundWindow,
+    SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -60,7 +64,20 @@ struct Session {
     visual: Visual,
     started: Instant,
     error: Option<OverlayError>,
+    mode: SessionMode,
 }
+
+/// 会话的运行方式。
+#[derive(Clone)]
+pub(crate) enum SessionMode {
+    /// 内嵌消息循环，结束后返回结局。
+    Blocking,
+    /// 挂在调用方的消息循环上，事件交给回调。
+    Live(LiveSink),
+}
+
+/// 常驻模式的事件回调。
+pub(crate) type LiveSink = Rc<dyn Fn(LiveEvent)>;
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
@@ -117,6 +134,33 @@ impl Session {
             let bounds = Rect::new(slot.origin.x, slot.origin.y, slot.size.0, slot.size.1);
             layout::pixel_at(&slot.bgra, &bounds, p)
         })
+    }
+
+    /// 结果弹窗已显示后覆盖层不再抢占前台和 Z 序，点击覆盖层时弹窗仍在上面。
+    fn yields_to_popup(&self) -> bool {
+        matches!(self.mode, SessionMode::Live(_)) && self.interaction.has_committed()
+    }
+
+    /// 取出常驻模式待回投的事件和回调；阻塞模式返回 `None`。
+    fn take_live_events(&mut self) -> Option<(LiveSink, Vec<LiveEvent>)> {
+        let SessionMode::Live(sink) = &self.mode else {
+            return None;
+        };
+        let sink = Rc::clone(sink);
+        let mut events: Vec<LiveEvent> = self
+            .interaction
+            .take_commits()
+            .into_iter()
+            .map(LiveEvent::Committed)
+            .collect();
+        if let Some(error) = self.error.take() {
+            // 出错时 fail 已顺带取消，统一按失败上报，不再报一次退出
+            discard(self.interaction.take_outcome());
+            events.push(LiveEvent::Failed(error.to_string()));
+        } else if self.interaction.take_outcome().is_some() {
+            events.push(LiveEvent::Closed);
+        }
+        Some((sink, events))
     }
 
     fn elapsed_secs(&self) -> f32 {
@@ -197,6 +241,17 @@ fn update(hwnd: HWND, change: impl FnOnce(&mut Session)) {
         s.invalidate_windows(&before);
         s.invalidate_windows(&s.interaction.painted_windows());
     });
+    deliver_live_events();
+}
+
+/// 把常驻模式积攒的事件交给回调；回调前已释放会话借用，回调里再进入覆盖层也安全。
+fn deliver_live_events() {
+    let Some((sink, events)) = with_session(Session::take_live_events).flatten() else {
+        return;
+    };
+    for event in events {
+        sink(event);
+    }
 }
 
 fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
@@ -340,6 +395,20 @@ fn on_paint(hwnd: HWND) {
     });
     // SAFETY: hwnd 是本线程的有效窗口，None 表示整个客户区。
     discard(unsafe { ValidateRect(Some(hwnd), None) });
+    // 绘制失败会结束会话，常驻模式要据此回投
+    deliver_live_events();
+}
+
+/// 让出 Z 序：保留系统的其它改动，只去掉 Z 序变化。
+fn keep_z_order(lparam: LPARAM) {
+    if !with_session(|s| s.yields_to_popup()).unwrap_or(false) {
+        return;
+    }
+    let pos = lparam.0 as *mut WINDOWPOS;
+    // SAFETY: WM_WINDOWPOSCHANGING 的 lParam 指向系统提供的可写 WINDOWPOS，仅在本消息期间有效。
+    if let Some(pos) = unsafe { pos.as_mut() } {
+        pos.flags |= SWP_NOZORDER;
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -376,6 +445,11 @@ unsafe extern "system" fn wnd_proc(
             on_glow_tick(hwnd);
             return LRESULT(0);
         }
+        // 弹窗显示后点击覆盖层不激活，焦点和 Esc 留在弹窗
+        WM_MOUSEACTIVATE if with_session(|s| s.yields_to_popup()).unwrap_or(false) => {
+            return LRESULT(isize::try_from(MA_NOACTIVATE).unwrap_or(0));
+        }
+        WM_WINDOWPOSCHANGING => keep_z_order(lparam),
         _ => {}
     }
     // SAFETY: 参数原样来自系统传入的窗口消息。
@@ -446,6 +520,34 @@ pub(crate) struct SessionInput {
 
 /// 显示覆盖层并运行消息循环，直到用户完成或取消选区。
 pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
+    let _owner = open(input, SessionMode::Blocking)?;
+    pump_until_finished()?;
+    match with_session(|s| (s.error.take(), s.interaction.take_outcome())) {
+        Some((Some(error), _)) => Err(error),
+        Some((None, Some(outcome))) => Ok(outcome),
+        _ => Ok(Outcome::Cancelled),
+    }
+}
+
+/// 常驻会话的窗口所有者；销毁时关闭全部覆盖层窗口。
+pub(crate) struct LiveWindows {
+    _owner: Windows,
+}
+
+/// 显示覆盖层后立即返回，事件通过 `sink` 回投；窗口由调用方的消息循环驱动。
+pub(crate) fn open_live(input: SessionInput, sink: LiveSink) -> Result<LiveWindows, OverlayError> {
+    let owner = open(input, SessionMode::Live(sink))?;
+    Ok(LiveWindows { _owner: owner })
+}
+
+/// 创建并显示每个显示器的覆盖层窗口，建立会话。
+fn open(input: SessionInput, mode: SessionMode) -> Result<Windows, OverlayError> {
+    let in_use = SESSION
+        .try_with(|cell| cell.try_borrow().map_or(true, |g| g.is_some()))
+        .unwrap_or(true);
+    if in_use {
+        return Err(OverlayError::InvalidInput("已有覆盖层正在显示".to_string()));
+    }
     let SessionInput {
         interaction,
         monitors,
@@ -529,6 +631,7 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
                 visual,
                 started: Instant::now(),
                 error: None,
+                mode,
             });
         })
         .map_err(|_| OverlayError::InvalidInput("无法初始化覆盖层会话".to_string()))?;
@@ -550,14 +653,7 @@ pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
         with_session(|s| s.started = Instant::now());
         start_glow_timer(hwnd, visual);
     }
-
-    pump_until_finished()?;
-
-    match with_session(|s| (s.error.take(), s.interaction.take_outcome())) {
-        Some((Some(error), _)) => Err(error),
-        Some((None, Some(outcome))) => Ok(outcome),
-        _ => Ok(Outcome::Cancelled),
-    }
+    Ok(owner)
 }
 
 /// 当前光标的虚拟桌面坐标，取不到时返回 `None`。
