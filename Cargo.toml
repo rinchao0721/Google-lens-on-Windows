@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/platform",
     "crates/overlay",
+    "crates/net",
     "crates/upload",
     "crates/actions",
     "crates/settings_ui",
@@ -26,6 +27,7 @@ embed-resource = "3.0.12"
 lenswin-core = { path = "crates/core" }
 lenswin-platform = { path = "crates/platform" }
 lenswin-overlay = { path = "crates/overlay" }
+lenswin-net = { path = "crates/net" }
 lenswin-upload = { path = "crates/upload" }
 lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
