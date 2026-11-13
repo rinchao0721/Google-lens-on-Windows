@@ -6,17 +6,21 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{
     COLOR_WINDOW, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
 };
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW,
     IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    UnregisterClassW, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_MOVE, WM_SETFOCUS,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    UnregisterClassW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{PCWSTR, w};
 
+use crate::chrome::{self, Click};
 use crate::error::{PopupError, last_error, win32};
 use crate::{Placement, PopupEvent, emit, web, with_host};
 
@@ -88,6 +92,7 @@ pub(crate) fn ensure_window() -> Result<HWND, PopupError> {
     }
     .map_err(win32("CreateWindowExW"))?;
     with_host(|host| host.hwnd = Some(hwnd));
+    chrome::init(hwnd);
     Ok(hwnd)
 }
 
@@ -183,6 +188,7 @@ pub(crate) fn hide(hwnd: HWND) {
     // 返回值只表示之前是否可见
     // SAFETY: hwnd 由本模块创建且存活。
     discard(unsafe { ShowWindow(hwnd, SW_HIDE) });
+    chrome::reset();
     web::reset_page();
     web::set_visible(false);
     // SAFETY: hwnd 有效，无回调函数，到期时收到 WM_TIMER。
@@ -241,12 +247,62 @@ fn on_dpi_changed(hwnd: HWND, lparam: LPARAM) {
     }
 }
 
-extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// 把手栏相关的消息；返回 `Some` 表示已处理。
+fn chrome_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     match msg {
-        WM_SIZE => web::fit_to_window(hwnd),
+        WM_NCCALCSIZE => chrome::on_nccalcsize(hwnd, wparam, lparam),
+        WM_NCHITTEST => chrome::on_nchittest(hwnd, lparam),
+        // 把手栏由 Direct2D 整块重绘，系统擦背景只会闪色
+        WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_PAINT => {
+            chrome::paint(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            chrome::mouse_move(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        WM_MOUSELEAVE => {
+            chrome::mouse_leave(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONDOWN => {
+            chrome::button_down(hwnd, lparam);
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP => {
+            if chrome::button_up(hwnd, lparam) == Click::Close {
+                close(hwnd);
+            }
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED => {
+            chrome::capture_lost(hwnd);
+            Some(LRESULT(0))
+        }
+        WM_SETTINGCHANGE => {
+            chrome::on_setting_change(hwnd, lparam);
+            None
+        }
+        _ => None,
+    }
+}
+
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Some(result) = chrome_message(hwnd, msg, wparam, lparam) {
+        return result;
+    }
+    match msg {
+        WM_SIZE => {
+            chrome::resize(hwnd);
+            web::fit_to_window(hwnd);
+        }
         WM_MOVE => web::notify_moved(),
         WM_SETFOCUS => web::focus(),
-        WM_DPICHANGED => on_dpi_changed(hwnd, lparam),
+        WM_DPICHANGED => {
+            chrome::dpi_changed(hwnd);
+            on_dpi_changed(hwnd, lparam);
+        }
         WM_CLOSE => {
             close(hwnd);
             return LRESULT(0);
@@ -263,6 +319,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         }
         WM_DESTROY => {
+            chrome::release();
             with_host(|host| {
                 if host.hwnd == Some(hwnd) {
                     host.hwnd = None;

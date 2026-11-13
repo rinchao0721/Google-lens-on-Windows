@@ -2,10 +2,10 @@
 
 use lenswin_core::lens::{LensRequest, NavigationDecision, classify_navigation};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    COREWEBVIEW2_COLOR, COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, COREWEBVIEW2_KEY_EVENT_KIND,
-    COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC,
-    COREWEBVIEW2_PROCESS_FAILED_KIND, COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
+    COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+    COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC, COREWEBVIEW2_PROCESS_FAILED_KIND,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
     COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
     COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE, COREWEBVIEW2_WEB_ERROR_STATUS,
     COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED, CreateCoreWebView2EnvironmentWithOptions,
@@ -30,6 +30,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindowVisible};
 use windows::core::{BOOL, HSTRING, Interface, PCWSTR, PWSTR, w};
 
+use crate::chrome::{self, Theme};
 use crate::error::{PopupError, win32};
 use crate::page::{error_page, loading_page};
 use crate::{
@@ -195,18 +196,7 @@ fn configure(
         settings.SetAreDevToolsEnabled(false)?;
         settings.SetIsStatusBarEnabled(false)?;
     }
-    if let Ok(controller2) = controller.cast::<ICoreWebView2Controller2>() {
-        let white = COREWEBVIEW2_COLOR {
-            A: 255,
-            R: 255,
-            G: 255,
-            B: 255,
-        };
-        // SAFETY: 同线程 COM 调用。
-        if let Err(e) = unsafe { controller2.SetDefaultBackgroundColor(white) } {
-            log::warn!("设置 WebView2 背景色失败：{e}");
-        }
-    }
+    set_background(&controller, chrome::theme());
     attach_navigation(&webview)?;
     attach_keys(&controller)?;
     attach_process_failed(&webview)?;
@@ -218,6 +208,23 @@ fn configure(
         controller,
         webview,
     })
+}
+
+fn set_background(controller: &ICoreWebView2Controller, theme: Theme) {
+    let Ok(controller2) = controller.cast::<ICoreWebView2Controller2>() else {
+        return;
+    };
+    // SAFETY: 同线程 COM 调用。
+    if let Err(e) = unsafe { controller2.SetDefaultBackgroundColor(theme.webview_background()) } {
+        log::warn!("设置 WebView2 背景色失败：{e}");
+    }
+}
+
+/// 系统深浅色变化后更新 WebView 默认底色。
+pub(crate) fn apply_theme() {
+    if let Some(parts) = web_parts() {
+        set_background(&parts.controller, chrome::theme());
+    }
 }
 
 fn read_uri(read: impl FnOnce(*mut PWSTR) -> windows::core::Result<()>) -> Option<String> {
@@ -582,6 +589,11 @@ pub(crate) fn fit_to_window(hwnd: HWND) {
         log::warn!("读取弹窗客户区失败：{e}");
         return;
     }
+    // 顶部留给自绘的把手栏
+    rect.top = rect
+        .top
+        .saturating_add(chrome::bar_height_of(hwnd))
+        .min(rect.bottom);
     // SAFETY: 同线程 COM 调用。
     if let Err(e) = unsafe { parts.controller.SetBounds(rect) } {
         log::warn!("调整 WebView 尺寸失败：{e}");
