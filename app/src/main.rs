@@ -10,6 +10,7 @@ mod hotkeys;
 mod logging;
 mod shared;
 mod tray_menu;
+mod update_check;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -131,6 +132,7 @@ fn run() -> anyhow::Result<()> {
 
     dispatcher.install_hotkeys();
     dispatcher.check_autostart();
+    dispatcher.schedule_update_check();
     if paths.mode == Mode::PortableFallback {
         dispatcher.balloon(
             NotifyLevel::Warning,

@@ -36,6 +36,10 @@ pub const MOUSE: char = '\u{E962}';
 pub const BRIGHTNESS: char = '\u{E706}';
 /// 调色板。
 pub const COLOR: char = '\u{E790}';
+/// 同步箭头，用于检查更新。
+pub const UPDATE: char = '\u{E895}';
+/// 实验瓶，用于预发布版本。
+pub const BETA: char = '\u{F196}';
 
 /// 导航项图标。
 pub const fn page_icon(page: Page) -> char {

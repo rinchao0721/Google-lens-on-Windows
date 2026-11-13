@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use lenswin_actions::{ActionRegistry, default_file_name, prepare_lens_request, save_to};
+use lenswin_actions::{
+    ActionRegistry, check_update, default_file_name, prepare_lens_request, save_to,
+};
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, SearchBackend, TrayLeftClick};
 use lenswin_core::frame::{CroppedImage, Frame};
@@ -14,6 +16,7 @@ use lenswin_core::ipc::SETTINGS_ARG;
 use lenswin_core::lens::LensRequest;
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
 use lenswin_core::snip::{OverlayFlow, OverlayResult, ToolbarAction, push_history};
+use lenswin_core::update::is_release_page_url;
 use lenswin_overlay::SelectRequest;
 use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::ScreenCapturer;
@@ -33,6 +36,9 @@ use lenswin_upload::privacy_summary;
 use crate::hotkeys::{self, HotkeySet};
 use crate::shared::AppShared;
 use crate::tray_menu::{self, MenuAction};
+use crate::update_check::{
+    AUTO_CHECK_DELAY, FinishGuard, Prompt, UpdateMessage, UpdateTrigger, admit, prompt_for,
+};
 
 /// 开机自启在注册表里的值名。
 const AUTOSTART_NAME: &str = autostart::VALUE_NAME;
@@ -63,6 +69,8 @@ pub enum Command {
     Search,
     /// 截屏到剪贴板。
     ScreenshotCopy,
+    /// 检查更新。
+    CheckUpdate,
     /// 关于。
     About,
     /// 退出。
@@ -75,7 +83,7 @@ impl Command {
         match self {
             Command::Search => Some(1),
             Command::ScreenshotCopy => Some(2),
-            Command::About | Command::Exit => None,
+            Command::CheckUpdate | Command::About | Command::Exit => None,
         }
     }
 
@@ -91,6 +99,7 @@ impl Command {
         match self {
             Command::Search => "圈选搜索",
             Command::ScreenshotCopy => "截屏到剪贴板",
+            Command::CheckUpdate => "检查更新",
             Command::About => "关于 lenswin",
             Command::Exit => "退出",
         }
@@ -123,6 +132,10 @@ pub struct Dispatcher<'a> {
     lens_seq: Cell<u64>,
     /// 本次运行内的历史选区，最新的在前，不落盘。
     history: RefCell<Vec<Rect>>,
+    update_tx: Sender<UpdateMessage>,
+    update_rx: Receiver<UpdateMessage>,
+    /// 进行中检查的提示方式，`None` 表示空闲；同一时间只跑一个检查。
+    update_running: Cell<Option<UpdateTrigger>>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -137,6 +150,7 @@ impl<'a> Dispatcher<'a> {
     ) -> Self {
         let (results_tx, results_rx) = channel();
         let (lens_tx, lens_rx) = channel();
+        let (update_tx, update_rx) = channel();
         let exe = match std::env::current_exe() {
             Ok(path) => Some(path),
             Err(e) => {
@@ -158,6 +172,160 @@ impl<'a> Dispatcher<'a> {
             lens_rx,
             lens_seq: Cell::new(0),
             history: RefCell::new(Vec::new()),
+            update_tx,
+            update_rx,
+            update_running: Cell::new(None),
+        }
+    }
+
+    /// 延迟一段时间后做一次自动检查；到点时再确认开关，期间被关掉就不发请求。
+    pub fn schedule_update_check(&self) {
+        if !self.shared.store.snapshot().update.auto_check {
+            log::info!("自动检查更新已关闭");
+            return;
+        }
+        let tx = self.update_tx.clone();
+        let notifier = self.notifier;
+        let spawned = std::thread::Builder::new()
+            .name("lenswin-update-timer".to_string())
+            .spawn(move || {
+                std::thread::sleep(AUTO_CHECK_DELAY);
+                if tx.send(UpdateMessage::AutoDue).is_err() {
+                    // 主线程已退出，无需检查
+                    return;
+                }
+                if let Err(e) = notifier.notify() {
+                    log::error!("投递自动检查更新失败：{e}");
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("创建自动检查更新线程失败：{e}");
+        }
+    }
+
+    /// 在工作线程检查更新；已有检查在进行时不再新开，手动请求会让这次结果照常提示。
+    fn start_update_check(&self, trigger: UpdateTrigger) {
+        let admission = admit(self.update_running.get(), trigger);
+        self.update_running.set(admission.running);
+        if !admission.spawn {
+            log::info!("检查更新正在进行，本次结果按 {trigger:?} 提示");
+            return;
+        }
+        let include_prerelease = self.shared.store.snapshot().update.include_prerelease;
+        let guard = FinishGuard::new(self.update_tx.clone(), self.notifier);
+        let spawned = std::thread::Builder::new()
+            .name("lenswin-update".to_string())
+            .spawn(move || {
+                let result = check_update(include_prerelease).map_err(|e| e.to_string());
+                guard.finish(result);
+            });
+        if let Err(e) = spawned {
+            log::error!("创建检查更新线程失败：{e}");
+            let running = self.update_running.take();
+            if running == Some(UpdateTrigger::Manual) {
+                self.show_update_prompt(Prompt::Failed(format!("无法创建检查线程：{e}")));
+            }
+        }
+    }
+
+    fn on_update_message(&self, message: UpdateMessage) {
+        match message {
+            UpdateMessage::AutoDue => {
+                if self.shared.store.snapshot().update.auto_check {
+                    self.start_update_check(UpdateTrigger::Auto);
+                } else {
+                    log::info!("自动检查更新已在等待期间关闭");
+                }
+            }
+            UpdateMessage::Finished(result) => {
+                // 线程创建失败时守卫也会补发一条，那时状态已复位，直接丢弃
+                let Some(trigger) = self.update_running.take() else {
+                    log::debug!("丢弃无对应检查的更新结果");
+                    return;
+                };
+                match &result {
+                    Ok(check) => log::info!("检查更新完成（{trigger:?}）：{check:?}"),
+                    Err(message) => log::warn!("检查更新失败（{trigger:?}）：{message}"),
+                }
+                if let Some(prompt) = prompt_for(trigger, &result) {
+                    self.show_update_prompt(prompt);
+                }
+            }
+            UpdateMessage::OpenFailed(message) => {
+                log::error!("打开更新页面失败：{message}");
+                if let Err(e) = dialog::error("lenswin", &format!("无法打开下载页：{message}"))
+                {
+                    log::error!("显示错误框失败：{e}");
+                }
+            }
+        }
+    }
+
+    // 气泡在部分系统上会被勿扰模式拦下，检查更新的结果一律用对话框
+    fn show_update_prompt(&self, prompt: Prompt) {
+        let current = env!("CARGO_PKG_VERSION");
+        let shown = match prompt {
+            Prompt::Upgrade {
+                version,
+                page_url: Some(url),
+            } => dialog::ask(
+                "lenswin",
+                "发现新版本",
+                &format!("lenswin {version} 已发布，当前版本 {current}"),
+                "前往下载",
+                "稍后",
+            )
+            .map(|go| {
+                if go {
+                    self.open_release_page(url);
+                }
+            }),
+            Prompt::Upgrade {
+                version,
+                page_url: None,
+            } => dialog::info(
+                "lenswin",
+                &format!("lenswin {version} 已发布，当前版本 {current}"),
+            ),
+            Prompt::UpToDate => dialog::info("lenswin", &format!("已是最新版本 {current}")),
+            Prompt::Failed(message) => {
+                dialog::error("lenswin", &format!("检查更新失败：{message}"))
+            }
+        };
+        if let Err(e) = shown {
+            log::error!("显示检查更新结果失败：{e}");
+        }
+        // 对话框模态期间按下的热键已积压，作答后不能连串触发
+        discard_pending_triggers();
+    }
+
+    /// 后台打开 Release 页；失败用对话框提示，气泡可能被系统拦下。
+    fn open_release_page(&self, url: String) {
+        if !is_release_page_url(&url) {
+            log::warn!("拒绝打开不受信任的地址");
+            return;
+        }
+        let tx = self.update_tx.clone();
+        let notifier = self.notifier;
+        let spawned = std::thread::Builder::new()
+            .name("lenswin-open-release".to_string())
+            .spawn(move || {
+                let Err(e) = shell::open_url(&url) else {
+                    return;
+                };
+                if tx.send(UpdateMessage::OpenFailed(e.to_string())).is_err() {
+                    // 主线程已退出，无人提示
+                    return;
+                }
+                if let Err(e) = notifier.notify() {
+                    log::error!("投递打开失败结果失败：{e}");
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("创建打开下载页线程失败：{e}");
+            if let Err(e) = dialog::error("lenswin", &format!("无法打开下载页：{e}")) {
+                log::error!("显示错误框失败：{e}");
+            }
         }
     }
 
@@ -371,6 +539,10 @@ impl<'a> Dispatcher<'a> {
             }
             Command::ScreenshotCopy => {
                 self.screenshot_copy();
+                LoopControl::Continue
+            }
+            Command::CheckUpdate => {
+                self.start_update_check(UpdateTrigger::Manual);
                 LoopControl::Continue
             }
             Command::About => {
@@ -739,6 +911,9 @@ impl<'a> Dispatcher<'a> {
         while let Ok(event) = self.popup.events.try_recv() {
             self.on_popup_event(event);
         }
+        while let Ok(message) = self.update_rx.try_recv() {
+            self.on_update_message(message);
+        }
         while let Ok(result) = self.results_rx.try_recv() {
             match result.error {
                 Some(message) => {
@@ -903,5 +1078,6 @@ mod tests {
         assert_eq!(Command::from_hotkey_id(2), Some(Command::ScreenshotCopy));
         assert_eq!(Command::from_hotkey_id(3), None);
         assert_eq!(Command::About.hotkey_id(), None);
+        assert_eq!(Command::CheckUpdate.hotkey_id(), None);
     }
 }

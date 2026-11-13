@@ -7,6 +7,7 @@ mod encode;
 mod lens;
 mod save;
 mod search;
+mod update;
 
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ pub use encode::encode_png;
 pub use lens::prepare_lens_request;
 pub use save::{SaveAction, default_file_name, save_to};
 pub use search::SearchAction;
+pub use update::check_update;
 
 /// 动作注册表：新增功能只需在 [`ActionRegistry::new`] 登记一行。
 pub struct ActionRegistry {

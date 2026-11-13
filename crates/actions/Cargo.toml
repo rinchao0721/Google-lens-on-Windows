@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 lenswin-upload.workspace = true
+lenswin-update.workspace = true
 lenswin-overlay.workspace = true
 lenswin-platform.workspace = true
 lenswin-core.workspace = true

@@ -79,6 +79,8 @@ pub struct Config {
     pub screenshot: ScreenshotConfig,
     /// 隐私。
     pub privacy: PrivacyConfig,
+    /// 检查更新。
+    pub update: UpdateConfig,
 }
 
 impl Config {
@@ -443,6 +445,25 @@ pub struct PrivacyConfig {
     pub lens_acknowledged: bool,
 }
 
+/// `[update]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// 启动后自动检查一次。
+    pub auto_check: bool,
+    /// 是否把 beta / rc 当作可升级版本。
+    pub include_prerelease: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            include_prerelease: false,
+        }
+    }
+}
+
 impl PrivacyConfig {
     /// 用户是否已确认过向该主机上传图片；主机名不区分大小写。
     pub fn is_acknowledged(&self, host: &str) -> bool {
@@ -601,6 +622,39 @@ acknowledged_host = \"uguu.se\"
         assert_eq!(parsed.search.backend, SearchBackend::Embedded);
         assert!(!parsed.privacy.lens_acknowledged);
         assert!(parsed.privacy.is_acknowledged("uguu.se"));
+        assert_eq!(parsed.update, UpdateConfig::default());
+    }
+
+    #[test]
+    fn update_defaults_and_roundtrip() {
+        let defaults = UpdateConfig::default();
+        assert!(defaults.auto_check);
+        assert!(!defaults.include_prerelease);
+        let parsed = Config::from_toml_str(
+            "[update]
+auto_check = false
+include_prerelease = true
+",
+        )
+        .expect("解析");
+        assert!(!parsed.update.auto_check);
+        assert!(parsed.update.include_prerelease);
+        assert!(
+            Config::from_toml_str(
+                "[update]
+channel = \"beta\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::from_toml_str(
+                "[update]
+auto_check = 1
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -661,6 +715,8 @@ acknowledged_host = \"uguu.se\"
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
         config.privacy.lens_acknowledged = true;
         config.search.backend = SearchBackend::ImageHost;
+        config.update.auto_check = false;
+        config.update.include_prerelease = true;
         let text = config.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("反序列化"), config);
     }

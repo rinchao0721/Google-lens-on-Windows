@@ -6,6 +6,7 @@ members = [
     "crates/overlay",
     "crates/net",
     "crates/upload",
+    "crates/update",
     "crates/actions",
     "crates/settings_ui",
     "crates/popup",
@@ -29,6 +30,7 @@ lenswin-platform = { path = "crates/platform" }
 lenswin-overlay = { path = "crates/overlay" }
 lenswin-net = { path = "crates/net" }
 lenswin-upload = { path = "crates/upload" }
+lenswin-update = { path = "crates/update" }
 lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
 lenswin-popup = { path = "crates/popup" }

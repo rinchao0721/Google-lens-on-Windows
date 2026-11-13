@@ -214,6 +214,7 @@ pub fn build(config: &Config, autostart: &AutostartState) -> Menu {
         b.plain(MenuAction::OpenConfigDir, "打开配置文件夹"),
         b.plain(MenuAction::ReloadConfig, "重新加载配置"),
         MenuItem::Separator,
+        b.command(Command::CheckUpdate, None),
         b.command(Command::About, None),
         b.command(Command::Exit, None),
     ];

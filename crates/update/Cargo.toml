@@ -1,0 +1,16 @@
+[package]
+name = "lenswin-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lenswin-core.workspace = true
+lenswin-net.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

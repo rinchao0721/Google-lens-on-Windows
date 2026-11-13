@@ -25,6 +25,7 @@ use crate::form::{
 use crate::icons;
 use crate::recorder::{self, Capture};
 use crate::theme::{self, CARD_GAP, FONT_DESC, Look, NAV_WIDTH, PAGE_MARGIN_X, Palette, ThemeKind};
+use crate::update_status::{UpdateChecker, UpdateStatus};
 use crate::widgets::{
     BannerKind, Card, banner, group_label, key_caps, modifier_chip, nav_item, page_title,
     primary_button, record_button, secondary_button, text_input, toggle,
@@ -96,6 +97,7 @@ pub struct SettingsApp {
     page: Page,
     issues: Vec<ValidationIssue>,
     feedback: Option<Feedback>,
+    updates: UpdateChecker,
     fonts: FontStatus,
     look: Look,
     theme_kind: ThemeKind,
@@ -145,6 +147,7 @@ impl SettingsApp {
             page: Page::General,
             issues: Vec::new(),
             feedback: None,
+            updates: UpdateChecker::new(),
             fonts,
             look: Look {
                 palette: Palette::of(theme_kind),
@@ -353,6 +356,26 @@ impl SettingsApp {
                             );
                         }
                     });
+            });
+        let error = self.issue("update.auto_check");
+        let auto_check = &mut self.draft.config.update.auto_check;
+        Card::new("自动检查更新")
+            .icon(icons::UPDATE)
+            .desc("启动后检查一次新版本，会访问 api.github.com")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, auto_check);
+            });
+        let error = self.issue("update.include_prerelease");
+        let include_prerelease = &mut self.draft.config.update.include_prerelease;
+        Card::new("接收预发布版本")
+            .icon(icons::BETA)
+            .desc("把 beta / rc 版本也当作可升级的版本")
+            .error(error.as_deref())
+            .right_width(48.0)
+            .show(ui, &look, |ui| {
+                toggle(ui, &look, include_prerelease);
             });
     }
 
@@ -889,13 +912,65 @@ impl SettingsApp {
             });
     }
 
-    fn about_page(&self, ui: &mut egui::Ui) {
+    fn update_card(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
+        let prerelease = self.draft.config.update.include_prerelease;
+        self.updates
+            .on_page_shown(ui.ctx(), self.draft.config.update.auto_check, prerelease);
+        let status = self.updates.status().clone();
+        let text = status.text();
+        let failed = matches!(status, UpdateStatus::Failed(_));
+        let mut clicked = false;
+        Card::new("检查更新")
+            .icon(icons::UPDATE)
+            .desc(&text)
+            .error(failed.then_some(text.as_str()))
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                clicked = match &status {
+                    UpdateStatus::Available {
+                        page_url: Some(_), ..
+                    } => primary_button(ui, &look, "前往下载").clicked(),
+                    UpdateStatus::Failed(_) => secondary_button(ui, &look, "重试").clicked(),
+                    UpdateStatus::Checking => ui
+                        .add_enabled_ui(false, |ui| secondary_button(ui, &look, "检查中"))
+                        .inner
+                        .clicked(),
+                    UpdateStatus::Idle
+                    | UpdateStatus::UpToDate
+                    | UpdateStatus::Available { page_url: None, .. } => {
+                        secondary_button(ui, &look, "检查更新").clicked()
+                    }
+                };
+            });
+        if !clicked {
+            return;
+        }
+        match status {
+            UpdateStatus::Available {
+                page_url: Some(url),
+                ..
+            } => {
+                if let Err(message) = self.updates.open_page(ui.ctx(), &url) {
+                    self.set_feedback(FeedbackKind::Error, message);
+                }
+            }
+            UpdateStatus::Idle
+            | UpdateStatus::Checking
+            | UpdateStatus::UpToDate
+            | UpdateStatus::Available { page_url: None, .. }
+            | UpdateStatus::Failed(_) => self.updates.start(ui.ctx(), prerelease),
+        }
+    }
+
+    fn about_page(&mut self, ui: &mut egui::Ui) {
         let look = self.look;
         let p = look.palette;
         Card::new("lenswin")
             .icon(icons::INFO)
             .desc(&format!("版本 {}", env!("CARGO_PKG_VERSION")))
             .show(ui, &look, |_| {});
+        self.update_card(ui);
         Card::new("运行方式")
             .icon(icons::SETTINGS)
             .desc(&self.mode_label)
@@ -1109,6 +1184,9 @@ fn hotkey_card(
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(message) = self.updates.poll() {
+            self.set_feedback(FeedbackKind::Error, format!("无法打开下载页：{message}"));
+        }
         self.sync_theme(ctx);
         self.capture_keys(ctx);
         let p = self.look.palette;

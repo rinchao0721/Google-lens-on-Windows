@@ -1604,6 +1604,7 @@ dependencies = [
  "lenswin-core",
  "lenswin-overlay",
  "lenswin-platform",
+ "lenswin-update",
  "lenswin-upload",
  "log",
  "png",
@@ -1663,6 +1664,18 @@ dependencies = [
  "eframe",
  "lenswin-core",
  "lenswin-platform",
+ "lenswin-update",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lenswin-update"
+version = "0.1.0"
+dependencies = [
+ "lenswin-core",
+ "lenswin-net",
+ "reqwest",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

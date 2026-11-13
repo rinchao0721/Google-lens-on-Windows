@@ -10,6 +10,7 @@ eframe.workspace = true
 thiserror.workspace = true
 lenswin-platform.workspace = true
 lenswin-core.workspace = true
+lenswin-update.workspace = true
 
 [lints]
 workspace = true

@@ -11,6 +11,7 @@ mod form;
 mod icons;
 mod recorder;
 mod theme;
+mod update_status;
 mod widgets;
 
 use eframe::egui;

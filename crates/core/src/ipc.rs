@@ -198,6 +198,8 @@ mod tests {
         }
         assert_eq!(IpcResult::from_code(99), None);
         assert_eq!(MessageKind::from_code(0), None);
+        // 3 曾用于检查更新，已删除，保留不复用
+        assert_eq!(MessageKind::from_code(3), None);
         assert_eq!(
             MessageKind::from_code(MessageKind::ApplyConfig.code()),
             Some(MessageKind::ApplyConfig)
