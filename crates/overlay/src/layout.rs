@@ -161,6 +161,8 @@ pub struct StripSpec {
     pub number_style: bool,
     /// 文字的「纯文字 / 底色」切换。
     pub appearance: bool,
+    /// 文字的「横 / 竖」切换。
+    pub orientation: bool,
 }
 
 /// 样式条内各控件的范围。
@@ -178,6 +180,8 @@ pub struct StripLayout {
     pub number_styles: Vec<(NumberStyle, Rect)>,
     /// 外观切换（是否带底色），只有文字工具有。
     pub appearance: Vec<(bool, Rect)>,
+    /// 横竖排切换（`true` 为竖排），只有文字工具有。
+    pub orientation: Vec<(bool, Rect)>,
 }
 
 /// 点中的控件。
@@ -193,6 +197,8 @@ pub enum Hit {
     NumberStyle(NumberStyle),
     /// 文字外观：`true` 为底色。
     Background(bool),
+    /// 文字排版方向：`true` 为竖排。
+    Vertical(bool),
 }
 
 /// 工具栏与样式条的完整布局。
@@ -224,6 +230,9 @@ impl ToolbarLayout {
         if let Some((background, _)) = strip.appearance.iter().find(|(_, r)| r.contains(p)) {
             return Some(Hit::Background(*background));
         }
+        if let Some((vertical, _)) = strip.orientation.iter().find(|(_, r)| r.contains(p)) {
+            return Some(Hit::Vertical(*vertical));
+        }
         strip
             .presets
             .iter()
@@ -250,6 +259,11 @@ pub fn scaled(value: u32, dpi: u32) -> u32 {
     let dpi = if dpi == 0 { BASE_DPI } else { dpi };
     let v = u64::from(value) * u64::from(dpi) / u64::from(BASE_DPI);
     u32::try_from(v).unwrap_or(u32::MAX).max(1)
+}
+
+/// 文字旋转手柄到文本框边缘的距离（96 DPI 下 24 像素）。
+pub fn text_rotate_distance(dpi: u32) -> u32 {
+    scaled(24, dpi)
 }
 
 /// 手柄抓取半径。
@@ -398,6 +412,9 @@ fn strip_layout(
     if spec.number_style || spec.appearance {
         width += gap + style_w * 2;
     }
+    if spec.orientation {
+        width += gap + style_w * 2;
+    }
 
     let mon = edges(monitor);
     let spacing = i64::from(scaled(STRIP_GAP, dpi));
@@ -481,6 +498,20 @@ fn strip_layout(
             left += style_w;
         }
     }
+    let mut orientation = Vec::new();
+    if spec.orientation {
+        left += gap;
+        for vertical in [false, true] {
+            let r = Rect::from_edges(
+                left,
+                mid - chip_h / 2,
+                left + style_w,
+                mid - chip_h / 2 + chip_h,
+            )?;
+            orientation.push((vertical, r));
+            left += style_w;
+        }
+    }
     Some(StripLayout {
         rect,
         swatches,
@@ -488,6 +519,7 @@ fn strip_layout(
         value,
         number_styles,
         appearance,
+        orientation,
     })
 }
 
@@ -694,6 +726,7 @@ mod tests {
         has_color: true,
         number_style: true,
         appearance: false,
+        orientation: false,
     };
 
     fn bar_of(sel: &Rect, monitor: &Rect) -> ToolbarLayout {
@@ -856,13 +889,19 @@ mod tests {
             has_color: true,
             number_style: false,
             appearance: true,
+            orientation: true,
         };
         let layout = toolbar_layout(&Rect::new(800, 100, 600, 300), &MONITOR, 96, Some(spec));
         let strip = layout.strip.clone().expect("样式条");
         assert!(strip.number_styles.is_empty());
         assert_eq!(strip.appearance.len(), 2);
-        // 与序号工具的「1 / A」占同样宽度
-        assert_eq!(strip.rect.width, 8 + 8 * 28 + 3 * 28 + 36 + 6 + 64);
+        // 在序号工具的「1 / A」宽度之上再加一组横竖切换
+        assert_eq!(strip.rect.width, 8 + 8 * 28 + 3 * 28 + 36 + 6 + 64 + 6 + 64);
+        assert_eq!(strip.orientation.len(), 2);
+        for (vertical, rect) in &strip.orientation {
+            let p = Point::new(rect.x + 3, rect.y + 3);
+            assert_eq!(layout.hit(p), Some(Hit::Vertical(*vertical)));
+        }
         for (background, rect) in &strip.appearance {
             let p = Point::new(rect.x + 3, rect.y + 3);
             assert_eq!(layout.hit(p), Some(Hit::Background(*background)));
@@ -880,6 +919,7 @@ mod tests {
             has_color: true,
             number_style: false,
             appearance: false,
+            orientation: false,
         };
         let strip = toolbar_layout(&sel, &MONITOR, 96, Some(plain))
             .strip
@@ -890,6 +930,7 @@ mod tests {
             has_color: false,
             number_style: false,
             appearance: false,
+            orientation: false,
         };
         let strip = toolbar_layout(&sel, &MONITOR, 96, Some(mosaic))
             .strip

@@ -11,6 +11,7 @@ use crate::config::{
     TEXT_SIZE_RANGE,
 };
 use crate::geometry::{Point, Rect};
+use crate::text_box::TextBox;
 
 /// 起止点距离小于该像素数时不生成拖拽类图元。
 pub const MIN_DRAG_DISTANCE: i64 = 2;
@@ -367,8 +368,14 @@ pub enum Shape {
         size: u32,
         /// 是否带底色。
         background: bool,
-        /// 确认时量出的外接框，命中测试用。
+        /// 未旋转的本地外接框（左上角加宽高），旋转中心为框中心，命中测试也用它。
         bounds: Rect,
+        /// 顺时针旋转角度（整数度，`0..360`）。
+        rotation: i32,
+        /// 换行长度（像素，不含内边距）：横排是宽、竖排是高；`None` 表示不自动换行。
+        wrap: Option<u32>,
+        /// 竖排：列从右往左排。
+        vertical: bool,
     },
 }
 
@@ -545,9 +552,26 @@ impl Document {
 
     /// 命中点的文字图元序号：按外接框判断，后添加的优先。
     pub fn text_at(&self, p: Point) -> Option<usize> {
-        self.shapes.iter().enumerate().rev().find_map(|(i, shape)| {
-            matches!(shape, Shape::Text { bounds, .. } if bounds.contains(p)).then_some(i)
-        })
+        let point = (f64::from(p.x), f64::from(p.y));
+        self.shapes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, shape)| match shape {
+                Shape::Text {
+                    bounds,
+                    rotation,
+                    vertical,
+                    ..
+                } => TextBox {
+                    bounds: *bounds,
+                    rotation: *rotation,
+                    vertical: *vertical,
+                }
+                .contains(point)
+                .then_some(i),
+                _ => None,
+            })
     }
 
     fn record(&mut self, step: UndoStep) {
@@ -783,6 +807,9 @@ mod tests {
             size: 24,
             background: false,
             bounds: Rect::new(x, 0, 20, 20),
+            rotation: 0,
+            wrap: None,
+            vertical: false,
         }
     }
 
@@ -842,6 +869,25 @@ mod tests {
         assert!(doc.undo());
         doc.replace(0, text("z", 0));
         assert!(!doc.can_redo(), "新操作应清空重做栈");
+    }
+
+    #[test]
+    fn text_hit_test_follows_rotation() {
+        let mut doc = Document::new();
+        doc.push(Shape::Text {
+            origin: p(0, 0),
+            text: "r".to_string(),
+            color: PALETTE[0],
+            size: 24,
+            background: false,
+            bounds: Rect::new(0, 0, 100, 20),
+            rotation: 90,
+            wrap: None,
+            vertical: false,
+        });
+        // 旋转 90° 后是围绕 (50, 10) 的竖条
+        assert_eq!(doc.text_at(p(50, 50)), Some(0));
+        assert_eq!(doc.text_at(p(95, 10)), None);
     }
 
     #[test]
@@ -963,7 +1009,7 @@ mod tests {
         assert_eq!(Tool::Text.label(), "文字");
         assert!(Tool::Text.has_color());
         assert_eq!(*Tool::Text.size_spec().range.start(), 12);
-        assert_eq!(*Tool::Text.size_spec().range.end(), 96);
+        assert_eq!(*Tool::Text.size_spec().range.end(), 16_384);
         assert_eq!(Tool::Text.size_spec().step, 2);
         assert_eq!(step_size(24, 1, &Tool::Text.size_spec()), 26);
         assert_eq!(step_size(12, -1, &Tool::Text.size_spec()), 12);

@@ -31,8 +31,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG,
+    GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG,
     PostQuitMessage, RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos,
     SetForegroundWindow, SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS,
     WM_CHAR, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
@@ -87,7 +87,7 @@ struct Session {
     /// 当前关联了输入法的窗口序号，只有文字编辑期间才有。
     ime_window: Option<usize>,
     /// 最近一次交给输入法的候选窗排除区域，避免每次移动鼠标都重复设置。
-    candidate: Option<(usize, Rect)>,
+    candidate: Option<(usize, Rect, bool)>,
     /// `WM_CHAR` 里等待低位的高位代理项。
     pending_high: Option<u16>,
     /// 光标闪烁计时器正在运行。
@@ -143,14 +143,19 @@ impl ImeContext {
     }
 
     /// 候选窗放在 `line` 下方，并排除该行不被遮挡；`line` 为窗口客户区坐标。
-    fn place_candidates(&self, line: &Rect) {
+    fn place_candidates(&self, line: &Rect, vertical: bool) {
         let clamp = |v: i64| i32::try_from(v).unwrap_or(0);
+        // 竖排时以当前列的左上角为基准，横排以所在行的左下角为基准
         let form = CANDIDATEFORM {
             dwIndex: 0,
             dwStyle: CFS_EXCLUDE,
             ptCurrentPos: POINT {
                 x: clamp(i64::from(line.x)),
-                y: clamp(line.bottom()),
+                y: clamp(if vertical {
+                    i64::from(line.y)
+                } else {
+                    line.bottom()
+                }),
             },
             rcArea: RECT {
                 left: clamp(i64::from(line.x)),
@@ -324,7 +329,7 @@ impl Session {
     /// 文字编辑与系统的同步：输入法关联、候选窗位置、键盘焦点和光标闪烁计时器。
     fn sync_editing(&mut self) {
         let target = self.interaction.ime_target();
-        let wanted = target.as_ref().map(|(index, _)| *index);
+        let wanted = target.as_ref().map(|(index, ..)| *index);
         if self.ime_window != wanted {
             if let Some(old) = self.ime_window {
                 self.set_ime(old, false);
@@ -342,14 +347,14 @@ impl Session {
             // SAFETY: hwnd 是本线程创建的有效窗口。
             discard(unsafe { SetFocus(Some(slot.hwnd)) });
         }
-        if let Some((index, line)) = target {
-            self.position_candidates(index, &line);
+        if let Some((index, line, vertical)) = target {
+            self.position_candidates(index, &line, vertical);
         }
         self.sync_caret_timer(wanted.is_some());
     }
 
-    fn position_candidates(&mut self, index: usize, line: &Rect) {
-        if self.candidate == Some((index, *line)) {
+    fn position_candidates(&mut self, index: usize, line: &Rect, vertical: bool) {
+        if self.candidate == Some((index, *line, vertical)) {
             return;
         }
         let Some(slot) = self.windows.get(index) else {
@@ -362,9 +367,9 @@ impl Session {
             line.bottom() - i64::from(slot.origin.y),
         );
         if let (Some(local), Some(context)) = (local, ImeContext::get(slot.hwnd)) {
-            context.place_candidates(&local);
+            context.place_candidates(&local, vertical);
         }
-        self.candidate = Some((index, *line));
+        self.candidate = Some((index, *line, vertical));
     }
 
     /// 编辑期间光标按固定周期闪烁；输入或移动光标后重新计时，让光标立即可见。
@@ -515,6 +520,7 @@ fn key_of(vk: VIRTUAL_KEY) -> Option<Key> {
         VK_OEM_PERIOD => Key::NewerHistory,
         // 美式键盘上 ? 与 / 同键，另给 F1 作为不依赖布局的备选
         VK_OEM_2 | VK_F1 => Key::ToggleHints,
+        VK_DELETE | VK_BACK => Key::Delete,
         _ => return None,
     };
     Some(key)
@@ -625,6 +631,7 @@ fn set_cursor() {
     let id = match kind {
         CursorKind::Cross => IDC_CROSS,
         CursorKind::Text => IDC_IBEAM,
+        CursorKind::Hand => IDC_HAND,
         CursorKind::Arrow => IDC_ARROW,
         CursorKind::Move => IDC_SIZEALL,
         CursorKind::SizeNs => IDC_SIZENS,

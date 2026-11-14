@@ -8,9 +8,10 @@ use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::{MonitorInfo, index_at};
 use lenswin_core::selection::{Selection, SelectionShape};
 use lenswin_core::snip::{ColorFormat, OverlayFlow, ToolbarAction, topmost_containing};
+use lenswin_core::text_box::{TextBox, TextHandle, round_to_i32};
 
 use crate::adjust::{self, Direction, Handle, NudgeMode};
-use crate::annotate::{Annotator, EditKey, EditView, StyleView, TextMeasure};
+use crate::annotate::{Annotator, EditKey, EditView, StyleView, TextBoxView, TextMeasure};
 use crate::hint::{self, Features, Hint, HintState, Stage};
 use crate::layout::{self, Hit, StripSpec, ToolbarButton, ToolbarLayout};
 use crate::modes::{Preview, SelectionTool};
@@ -58,6 +59,8 @@ pub enum Key {
     Edit(EditKey),
     /// 编辑文字时粘贴剪贴板快照。
     Paste,
+    /// 删除选中的文字。
+    Delete,
     /// 撤销上一个标注。
     Undo,
     /// 重做被撤销的标注。
@@ -80,6 +83,8 @@ pub enum CursorKind {
     Cross,
     /// 文字输入的 I 形光标。
     Text,
+    /// 手形，旋转手柄用。
+    Hand,
     /// 箭头。
     Arrow,
     /// 四向移动。
@@ -191,6 +196,8 @@ pub struct View<'a> {
     pub annotations: Annotations<'a>,
     /// 编辑中的文本框，只在它所在的显示器上有值。
     pub editor: Option<EditorView>,
+    /// 选中或编辑中的文字文本框，画虚线框和手柄。
+    pub text_box: Option<TextBoxView>,
     /// 放大镜：光标位置与颜色格式。
     pub magnifier: Option<(Point, ColorFormat)>,
     /// 快捷键提示，为空表示不显示。
@@ -263,6 +270,33 @@ fn is_click(a: Point, b: Point) -> bool {
         && (i64::from(a.y) - i64::from(b.y)).abs() <= CLICK_SLOP
 }
 
+/// 文字文本框上各部位的光标：缩放按旋转后的方向取最接近的系统缩放光标。
+fn text_cursor(handle: TextHandle, geometry: &TextBox) -> CursorKind {
+    let center = geometry.center();
+    let target = match handle {
+        TextHandle::Body | TextHandle::Border => return CursorKind::Move,
+        TextHandle::Rotate => return CursorKind::Hand,
+        TextHandle::Corner(corner) => geometry.corner(corner),
+        TextHandle::Edge(edge) => geometry
+            .edge_handles()
+            .iter()
+            .find(|(e, _)| *e == edge)
+            .map_or(center, |(_, p)| *p),
+    };
+    resize_cursor(target.0 - center.0, target.1 - center.1)
+}
+
+/// 由中心指向手柄的方向取最接近的缩放光标（屏幕坐标，y 向下）。
+fn resize_cursor(dx: f64, dy: f64) -> CursorKind {
+    let degrees = round_to_i32(dy.atan2(dx).to_degrees()).rem_euclid(180);
+    match ((degrees + 22) / 45) % 4 {
+        0 => CursorKind::SizeWe,
+        1 => CursorKind::SizeNwse,
+        2 => CursorKind::SizeNs,
+        _ => CursorKind::SizeNesw,
+    }
+}
+
 fn cursor_for(handle: Handle) -> CursorKind {
     match handle {
         Handle::N | Handle::S => CursorKind::SizeNs,
@@ -326,6 +360,7 @@ impl Interaction {
             has_color: tool.has_color(),
             number_style: tool == Tool::Number,
             appearance: tool == Tool::Text,
+            orientation: tool == Tool::Text,
         });
         Some(layout::toolbar_layout(
             &adj.rect,
@@ -363,6 +398,7 @@ impl Interaction {
             }
             Some(Hit::NumberStyle(style)) => self.annotator.set_number_style(style),
             Some(Hit::Background(on)) => self.annotator.set_text_background(on),
+            Some(Hit::Vertical(on)) => self.annotator.set_text_vertical(on),
             Some(Hit::Preset(index)) => self.annotator.apply_preset(index),
             None => {}
         }
@@ -455,6 +491,7 @@ impl Interaction {
             return;
         };
         self.hover = Some(p);
+        self.sync_text_limit();
         match self.phase {
             Phase::Drawing { .. } => return,
             Phase::Adjusting(mut adj) => {
@@ -469,25 +506,46 @@ impl Interaction {
                     self.press_toolbar(adj, hit);
                     return;
                 }
-                if self.annotator.is_editing() {
-                    // 点文本框外只确认，不新建文本框，也不缩放选区
-                    if !self.annotator.edit_bounds().is_some_and(|b| b.contains(p)) {
-                        self.annotator.confirm_text();
+                let text_tool = self.annotator.tool() == Some(Tool::Text) && self.annotating();
+                if text_tool {
+                    // 文字手柄优先于截屏选区手柄
+                    match (
+                        self.text_handle_at(p, adj.monitor),
+                        self.annotator.is_editing(),
+                    ) {
+                        (Some(TextHandle::Body), true) => return,
+                        (Some(handle), _) => {
+                            self.annotator.begin_text_adjust(handle, p);
+                            return;
+                        }
+                        _ => {}
                     }
+                    if self.annotator.is_editing() {
+                        // 点框外只确认；点到别的文字则顺带选中它
+                        self.annotator.confirm_text();
+                        self.select_text_at(p);
+                        return;
+                    }
+                } else if self.annotator.is_editing() {
+                    self.annotator.confirm_text();
                     return;
                 }
                 let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
                 match hit {
                     // 有工具时选区内部用来画图，手柄仍然优先缩放
                     Some(Handle::Body) if self.annotating() => {
-                        if let Some(bounds) = self.monitor_bounds(adj.monitor) {
-                            if self.annotator.tool() == Some(Tool::Text) {
+                        if text_tool {
+                            // 单击已有文字选中它；点空白处时有选中就只取消选中，否则新建文本框
+                            if self.select_text_at(p) || self.annotator.deselect_text() {
+                                return;
+                            }
+                            if let Some(bounds) = self.monitor_bounds(adj.monitor) {
                                 self.annotator.begin_text(p, &bounds, adj.monitor);
                                 self.focus_request = Some(adj.monitor);
                                 self.touch_caret();
-                            } else {
-                                self.annotator.press(p, &bounds);
                             }
+                        } else if let Some(bounds) = self.monitor_bounds(adj.monitor) {
+                            self.annotator.press(p, &bounds);
                         }
                         return;
                     }
@@ -500,7 +558,12 @@ impl Interaction {
                         self.phase = Phase::Adjusting(adj);
                         return;
                     }
-                    None if self.annotating() => return,
+                    None if self.annotating() => {
+                        if text_tool {
+                            self.annotator.deselect_text();
+                        }
+                        return;
+                    }
                     None => {
                         self.phase = Phase::Idle;
                         self.history_index = None;
@@ -517,6 +580,24 @@ impl Interaction {
         self.phase = Phase::Drawing { window, press: p };
     }
 
+    /// 屏幕点命中当前文字文本框的哪个部位。
+    fn text_handle_at(&self, p: Point, monitor: usize) -> Option<TextHandle> {
+        let dpi = self.dpi(monitor);
+        self.annotator.text_handle_at(
+            p,
+            f64::from(layout::grip(dpi)),
+            f64::from(layout::text_rotate_distance(dpi)),
+        )
+    }
+
+    /// 选中 `p` 处最上面的文字；没有文字返回 `false`。
+    fn select_text_at(&mut self, p: Point) -> bool {
+        match self.annotator.document().text_at(p) {
+            Some(index) => self.annotator.select_text(index),
+            None => false,
+        }
+    }
+
     /// 移动鼠标；拖拽时 `window` 是起始窗口（鼠标已被捕获）。
     pub fn mouse_move(&mut self, window: usize, local: (i32, i32)) {
         if self.outcome.is_some() {
@@ -526,6 +607,11 @@ impl Interaction {
             return;
         };
         self.hover = Some(p);
+        self.sync_text_limit();
+        if self.annotator.is_adjusting_text() {
+            self.annotator.update_text_adjust(p);
+            return;
+        }
         if self.annotator.is_drawing() {
             if let Phase::Adjusting(adj) = self.phase
                 && let Some(bounds) = self.monitor_bounds(adj.monitor)
@@ -557,6 +643,14 @@ impl Interaction {
     /// 松开左键；单击且光标下有可吸附窗口时选中该窗口，否则无效选区回到空闲。
     pub fn release(&mut self, window: usize, local: (i32, i32)) {
         if self.outcome.is_some() {
+            return;
+        }
+        if self.annotator.is_adjusting_text() {
+            if let Some(p) = self.point(window, local) {
+                self.hover = Some(p);
+                self.annotator.update_text_adjust(p);
+            }
+            self.annotator.finish_text_adjust();
             return;
         }
         if self.annotator.is_drawing() {
@@ -626,6 +720,14 @@ impl Interaction {
         let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local)) else {
             return false;
         };
+        // 双击换行边手柄：取消自动换行
+        if let Some(TextHandle::Edge(_)) = self.text_handle_at(p, adj.monitor) {
+            self.annotator.finish_text_adjust();
+            // 没有换行可取消时按普通双击处理，贴边的文字仍然能双击进入编辑
+            if self.annotator.clear_wrap() {
+                return true;
+            }
+        }
         if !adj.rect.contains(p) || self.toolbar(&adj).is_some_and(|t| t.covers(p)) {
             return false;
         }
@@ -670,9 +772,12 @@ impl Interaction {
             self.cancel();
             return;
         }
-        // 编辑中右键等同于点框外：确认文字
+        // 编辑中右键等同于点框外：确认文字；选中状态下先取消选中
         if self.annotator.is_editing() {
             self.annotator.confirm_text();
+            return;
+        }
+        if self.annotator.deselect_text() {
             return;
         }
         if self.annotator.exit_tool() {
@@ -696,6 +801,26 @@ impl Interaction {
         if self.annotator.is_editing() {
             self.editing_key(key);
             return None;
+        }
+        if self.annotator.selected_text().is_some() && self.annotating() {
+            match key {
+                Key::Delete => {
+                    self.annotator.delete_selected();
+                    return None;
+                }
+                Key::Escape => {
+                    self.annotator.deselect_text();
+                    return None;
+                }
+                Key::Arrow(direction) => {
+                    let step = if mode == NudgeMode::Shrink { 10 } else { 1 };
+                    let (dx, dy) = direction.delta();
+                    self.annotator
+                        .nudge_selected(dx.saturating_mul(step), dy.saturating_mul(step));
+                    return None;
+                }
+                _ => {}
+            }
         }
         match key {
             Key::Escape => {
@@ -747,7 +872,7 @@ impl Interaction {
             Key::OlderHistory => self.step_history(true),
             Key::NewerHistory => self.step_history(false),
             Key::ToggleHints => self.options.hints = self.options.hints.toggled(),
-            Key::Edit(_) | Key::Paste => {}
+            Key::Edit(_) | Key::Paste | Key::Delete => {}
         }
         None
     }
@@ -811,7 +936,7 @@ impl Interaction {
     }
 
     /// 光标所在显示器序号和所在行的范围（虚拟桌面坐标），输入法候选窗据此定位；没有编辑时为 `None`。
-    pub fn ime_target(&self) -> Option<(usize, Rect)> {
+    pub fn ime_target(&self) -> Option<(usize, Rect, bool)> {
         self.annotator.caret_line()
     }
 
@@ -908,7 +1033,7 @@ impl Interaction {
 
     /// 是否需要捕获鼠标：拖拽框选或拖动手柄期间。
     pub fn is_capturing(&self) -> bool {
-        if self.annotator.is_drawing() {
+        if self.annotator.is_drawing() || self.annotator.is_adjusting_text() {
             return true;
         }
         match self.phase {
@@ -936,8 +1061,18 @@ impl Interaction {
         self.annotator.set_shift(down);
     }
 
+    /// 文字字号上限跟随选区所在的显示器。
+    fn sync_text_limit(&mut self) {
+        if let Phase::Adjusting(adj) = self.phase
+            && let Some(bounds) = self.monitor_bounds(adj.monitor)
+        {
+            self.annotator.set_text_limit(bounds.height);
+        }
+    }
+
     /// 滚轮：`notches` 为正表示向上滚；调整当前标注工具的粗细，没有工具时无作用。
     pub fn wheel(&mut self, notches: i32) {
+        self.sync_text_limit();
         if matches!(self.phase, Phase::Adjusting(_)) && self.options.flow == OverlayFlow::Toolbar {
             self.annotator.wheel(notches);
         }
@@ -1018,9 +1153,13 @@ impl Interaction {
             annotations: Annotations {
                 shapes: self.annotator.document().shapes(),
                 revision: self.annotator.document().revision(),
-                hidden: self.annotator.edit_view().and_then(|v| v.hidden),
-                draft: self.annotator.preview(),
+                hidden: self.annotator.hidden_shape(),
+                draft: self
+                    .annotator
+                    .preview()
+                    .or_else(|| self.annotator.text_preview()),
             },
+            text_box: self.annotator.active_text_box(),
             editor: self
                 .annotator
                 .edit_view()
@@ -1094,11 +1233,23 @@ impl Interaction {
         if self.annotator.is_drawing() {
             return CursorKind::Cross;
         }
+        if let (Some(handle), Some(view)) = (
+            self.annotator.adjusting_handle(),
+            self.annotator.active_text_box(),
+        ) {
+            return text_cursor(handle, &view.geometry);
+        }
         let Some(p) = self.hover else {
             return CursorKind::Cross;
         };
         if self.toolbar(&adj).is_some_and(|t| t.covers(p)) {
             return CursorKind::Arrow;
+        }
+        if let (Some(handle), Some(view)) = (
+            self.text_handle_at(p, adj.monitor),
+            self.annotator.active_text_box(),
+        ) {
+            return text_cursor(handle, &view.geometry);
         }
         let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
         match hit {
@@ -1645,7 +1796,7 @@ mod tests {
         assert_eq!(it.take_focus_request(), None);
         assert!(it.view(1).editor.is_some());
         assert!(it.view(0).editor.is_none());
-        let (monitor, line) = it.ime_target().expect("候选窗目标");
+        let (monitor, line, _) = it.ime_target().expect("候选窗目标");
         assert_eq!(monitor, 1);
         assert_eq!((line.x, line.y), (200, 200));
         assert!(!it.is_capturing());
@@ -1678,11 +1829,11 @@ mod tests {
         assert!(!it.is_editing());
         assert_eq!(only_text(&it).map(|t| t.0), Some("x".to_string()));
         // 选区外和手柄上的点击同样只确认
-        click(&mut it, (200, 200));
+        click(&mut it, (300, 250));
         type_in(&mut it, "y");
         click(&mut it, (1000, 800));
         assert!(!it.is_editing());
-        click(&mut it, (200, 200));
+        click(&mut it, (350, 150));
         type_in(&mut it, "z");
         it.press(1, (500, 400));
         assert!(!it.is_editing() && !it.is_capturing());
@@ -1843,12 +1994,13 @@ mod tests {
         type_in(&mut it, "hello");
         click(&mut it, (400, 350));
         assert_eq!(only_text(&it).map(|t| t.0), Some("hello".to_string()));
-        // 真实的双击顺序：第一下建出空文本框，第二下是 WM_LBUTTONDBLCLK
-        it.press(1, (155, 155));
-        it.release(1, (155, 155));
-        assert!(it.is_editing());
-        it.double_click(1, (155, 155));
-        it.release(1, (155, 155));
+        // 真实的双击顺序：第一下单击选中文字，第二下是 WM_LBUTTONDBLCLK
+        it.press(1, (180, 165));
+        it.release(1, (180, 165));
+        assert!(!it.is_editing());
+        assert_eq!(it.annotator.selected_text(), Some(0));
+        it.double_click(1, (180, 165));
+        it.release(1, (180, 165));
         assert!(it.is_editing());
         assert_eq!(it.view(1).annotations.hidden, Some(0));
         assert_eq!(
@@ -2017,6 +2169,288 @@ mod tests {
         it.char_input('a');
         assert!(it.view(1).annotations.shapes.is_empty());
         assert!(!it.take_blink_reset());
+    }
+
+    /// 在 `at` 处建一个字号 24 的 "hello"（近似度量下框为 60×30）并确认。
+    fn add_hello(it: &mut Interaction, at: (i32, i32)) {
+        click(it, at);
+        type_in(it, "hello");
+        it.key(Key::Enter, NudgeMode::Move, false);
+    }
+
+    fn with_text() -> Interaction {
+        let mut it = text_session(None);
+        add_hello(&mut it, (150, 150));
+        it
+    }
+
+    /// 第 `index` 个文字图元的（外接框, 旋转, 换行, 竖排, 字号）。
+    fn text_at(it: &Interaction, index: usize) -> Option<(Rect, i32, Option<u32>, bool, u32)> {
+        match it.view(1).annotations.shapes.get(index) {
+            Some(Shape::Text {
+                bounds,
+                rotation,
+                wrap,
+                vertical,
+                size,
+                ..
+            }) => Some((*bounds, *rotation, *wrap, *vertical, *size)),
+            _ => None,
+        }
+    }
+
+    fn drag_to(it: &mut Interaction, from: (i32, i32), to: (i32, i32)) {
+        it.press(1, from);
+        it.mouse_move(1, to);
+        it.release(1, to);
+    }
+
+    #[test]
+    fn single_click_selects_text_and_blank_click_only_deselects() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        assert_eq!(it.annotator.selected_text(), Some(0));
+        assert!(!it.is_editing());
+        assert!(it.view(1).text_box.is_some_and(|t| !t.editing));
+        click(&mut it, (350, 300));
+        assert_eq!(it.annotator.selected_text(), None);
+        assert!(!it.is_editing(), "有选中时点空白只取消选中");
+        click(&mut it, (350, 300));
+        assert!(it.is_editing(), "没有选中时点空白才新建文本框");
+    }
+
+    #[test]
+    fn dragging_selected_text_moves_it_in_one_undo_step() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        it.press(1, (180, 165));
+        assert!(it.is_capturing());
+        it.mouse_move(1, (200, 185));
+        // 拖动中显示预览，原图元被隐藏
+        assert!(it.view(1).annotations.draft.is_some());
+        assert_eq!(it.view(1).annotations.hidden, Some(0));
+        it.release(1, (200, 185));
+        assert!(!it.is_capturing());
+        assert_eq!(
+            text_at(&it, 0).map(|t| t.0),
+            Some(Rect::new(170, 170, 60, 30))
+        );
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(
+            text_at(&it, 0).map(|t| t.0),
+            Some(Rect::new(150, 150, 60, 30))
+        );
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+    }
+
+    #[test]
+    fn text_handles_win_over_the_screenshot_selection_handles() {
+        let mut it = text_session(None);
+        add_hello(&mut it, (440, 370));
+        click(&mut it, (470, 385));
+        assert_eq!(it.annotator.selected_text(), Some(0));
+        // 文字右下角 (500, 400) 与截屏选区右下角重合：缩放文字而不是选区
+        drag_to(&mut it, (500, 400), (560, 430));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        assert!(text_at(&it, 0).is_some_and(|t| t.4 > 24));
+    }
+
+    #[test]
+    fn keys_in_selected_state_delete_nudge_and_deselect() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        it.key(Key::Arrow(Direction::Right), NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.0.x), Some(151));
+        it.key(Key::Arrow(Direction::Down), NudgeMode::Shrink, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.0.y), Some(160));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert_eq!(it.annotator.selected_text(), None);
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(Some(Tool::Text)));
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
+
+        let mut again = with_text();
+        click(&mut again, (180, 165));
+        again.key(Key::Delete, NudgeMode::Move, false);
+        assert!(again.view(1).annotations.shapes.is_empty());
+        again.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(again.view(1).annotations.shapes.len(), 1);
+
+        let mut third = with_text();
+        click(&mut third, (180, 165));
+        third.right_click();
+        assert_eq!(third.annotator.selected_text(), None);
+        assert_eq!(
+            third.view(1).toolbar.map(|t| t.active),
+            Some(Some(Tool::Text))
+        );
+        third.right_click();
+        assert_eq!(third.view(1).toolbar.map(|t| t.active), Some(None));
+    }
+
+    #[test]
+    fn cursors_follow_the_box_handles() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        it.mouse_move(1, (180, 165));
+        assert_eq!(it.cursor_kind(), CursorKind::Move);
+        it.mouse_move(1, (210, 180));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeNwse);
+        it.mouse_move(1, (210, 165));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeWe);
+        it.mouse_move(1, (180, 126));
+        assert_eq!(it.cursor_kind(), CursorKind::Hand);
+        it.mouse_move(1, (150, 180));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeNesw);
+        it.mouse_move(1, (300, 300));
+        assert_eq!(it.cursor_kind(), CursorKind::Text);
+    }
+
+    #[test]
+    fn resize_cursor_picks_the_nearest_axis() {
+        assert_eq!(resize_cursor(10.0, 0.0), CursorKind::SizeWe);
+        assert_eq!(resize_cursor(-10.0, 1.0), CursorKind::SizeWe);
+        assert_eq!(resize_cursor(10.0, 10.0), CursorKind::SizeNwse);
+        assert_eq!(resize_cursor(-10.0, -10.0), CursorKind::SizeNwse);
+        assert_eq!(resize_cursor(0.0, 10.0), CursorKind::SizeNs);
+        assert_eq!(resize_cursor(-10.0, 10.0), CursorKind::SizeNesw);
+        assert_eq!(resize_cursor(10.0, -10.0), CursorKind::SizeNesw);
+        assert_eq!(resize_cursor(10.0, 3.0), CursorKind::SizeWe);
+    }
+
+    #[test]
+    fn double_clicking_an_edge_handle_cancels_the_wrap() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        drag_to(&mut it, (210, 165), (170, 165));
+        let wrapped = text_at(&it, 0).expect("文字");
+        assert_eq!(wrapped.2, Some(24));
+        assert_eq!(wrapped.0, Rect::new(150, 150, 24, 90));
+        // 换行后右边手柄在 (174, 195)
+        it.press(1, (174, 195));
+        it.release(1, (174, 195));
+        it.double_click(1, (174, 195));
+        it.release(1, (174, 195));
+        let restored = text_at(&it, 0).expect("文字");
+        assert_eq!(
+            (restored.2, restored.0),
+            (None, Rect::new(150, 150, 60, 30))
+        );
+        assert!(!it.is_editing());
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).and_then(|t| t.2), Some(24));
+    }
+
+    #[test]
+    fn text_size_limit_follows_the_selection_monitor_height() {
+        let mut it = text_session(None);
+        // 选区所在的主显示器高 1080：上限 2160
+        it.mouse_move(1, (300, 300));
+        it.wheel(2000);
+        assert_eq!(
+            it.view(1).toolbar.and_then(|t| t.style).map(|s| s.size),
+            Some(2160)
+        );
+        click(&mut it, (200, 200));
+        type_in(&mut it, "a");
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.4), Some(2160));
+        assert_eq!(it.annotate_change().map(|c| c.text.size), Some(2160));
+    }
+
+    #[test]
+    fn double_clicking_a_wrapless_edge_still_reedits_the_text() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        // 右边缘中点在 (210, 165)，没有换行可取消
+        it.press(1, (209, 165));
+        it.release(1, (209, 165));
+        it.double_click(1, (209, 165));
+        it.release(1, (209, 165));
+        assert!(it.is_editing());
+    }
+
+    #[test]
+    fn strip_changes_apply_to_the_selected_text_without_deselecting() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        let chip = bar_layout(&it)
+            .strip
+            .and_then(|s| s.orientation.get(1).map(|(_, r)| *r))
+            .expect("横竖切换");
+        click(&mut it, (chip.x + 2, chip.y + 2));
+        assert_eq!(it.annotator.selected_text(), Some(0));
+        assert_eq!(text_at(&it, 0).map(|t| t.3), Some(true));
+        let dot = bar_layout(&it)
+            .strip
+            .and_then(|s| s.presets.get(2).copied())
+            .expect("预设圆点");
+        click(&mut it, (dot.x + 2, dot.y + 2));
+        assert_eq!(text_at(&it, 0).map(|t| t.4), Some(36));
+        it.wheel(-1);
+        assert_eq!(text_at(&it, 0).map(|t| t.4), Some(34));
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.4), Some(36));
+    }
+
+    #[test]
+    fn rotating_while_editing_is_part_of_the_confirmed_text() {
+        let mut it = with_text();
+        it.press(1, (180, 165));
+        it.release(1, (180, 165));
+        it.double_click(1, (180, 165));
+        it.release(1, (180, 165));
+        assert!(it.is_editing());
+        // 编辑中旋转手柄在框上方 24 像素
+        drag_to(&mut it, (180, 126), (260, 165));
+        assert_eq!(it.view(1).editor.map(|e| e.edit.rotation), Some(90));
+        assert!(it.is_editing());
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.1), Some(90));
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(text_at(&it, 0).map(|t| t.1), Some(0));
+    }
+
+    #[test]
+    fn dragging_the_dashed_border_moves_the_text_being_edited() {
+        let mut it = with_text();
+        it.press(1, (180, 165));
+        it.release(1, (180, 165));
+        it.double_click(1, (180, 165));
+        it.release(1, (180, 165));
+        let before = it.view(1).editor.map(|e| e.edit.bounds).expect("编辑框");
+        click(&mut it, (180, 165));
+        assert!(it.is_editing());
+        // 上边缘中点附近属于虚线框，可以拖动
+        drag_to(&mut it, (180, 150), (200, 170));
+        let after = it.view(1).editor.map(|e| e.edit.bounds).expect("编辑框");
+        assert_eq!((after.x - before.x, after.y - before.y), (20, 20));
+        assert!(it.is_editing());
+    }
+
+    #[test]
+    fn clicking_another_text_while_editing_confirms_and_selects_it() {
+        let mut it = text_session(None);
+        add_hello(&mut it, (150, 150));
+        add_hello(&mut it, (350, 300));
+        it.press(1, (180, 165));
+        it.release(1, (180, 165));
+        it.double_click(1, (180, 165));
+        it.release(1, (180, 165));
+        assert!(it.is_editing());
+        click(&mut it, (380, 315));
+        assert!(!it.is_editing());
+        assert_eq!(it.annotator.selected_text(), Some(1));
+    }
+
+    #[test]
+    fn box_and_handles_are_not_part_of_the_composited_image() {
+        let mut it = with_text();
+        click(&mut it, (180, 165));
+        // 选中状态下的虚线框和手柄只在 View 里，文档里没有额外图元
+        assert!(it.view(1).text_box.is_some());
+        assert_eq!(it.document().shapes().len(), 1);
     }
 
     #[test]

@@ -989,9 +989,9 @@ impl SettingsApp {
         let text = &mut a.text;
         Card::new("文字")
             .icon(icons::COLOR)
-            .desc("颜色、字号与外观；底色模式下颜色用作底色")
+            .desc("颜色、字号、外观与排版方向；底色模式下颜色用作底色")
             .error(text_issue.as_deref())
-            .right_width(470.0)
+            .right_width(580.0)
             .show(ui, &look, |ui| {
                 ui.add(
                     egui::DragValue::new(&mut text.size)
@@ -1005,6 +1005,8 @@ impl SettingsApp {
                         text.background = background;
                     }
                 }
+                toggle(ui, &look, &mut text.vertical);
+                ui.label("竖排");
             });
         let number = &mut a.number;
         Card::new("序号")

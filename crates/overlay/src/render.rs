@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
     D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
-    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_PROPERTY_TYPE_FLOAT, D2D1_QUADRATIC_BEZIER_SEGMENT,
@@ -48,7 +48,7 @@ use windows::Win32::System::Com::{
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::adjust;
-use crate::annotate::{StyleView, TextMeasure, text_padding};
+use crate::annotate::{StyleView, TextBoxView, TextLayout, TextMeasure, text_padding};
 use crate::error::{OverlayError, win32};
 use crate::glow::{self, Edge, GlowFrame, Rgb};
 use crate::hint::Hint;
@@ -57,6 +57,7 @@ use crate::layout::{self, Glyph, Hit, MagnifierLayout, ToolbarButton};
 use crate::modes::Preview;
 use crate::paint::{self, DWriteMeasure, FrameRef, Painter, TextBlock};
 use crate::stroke::{self, PointF};
+use lenswin_core::text_box::round_to_i32;
 
 /// 选框描边宽度（像素，96 DPI 下）。
 const OUTLINE_WIDTH: u32 = 2;
@@ -232,6 +233,7 @@ impl Renderer {
 
         let round_stroke = self.round_stroke_style()?;
         let flat_stroke = self.flat_stroke_style()?;
+        let dash_stroke = self.dash_stroke_style()?;
 
         let px = |v: u32| to_f32(i64::from(layout::scaled(v, dpi)));
         let fonts = Fonts {
@@ -286,6 +288,7 @@ impl Renderer {
             brushes,
             round_stroke,
             flat_stroke,
+            dash_stroke,
             layer: RefCell::new(None),
             fonts,
             dwrite: self.dwrite.clone(),
@@ -402,6 +405,16 @@ impl Renderer {
         drawn?;
         ended?;
         read_back(&wic_bitmap, width, height)
+    }
+
+    /// 虚线线型，文字文本框用。
+    fn dash_stroke_style(&self) -> Result<ID2D1StrokeStyle, OverlayError> {
+        let props = D2D1_STROKE_STYLE_PROPERTIES {
+            dashStyle: D2D1_DASH_STYLE_DASH,
+            ..Default::default()
+        };
+        // SAFETY: props 已完整填写，使用预置虚线样式。
+        unsafe { self.factory.CreateStrokeStyle(&props, None) }.map_err(win32("CreateStrokeStyle"))
     }
 
     /// 方头线型，荧光笔用；端点为方形，转角仍然圆滑。
@@ -601,6 +614,8 @@ pub struct TargetResources {
     brushes: Brushes,
     round_stroke: ID2D1StrokeStyle,
     flat_stroke: ID2D1StrokeStyle,
+    /// 文本框的虚线线型。
+    dash_stroke: ID2D1StrokeStyle,
     /// 已完成标注的缓存层，只在新增、撤销、重做时重建。
     layer: RefCell<Option<LayerCache>>,
     fonts: Fonts,
@@ -719,6 +734,9 @@ impl TargetResources {
         }
         if let Some(editor) = &view.editor {
             self.draw_editor(editor, surface);
+        }
+        if let Some(text_box) = &view.text_box {
+            self.draw_text_box(text_box, surface);
         }
         if let Some(r) = view.label {
             self.draw_label(&r, surface);
@@ -1345,25 +1363,30 @@ impl TargetResources {
             }
             self.chip_text(if *background { "底" } else { "字" }, &r);
         }
+        for (vertical, cell) in &strip.orientation {
+            let r = local_rect(cell, origin);
+            if style.vertical == Some(*vertical) {
+                self.rounded(&r, &self.brushes.active);
+            } else if hovered == Some(Hit::Vertical(*vertical)) {
+                self.rounded(&r, &self.brushes.hover);
+            }
+            self.chip_text(if *vertical { "竖" } else { "横" }, &r);
+        }
     }
 
-    /// 编辑中的文本框：文字（组字串带下划线）、边框与闪烁的光标。
+    /// 编辑中的文字：文字（组字串带下划线）和闪烁的光标，整体绕文本框中心旋转。
     fn draw_editor(&self, editor: &EditorView, surface: &Surface<'_>) {
         let edit = &editor.edit;
         let frames = [FrameRef {
             bounds: surface.monitor(),
             bgra: surface.bgra,
         }];
-        let painter = Painter {
-            target: &self.target,
-            factory: &self.factory,
-            dwrite: &self.dwrite,
-            round_stroke: &self.round_stroke,
-            flat_stroke: &self.flat_stroke,
-            frames: &frames,
-        };
+        let painter = self.plain_painter(&frames);
         let block = TextBlock {
-            origin: edit.origin,
+            bounds: edit.bounds,
+            rotation: edit.rotation,
+            wrap: edit.wrap,
+            vertical: edit.style.vertical,
             text: &edit.text,
             size: edit.style.size,
             color: edit.style.color,
@@ -1386,40 +1409,157 @@ impl TargetResources {
                     .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
             }
         }
-        let frame = local_rect(&edit.bounds, surface.origin);
-        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
-        unsafe {
-            self.target
-                .DrawRectangle(&frame, &self.brushes.accent, 1.0, None);
-        }
         if !editor.caret_visible {
             return;
         }
+        let spec = TextLayout {
+            wrap: edit.wrap,
+            vertical: edit.style.vertical,
+        };
         let measure = DWriteMeasure::from_factory(self.dwrite.clone());
-        let (cx, cy, height) = measure.caret(&edit.text, edit.style.size, edit.caret);
+        let (cx, cy, thickness) = measure.caret(&edit.text, edit.style.size, spec, edit.caret);
         let pad = to_f32(i64::from(text_padding(
             edit.style.size,
             edit.style.background,
         )));
+        let frame = local_rect(&edit.bounds, surface.origin);
         let x = frame.left + pad + to_f32(i64::from(cx));
         let y = frame.top + pad + to_f32(i64::from(cy));
-        let line = D2D_RECT_F {
-            left: x,
-            top: y,
-            right: x + 1.0,
-            bottom: y + to_f32(i64::from(height)),
+        let length = to_f32(i64::from(thickness));
+        // 横排是竖线，竖排是横线
+        let line = if edit.style.vertical {
+            D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + length,
+                bottom: y + 2.0,
+            }
+        } else {
+            D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + 1.0,
+                bottom: y + length,
+            }
         };
         let shadow = D2D_RECT_F {
-            left: x - 1.0,
-            right: x + 2.0,
-            ..line
+            left: line.left - 1.0,
+            top: line.top - 1.0,
+            right: line.right + 1.0,
+            bottom: line.bottom + 1.0,
         };
+        painter.set_rotation(
+            (
+                (frame.left + frame.right) / 2.0,
+                (frame.top + frame.bottom) / 2.0,
+            ),
+            edit.rotation,
+        );
         // 先垫一层半透明深色，白色光标在浅色底上也看得清
         // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
         unsafe {
             self.brushes.swatch.SetColor(&color(0.0, 0.0, 0.0, 0.5));
             self.target.FillRectangle(&shadow, &self.brushes.swatch);
             self.target.FillRectangle(&line, &self.brushes.white);
+        }
+        painter.reset_transform();
+    }
+
+    /// 没有冻结帧可取的绘制器，画文字和光标用。
+    fn plain_painter<'a>(&'a self, frames: &'a [FrameRef<'a>]) -> Painter<'a> {
+        Painter {
+            target: &self.target,
+            factory: &self.factory,
+            dwrite: &self.dwrite,
+            round_stroke: &self.round_stroke,
+            flat_stroke: &self.flat_stroke,
+            frames,
+        }
+    }
+
+    /// 选中或编辑中的文字文本框：随文字旋转的虚线框和手柄；只画在屏幕上，不进入成图。
+    fn draw_text_box(&self, view: &TextBoxView, surface: &Surface<'_>) {
+        let geometry = &view.geometry;
+        let origin = surface.origin;
+        let at = |p: (f64, f64)| {
+            let (x, y) = (round_to_i32(p.0) - origin.x, round_to_i32(p.1) - origin.y);
+            float_point(to_f32(i64::from(x)), to_f32(i64::from(y)))
+        };
+        let corners = geometry.corners();
+        // 先画一圈半透明深色，再画白色虚线，任何底色上都看得见
+        for (width, brush, stroke) in [
+            (3.0, &self.brushes.swatch, &self.round_stroke),
+            (1.0, &self.brushes.white, &self.dash_stroke),
+        ] {
+            if width > 1.5 {
+                // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+                unsafe { self.brushes.swatch.SetColor(&color(0.0, 0.0, 0.0, 0.45)) };
+            }
+            for (a, b) in corners.iter().zip(corners.iter().cycle().skip(1)) {
+                // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
+                unsafe {
+                    self.target
+                        .DrawLine(at(*a).point, at(*b).point, brush, width, stroke);
+                }
+            }
+        }
+        let dpi_scale = |v: u32| self.px(v);
+        let dot = dpi_scale(5);
+        let rotate_distance = f64::from(layout::text_rotate_distance(self.dpi));
+        let stem_from = geometry.to_screen(if geometry.vertical {
+            (f64::from(geometry.bounds.width) / 2.0, 0.0)
+        } else {
+            (0.0, -f64::from(geometry.bounds.height) / 2.0)
+        });
+        let rotate_at = geometry.rotate_handle(rotate_distance);
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
+        unsafe {
+            self.target.DrawLine(
+                at(stem_from).point,
+                at(rotate_at).point,
+                &self.brushes.white,
+                1.0,
+                None,
+            );
+        }
+        let mut marks: Vec<(f32, (f64, f64))> =
+            geometry.corners().into_iter().map(|p| (dot, p)).collect();
+        marks.push((dpi_scale(6), rotate_at));
+        for (radius, point) in marks {
+            let mut circle = at(point);
+            circle.radiusX = radius;
+            circle.radiusY = radius;
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，椭圆为局部变量，画刷有效。
+            unsafe {
+                self.target.FillEllipse(&circle, &self.brushes.white);
+                self.target
+                    .DrawEllipse(&circle, &self.brushes.accent, 1.5, None);
+            }
+        }
+        // 换行边手柄是沿边方向的短条，随框旋转
+        let painter = self.plain_painter(&[]);
+        let (along, across) = (dpi_scale(14), dpi_scale(4));
+        for (_, point) in geometry.edge_handles() {
+            let center = at(point).point;
+            let (half_w, half_h) = if geometry.vertical {
+                (along / 2.0, across / 2.0)
+            } else {
+                (across / 2.0, along / 2.0)
+            };
+            let bar = D2D_RECT_F {
+                left: center.X - half_w,
+                top: center.Y - half_h,
+                right: center.X + half_w,
+                bottom: center.Y + half_h,
+            };
+            painter.set_rotation((center.X, center.Y), geometry.rotation);
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+            unsafe {
+                self.target.FillRectangle(&bar, &self.brushes.white);
+                self.target
+                    .DrawRectangle(&bar, &self.brushes.accent, 1.5, None);
+            }
+            painter.reset_transform();
         }
     }
 
@@ -2383,7 +2523,7 @@ mod tests {
     fn text_shape(text: &str, size: u32, background: bool) -> Shape {
         let measure = DWriteMeasure::new().expect("度量");
         let pad = crate::annotate::text_padding(size, background);
-        let (w, h) = measure.measure(text, size);
+        let (w, h) = measure.measure(text, size, TextLayout::default());
         Shape::Text {
             origin: Point::new(20, 20),
             text: text.to_string(),
@@ -2391,6 +2531,9 @@ mod tests {
             size,
             background,
             bounds: Rect::new(20, 20, w + pad * 2, h + pad * 2),
+            rotation: 0,
+            wrap: None,
+            vertical: false,
         }
     }
 
@@ -2512,43 +2655,296 @@ mod tests {
     #[test]
     fn dwrite_measure_orders_widths_and_heights() {
         let m = DWriteMeasure::new().expect("度量");
-        let (w_a, h_a) = m.measure("a", 24);
-        let (w_ab, _) = m.measure("ab", 24);
+        let (w_a, h_a) = m.measure("a", 24, TextLayout::default());
+        let (w_ab, _) = m.measure("ab", 24, TextLayout::default());
         assert!(w_ab > w_a && w_a > 0 && h_a > 0);
-        let (w_cn, _) = m.measure("中文", 24);
+        let (w_cn, _) = m.measure("中文", 24, TextLayout::default());
         assert!(w_cn > w_ab);
-        let (_, h_two) = m.measure("a\nb", 24);
+        let (_, h_two) = m.measure("a\nb", 24, TextLayout::default());
         assert!(h_two >= h_a * 2 - 2, "{h_two} vs {h_a}");
-        let (w_big, h_big) = m.measure("a", 48);
+        let (w_big, h_big) = m.measure("a", 48, TextLayout::default());
         assert!(w_big > w_a && h_big > h_a);
         // 空文字：宽 0、高为一行
-        let (w_empty, h_empty) = m.measure("", 24);
+        let (w_empty, h_empty) = m.measure("", 24, TextLayout::default());
         assert_eq!(w_empty, 0);
         assert!(h_empty > 0);
         // 末尾换行多出一行
-        assert!(m.measure("a\n", 24).1 > h_a);
+        assert!(m.measure("a\n", 24, TextLayout::default()).1 > h_a);
     }
 
     #[test]
     fn dwrite_caret_moves_with_index_lines_and_surrogates() {
         let m = DWriteMeasure::new().expect("度量");
-        let (x0, y0, h) = m.caret("ab", 24, 0);
-        let (x2, y2, _) = m.caret("ab", 24, 2);
+        let (x0, y0, h) = m.caret("ab", 24, TextLayout::default(), 0);
+        let (x2, y2, _) = m.caret("ab", 24, TextLayout::default(), 2);
         assert_eq!((x0, y0), (0, 0));
         assert!(x2 > x0 && y2 == y0 && h > 0);
-        let (xl, yl, _) = m.caret("ab\nc", 24, 3);
+        let (xl, yl, _) = m.caret("ab\nc", 24, TextLayout::default(), 3);
         assert_eq!(xl, 0);
         assert!(yl >= i32::try_from(h).expect("小") - 2);
         // 代理对按一个字符计：光标在表情之后、a 之前
-        let (xe, _, _) = m.caret("😀a", 24, 1);
-        let (xa, _, _) = m.caret("😀a", 24, 2);
+        let (xe, _, _) = m.caret("😀a", 24, TextLayout::default(), 1);
+        let (xa, _, _) = m.caret("😀a", 24, TextLayout::default(), 2);
         assert!(xe > 0 && xa > xe);
         // 空文字也有行高，光标在行首
-        let (xz, yz, hz) = m.caret("", 24, 0);
+        let (xz, yz, hz) = m.caret("", 24, TextLayout::default(), 0);
         assert_eq!((xz, yz), (0, 0));
         assert!(hz > 0);
         // 序号越界时取末尾而不是失败
-        let (xo, _, _) = m.caret("ab", 24, 99);
+        let (xo, _, _) = m.caret("ab", 24, TextLayout::default(), 99);
         assert_eq!(xo, x2);
+    }
+
+    // 旋转、竖排、换行：真实 DirectWrite 排版与离屏合成。
+
+    fn shape_with(
+        text: &str,
+        size: u32,
+        background: bool,
+        rotation: i32,
+        layout: TextLayout,
+    ) -> Shape {
+        let measure = DWriteMeasure::new().expect("度量");
+        let pad = crate::annotate::text_padding(size, background);
+        let (mut w, mut h) = measure.measure(text, size, layout);
+        match (layout.vertical, layout.wrap) {
+            (false, Some(l)) => w = l,
+            (true, Some(l)) => h = l,
+            _ => {}
+        }
+        Shape::Text {
+            origin: Point::new(60, 30),
+            text: text.to_string(),
+            color: RED,
+            size,
+            background,
+            bounds: Rect::new(60, 30, w + pad * 2, h + pad * 2),
+            rotation,
+            wrap: layout.wrap,
+            vertical: layout.vertical,
+        }
+    }
+
+    fn bounds_of(shape: &Shape) -> Rect {
+        match shape {
+            Shape::Text { bounds, .. } => *bounds,
+            _ => panic!("期望文字图元"),
+        }
+    }
+
+    /// 红色像素的外接框（左, 上, 右, 下）。
+    fn red_extent(image: &CroppedImage) -> Option<(u32, u32, u32, u32)> {
+        let pixels = reddish_pixels(image);
+        let xs = pixels.iter().map(|p| p.0);
+        let ys = pixels.iter().map(|p| p.1);
+        Some((xs.clone().min()?, ys.clone().min()?, xs.max()?, ys.max()?))
+    }
+
+    const FLAT: TextLayout = TextLayout {
+        wrap: None,
+        vertical: false,
+    };
+    const COLUMNS: TextLayout = TextLayout {
+        wrap: None,
+        vertical: true,
+    };
+
+    #[test]
+    fn rotation_turns_the_text_about_the_box_center() {
+        let flat = shape_with("HHHH", 32, false, 0, FLAT);
+        let turned = shape_with("HHHH", 32, false, 90, FLAT);
+        let b = bounds_of(&flat);
+        let (cx, cy) = (
+            f64::from(b.x) + f64::from(b.width) / 2.0,
+            f64::from(b.y) + f64::from(b.height) / 2.0,
+        );
+        let before = red_extent(&compose_big(&[flat])).expect("红色像素");
+        let after = red_extent(&compose_big(&[turned])).expect("红色像素");
+        assert!(before.2 - before.0 > before.3 - before.1, "未旋转时偏宽");
+        assert!(after.2 - after.0 < after.3 - after.1, "旋转 90° 后偏高");
+        let center = |e: (u32, u32, u32, u32)| {
+            (
+                f64::from(e.0 + e.2) / 2.0 - cx,
+                f64::from(e.1 + e.3) / 2.0 - cy,
+            )
+        };
+        let (dx, dy) = center(after);
+        assert!(dx.abs() < 10.0 && dy.abs() < 10.0, "{dx} {dy}");
+    }
+
+    #[test]
+    fn rotation_applies_to_the_background_chip_too() {
+        let shape = shape_with("HHHHH", 24, true, 90, FLAT);
+        let b = bounds_of(&shape);
+        assert!(b.width > b.height);
+        let image = compose_big(&[shape]);
+        let at = |x: i32, y: i32| {
+            pixel(
+                &image,
+                u32::try_from(x).expect("小"),
+                u32::try_from(y).expect("小"),
+            )
+        };
+        let mid_y = b.y + i32::try_from(b.height / 2).expect("小");
+        let center_x = b.x + i32::try_from(b.width / 2).expect("小");
+        // 原来框左端中间的位置，旋转后已不在底色块内
+        assert_eq!(at(b.x + 2, mid_y), (200, 200, 200, 255));
+        // 中心仍在底色块内
+        assert!(
+            near(at(center_x, mid_y).0, 247, 20),
+            "{:?}",
+            at(center_x, mid_y)
+        );
+        // 旋转后的块上下伸出原框
+        let top = at(center_x, b.y - 8);
+        assert!(top.1 < 150, "{top:?}");
+    }
+
+    #[test]
+    fn huge_font_sizes_degrade_instead_of_crashing() {
+        let m = DWriteMeasure::new().expect("度量");
+        for size in [2160, 8640, 16_384] {
+            let (w, h) = m.measure("HH", size, FLAT);
+            assert!(w > 0 && h > 0, "{size}: {w}×{h}");
+            let (w, h) = m.measure("HH", size, COLUMNS);
+            assert!(w > 0 && h > 0, "{size}: {w}×{h}");
+            let _ = m.caret("HH", size, FLAT, 1);
+        }
+        // 超大字号合成不崩溃：成功时尺寸正确，失败时返回错误
+        let shape = shape_with("HH", 8640, false, 30, FLAT);
+        let renderer = Renderer::new().expect("创建渲染器");
+        let bgra = big_grey();
+        let frame = FrameRef {
+            bounds: BIG,
+            bgra: &bgra,
+        };
+        if let Ok(image) = renderer.compose(frame, &BIG, &[shape]) {
+            assert_eq!((image.width(), image.height()), (BIG.width, BIG.height));
+        }
+    }
+
+    #[test]
+    fn dwrite_vertical_layout_is_taller_than_wide_and_stacks_columns() {
+        let m = DWriteMeasure::new().expect("度量");
+        let (w1, h1) = m.measure("中文中文", 24, COLUMNS);
+        assert!(h1 > w1, "{w1}×{h1}");
+        assert!(h1 >= 4 * 24 - 8, "{h1}");
+        let (w2, h2) = m.measure("中文\n中文", 24, COLUMNS);
+        let (w_one, _) = m.measure("中文", 24, COLUMNS);
+        assert!(
+            w2 >= w_one * 2 - 2 && w2 <= w_one * 2 + 2,
+            "{w2} vs {w_one}"
+        );
+        assert!(h2 <= h1);
+        // 空文字：沿列方向长度为 0，列宽为一行
+        let (w0, h0) = m.measure("", 24, COLUMNS);
+        assert_eq!(h0, 0);
+        assert!(w0 > 0);
+    }
+
+    #[test]
+    fn dwrite_vertical_caret_walks_down_a_column_and_left_across_columns() {
+        let m = DWriteMeasure::new().expect("度量");
+        let first = m.caret("中文\n中文", 24, COLUMNS, 0);
+        let second = m.caret("中文\n中文", 24, COLUMNS, 1);
+        let next_column = m.caret("中文\n中文", 24, COLUMNS, 3);
+        assert_eq!(first.0, second.0);
+        assert!(second.1 > first.1);
+        assert!(next_column.0 < first.0, "第二列在第一列左边");
+        assert!(first.2 > 0, "竖排光标的厚度是列宽");
+    }
+
+    #[test]
+    fn vertical_text_is_drawn_inside_its_box() {
+        let shape = shape_with("中文中文", 32, false, 0, COLUMNS);
+        let b = bounds_of(&shape);
+        let extent = red_extent(&compose_big(&[shape])).expect("红色像素");
+        assert!(extent.3 - extent.1 > extent.2 - extent.0);
+        let right = u32::try_from(b.right()).expect("小") + 2;
+        let bottom = u32::try_from(b.bottom()).expect("小") + 2;
+        assert!(extent.0 + 2 >= u32::try_from(b.x).expect("小"));
+        assert!(
+            extent.2 <= right && extent.3 <= bottom,
+            "{extent:?} 超出 {b:?}"
+        );
+    }
+
+    #[test]
+    fn vertical_columns_run_right_to_left() {
+        // 第一列 "H" 在右，第二列 "I" 在左：分别画出来比较红色像素的水平位置
+        let both = compose_big(&[shape_with("H\nI", 32, false, 0, COLUMNS)]);
+        let only_first = compose_big(&[shape_with("H\n", 32, false, 0, COLUMNS)]);
+        let (l_both, _, r_both, _) = red_extent(&both).expect("红色像素");
+        let (l_first, _, r_first, _) = red_extent(&only_first).expect("红色像素");
+        // 加上第二列后整体向左伸展，第一列留在右侧
+        assert!(l_both < l_first, "{l_both} {l_first}");
+        assert!(r_both + 6 >= r_first && r_first + 40 > r_both);
+    }
+
+    #[test]
+    fn wrapping_limits_the_width_and_adds_lines() {
+        let m = DWriteMeasure::new().expect("度量");
+        let wrapped = TextLayout {
+            wrap: Some(60),
+            vertical: false,
+        };
+        let (w_flat, h_flat) = m.measure("abcdefghijkl", 24, FLAT);
+        let (w_wrap, h_wrap) = m.measure("abcdefghijkl", 24, wrapped);
+        assert!(w_flat > 60);
+        assert!(w_wrap <= 60, "{w_wrap}");
+        assert!(h_wrap > h_flat);
+        // 竖排换行限制的是列高
+        let tall = TextLayout {
+            wrap: Some(60),
+            vertical: true,
+        };
+        let (_, h_tall) = m.measure("中文中文中文", 24, tall);
+        assert!(h_tall <= 60, "{h_tall}");
+        let (w_tall, _) = m.measure("中文中文中文", 24, tall);
+        let (w_one, _) = m.measure("中文中文中文", 24, COLUMNS);
+        assert!(w_tall > w_one);
+    }
+
+    #[test]
+    fn wrapped_text_is_drawn_inside_the_forced_width() {
+        let layout = TextLayout {
+            wrap: Some(70),
+            vertical: false,
+        };
+        let shape = shape_with("abcdefghijklmnop", 24, false, 0, layout);
+        let b = bounds_of(&shape);
+        assert_eq!(b.width, 70);
+        let extent = red_extent(&compose_big(&[shape])).expect("红色像素");
+        assert!(extent.2 <= u32::try_from(b.right()).expect("小") + 1);
+        assert!(extent.3 > extent.1 + 24, "应排成多行");
+    }
+
+    #[test]
+    fn step_block_moves_between_visual_lines_and_columns() {
+        let m = DWriteMeasure::new().expect("度量");
+        let wrapped = TextLayout {
+            wrap: Some(60),
+            vertical: false,
+        };
+        let text = "abcdefghijkl";
+        let down = m.step_block(text, 24, wrapped, 0, true).expect("下一行");
+        assert!(down > 0 && down < text.chars().count());
+        assert_eq!(m.step_block(text, 24, wrapped, 0, false), None);
+        let up = m
+            .step_block(text, 24, wrapped, down, false)
+            .expect("上一行");
+        assert!(up < down);
+        // 不换行的单行文字没有上下行
+        assert_eq!(m.step_block("abc", 24, FLAT, 1, true), None);
+        // 竖排：向前（左）一列
+        let next = m
+            .step_block("中文\n中文", 24, COLUMNS, 0, true)
+            .expect("下一列");
+        assert!((3..=4).contains(&next), "{next}");
+        let back = m
+            .step_block("中文\n中文", 24, COLUMNS, 3, false)
+            .expect("上一列");
+        assert!(back <= 1, "{back}");
+        assert_eq!(m.step_block("中文\n中文", 24, COLUMNS, 0, false), None);
     }
 }

@@ -110,6 +110,11 @@ impl TextBuffer {
         self.cursor
     }
 
+    /// 把光标放到 `index`，超出末尾时放到末尾。
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor = index.min(self.chars.len());
+    }
+
     /// 光标前的文字。
     pub fn before_cursor(&self) -> String {
         self.chars.iter().take(self.cursor).collect()
@@ -449,6 +454,17 @@ mod tests {
         let b = TextBuffer::from_text("a\u{7}b\nc");
         assert_eq!(b.text(), "ab\nc");
         assert_eq!(b.cursor(), 4);
+    }
+
+    #[test]
+    fn set_cursor_clamps_to_the_end() {
+        let mut b = TextBuffer::from_text("abc");
+        b.set_cursor(1);
+        assert_eq!(b.cursor(), 1);
+        b.set_cursor(99);
+        assert_eq!(b.cursor(), 3);
+        b.set_cursor(0);
+        assert_eq!(b.cursor(), 0);
     }
 
     #[test]

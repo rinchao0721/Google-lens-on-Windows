@@ -33,7 +33,7 @@ pub const MOSAIC_BLOCK_RANGE: RangeInclusive<u32> = 4..=64;
 pub const NUMBER_SIZE_RANGE: RangeInclusive<u32> = 16..=96;
 
 /// 文字字号（像素）的合法范围。
-pub const TEXT_SIZE_RANGE: RangeInclusive<u32> = 12..=96;
+pub const TEXT_SIZE_RANGE: RangeInclusive<u32> = 12..=16_384;
 
 /// 搜索引擎模板中图片地址的占位符。
 pub const URL_PLACEHOLDER: &str = "{url}";
@@ -561,6 +561,8 @@ pub struct TextConfig {
     pub size: u32,
     /// 是否带底色。
     pub background: bool,
+    /// 是否竖排。
+    pub vertical: bool,
 }
 
 impl Default for TextConfig {
@@ -569,6 +571,7 @@ impl Default for TextConfig {
             color: DEFAULT_RED.to_string(),
             size: 24,
             background: false,
+            vertical: false,
         }
     }
 }
@@ -856,6 +859,7 @@ auto_check = 1
         config.annotate.number.style = NumberStyle::Letter;
         config.annotate.text.size = 40;
         config.annotate.text.background = true;
+        config.annotate.text.vertical = true;
         config.annotate.text.color = "#34C759".to_string();
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
         config.privacy.lens_acknowledged = true;
@@ -882,6 +886,7 @@ auto_check = 1
         assert_eq!(a.text.color, "#FF3B30");
         assert_eq!(a.text.size, 24);
         assert!(!a.text.background);
+        assert!(!a.text.vertical);
         assert_eq!(validate(&Config::default()), Ok(()));
     }
 
@@ -931,7 +936,7 @@ auto_check = 1
             ("[annotate.number]\nsize = 15\n", "annotate.number.size"),
             ("[annotate.number]\nsize = 97\n", "annotate.number.size"),
             ("[annotate.text]\nsize = 11\n", "annotate.text.size"),
-            ("[annotate.text]\nsize = 97\n", "annotate.text.size"),
+            ("[annotate.text]\nsize = 16385\n", "annotate.text.size"),
         ];
         for (text, field) in cases {
             match Config::from_toml_str(text) {
@@ -951,7 +956,8 @@ auto_check = 1
             "[annotate.number]\nsize = 16\n",
             "[annotate.number]\nsize = 96\n",
             "[annotate.text]\nsize = 12\n",
-            "[annotate.text]\nsize = 96\n",
+            "[annotate.text]\nsize = 16384\n",
+            "[annotate.text]\nsize = 1000\n",
         ] {
             assert!(Config::from_toml_str(text).is_ok(), "{text}");
         }
@@ -963,6 +969,9 @@ auto_check = 1
         assert!(config.annotate.text.background);
         assert_eq!(config.annotate.text.size, 24);
         assert!(Config::from_toml_str("[annotate.text]\nbackground = 1\n").is_err());
+        let vertical = Config::from_toml_str("[annotate.text]\nvertical = true\n").expect("解析");
+        assert!(vertical.annotate.text.vertical && !vertical.annotate.text.background);
+        assert!(Config::from_toml_str("[annotate.text]\nvertical = \"yes\"\n").is_err());
         assert!(Config::from_toml_str("[annotate.text]\nweight = 1\n").is_err());
         assert!(Config::from_toml_str("[annotate.text]\ncolor = \"red\"\n").is_err());
     }

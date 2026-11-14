@@ -7,29 +7,32 @@ use lenswin_core::annotation::{
     number_label,
 };
 use lenswin_core::geometry::{Point, Rect};
-use lenswin_core::text_edit::utf16_offset_of_char;
+use lenswin_core::text_box::round_to_i32;
+use lenswin_core::text_edit::{char_index_of_utf16, utf16_offset_of_char};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_QUADRATIC_BEZIER_SEGMENT,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    ID2D1Brush, ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle,
+    D2D1_BITMAP_PROPERTIES, D2D1_BRUSH_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Brush, ID2D1Factory, ID2D1PathGeometry,
+    ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_HIT_TEST_METRICS, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_READING_DIRECTION_TOP_TO_BOTTOM, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::core::w;
+use windows::core::{BOOL, w};
 
-use crate::annotate::{ApproxMeasure, TextMeasure, text_padding};
+use crate::annotate::{ApproxMeasure, TextLayout, TextMeasure, text_padding};
 use crate::error::{OverlayError, win32};
 use crate::render::{color, f32_to_u16, float_point, to_f32};
 use crate::stroke::{self, PointF, Segment};
@@ -88,8 +91,14 @@ fn box_rect(from: Point, to: Point, origin: Point) -> D2D_RECT_F {
 
 /// 一段要绘制的文字：位置、内容与外观。
 pub(crate) struct TextBlock<'a> {
-    /// 文本框左上角（虚拟桌面坐标），底色模式下含内边距。
-    pub origin: Point,
+    /// 未旋转的本地框（虚拟桌面坐标），底色模式下含内边距；旋转中心是框中心。
+    pub bounds: Rect,
+    /// 顺时针旋转角度（度）。
+    pub rotation: i32,
+    /// 换行长度。
+    pub wrap: Option<u32>,
+    /// 竖排：列从右往左排。
+    pub vertical: bool,
     /// 内容。
     pub text: &'a str,
     /// 字号。
@@ -102,11 +111,16 @@ pub(crate) struct TextBlock<'a> {
     pub underline: Option<(usize, usize)>,
 }
 
-/// 按字号建立不自动换行的文字排版。
+/// 按字号和排版参数建立文字排版。
+///
+/// 竖排用自上而下的阅读方向加自右向左的流向；`width_hint` 是竖排时排版区域的宽度，
+/// 列从这个宽度的右缘起排，不给时取一个足够大的值。
 pub(crate) fn text_layout(
     dwrite: &IDWriteFactory,
     text: &str,
     size: u32,
+    spec: TextLayout,
+    width_hint: Option<u32>,
 ) -> Result<IDWriteTextLayout, OverlayError> {
     // SAFETY: 字体名与区域名为静态字符串；字体不存在时 DirectWrite 自动回退。
     let format = unsafe {
@@ -121,26 +135,53 @@ pub(crate) fn text_layout(
         )
     }
     .map_err(win32("CreateTextFormat"))?;
+    let wrapping = if spec.wrap.is_some() {
+        DWRITE_WORD_WRAPPING_WRAP
+    } else {
+        DWRITE_WORD_WRAPPING_NO_WRAP
+    };
     // SAFETY: format 刚刚创建，参数为合法枚举值。
-    unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) }
-        .map_err(win32("SetWordWrapping"))?;
+    unsafe { format.SetWordWrapping(wrapping) }.map_err(win32("SetWordWrapping"))?;
+    if spec.vertical {
+        // SAFETY: 同上。
+        unsafe { format.SetReadingDirection(DWRITE_READING_DIRECTION_TOP_TO_BOTTOM) }
+            .map_err(win32("SetReadingDirection"))?;
+        // SAFETY: 同上。
+        unsafe { format.SetFlowDirection(DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT) }
+            .map_err(win32("SetFlowDirection"))?;
+    }
+    let limit = |v: Option<u32>| v.map_or(TEXT_LAYOUT_LIMIT, |v| to_f32(i64::from(v)));
+    let (max_width, max_height) = if spec.vertical {
+        (limit(width_hint), limit(spec.wrap))
+    } else {
+        (limit(spec.wrap), TEXT_LAYOUT_LIMIT)
+    };
     let wide: Vec<u16> = text.encode_utf16().collect();
     // SAFETY: wide 与 format 在调用期间有效。
-    unsafe { dwrite.CreateTextLayout(&wide, &format, TEXT_LAYOUT_LIMIT, TEXT_LAYOUT_LIMIT) }
+    unsafe { dwrite.CreateTextLayout(&wide, &format, max_width, max_height) }
         .map_err(win32("CreateTextLayout"))
 }
 
-/// 排版后的（宽, 高）；空文字高度按一行算。
-fn layout_size(layout: &IDWriteTextLayout) -> Result<(f32, f32), OverlayError> {
+/// 排版后文字区域的（左, 上, 宽, 高）；竖排时区域靠排版宽度的右缘，所以左边不一定是 0。
+fn layout_extent(layout: &IDWriteTextLayout) -> Result<(f32, f32, f32, f32), OverlayError> {
     let mut metrics = DWRITE_TEXT_METRICS::default();
     // SAFETY: metrics 是有效的输出位置。
     unsafe { layout.GetMetrics(&mut metrics) }.map_err(win32("GetMetrics"))?;
-    Ok((metrics.widthIncludingTrailingWhitespace, metrics.height))
+    Ok((
+        metrics.left,
+        metrics.top,
+        metrics.widthIncludingTrailingWhitespace,
+        metrics.height,
+    ))
 }
 
 /// 基于 DirectWrite 的文字度量，屏幕绘制与成图共用同一套排版，保证命中范围与所见一致。
 pub(crate) struct DWriteMeasure {
     dwrite: IDWriteFactory,
+}
+
+fn px(value: f32) -> u32 {
+    u32::from(f32_to_u16(value.max(0.0).ceil()))
 }
 
 impl DWriteMeasure {
@@ -157,50 +198,140 @@ impl DWriteMeasure {
         Self { dwrite }
     }
 
-    fn try_measure(&self, text: &str, size: u32) -> Result<(u32, u32), OverlayError> {
-        // 空文字量不出行高，用一个空格代替，宽度仍按 0 算
-        let probe = if text.is_empty() { " " } else { text };
-        let (w, h) = layout_size(&text_layout(&self.dwrite, probe, size)?)?;
-        let width = if text.is_empty() { 0.0 } else { w };
-        Ok((
-            u32::from(f32_to_u16(width.max(0.0).ceil())),
-            u32::from(f32_to_u16(h.max(0.0).ceil())),
-        ))
-    }
-
-    fn try_caret(
+    fn try_measure(
         &self,
         text: &str,
         size: u32,
+        spec: TextLayout,
+    ) -> Result<(u32, u32), OverlayError> {
+        // 空文字量不出行高，用一个空格代替，沿行方向的长度仍按 0 算
+        let probe = if text.is_empty() { " " } else { text };
+        let layout = text_layout(&self.dwrite, probe, size, spec, None)?;
+        let (_, _, w, h) = layout_extent(&layout)?;
+        let (w, h) = match (text.is_empty(), spec.vertical) {
+            (true, false) => (0.0, h),
+            (true, true) => (w, 0.0),
+            (false, _) => (w, h),
+        };
+        Ok((px(w), px(h)))
+    }
+
+    /// 光标处字符的（左, 上, 宽, 高），排版坐标，未减去文字区域的偏移。
+    /// 竖排自右向左流动时系统返回的是字符框的右缘，这里换成左缘。
+    fn hit_position(
+        layout: &IDWriteTextLayout,
+        text: &str,
         char_index: usize,
-    ) -> Result<(i32, i32, u32), OverlayError> {
-        let layout = text_layout(&self.dwrite, text, size)?;
+        vertical: bool,
+    ) -> Result<(f32, f32, f32, f32), OverlayError> {
         let position = u32::try_from(utf16_offset_of_char(text, char_index)).unwrap_or(u32::MAX);
         let (mut x, mut y) = (0.0f32, 0.0f32);
         let mut metrics = DWRITE_HIT_TEST_METRICS::default();
         // SAFETY: 三个输出参数都指向有效的局部变量。
         unsafe { layout.HitTestTextPosition(position, false, &mut x, &mut y, &mut metrics) }
             .map_err(win32("HitTestTextPosition"))?;
-        let height = u32::from(f32_to_u16(metrics.height.max(0.0).ceil()));
+        let left = if vertical { x - metrics.width } else { x };
+        Ok((left, y, metrics.width, metrics.height))
+    }
+
+    fn try_caret(
+        &self,
+        text: &str,
+        size: u32,
+        spec: TextLayout,
+        char_index: usize,
+    ) -> Result<(i32, i32, u32), OverlayError> {
+        let layout = text_layout(&self.dwrite, text, size, spec, None)?;
+        let (left, top, _, _) = layout_extent(&layout)?;
+        let (x, y, w, h) = Self::hit_position(&layout, text, char_index, spec.vertical)?;
+        let thickness = if spec.vertical { w } else { h };
         Ok((
-            i32::from(f32_to_u16(x.max(0.0).round())),
-            i32::from(f32_to_u16(y.max(0.0).round())),
-            height,
+            round_to_i32(f64::from(x - left)),
+            round_to_i32(f64::from(y - top)),
+            px(thickness),
         ))
+    }
+
+    fn try_step(
+        &self,
+        text: &str,
+        size: u32,
+        spec: TextLayout,
+        char_index: usize,
+        forward: bool,
+    ) -> Result<Option<usize>, OverlayError> {
+        let layout = text_layout(&self.dwrite, text, size, spec, None)?;
+        let (x, y, w, h) = Self::hit_position(&layout, text, char_index, spec.vertical)?;
+        // 取下一行（列）正中的一点：横排向下，竖排向左（列从右往左排）
+        let (tx, ty) = match (spec.vertical, forward) {
+            (false, true) => (x + 1.0, y + h * 1.5),
+            (false, false) => (x + 1.0, y - h * 0.5),
+            (true, true) => (x - w * 0.5, y + 1.0),
+            (true, false) => (x + w * 1.5, y + 1.0),
+        };
+        let (mut trailing, mut inside) = (BOOL::default(), BOOL::default());
+        let mut hit = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: 三个输出参数都指向有效的局部变量。
+        unsafe { layout.HitTestPoint(tx, ty, &mut trailing, &mut inside, &mut hit) }
+            .map_err(win32("HitTestPoint"))?;
+        let unit = hit.textPosition + if trailing.as_bool() { hit.length } else { 0 };
+        let target = char_index_of_utf16(text, usize::try_from(unit).unwrap_or(usize::MAX));
+        // 目标落在同一行（列）说明已经到头
+        let (nx, ny, _, _) = Self::hit_position(&layout, text, target, spec.vertical)?;
+        let moved = if spec.vertical {
+            (nx - x).abs() >= 1.0
+        } else {
+            (ny - y).abs() >= 1.0
+        };
+        Ok((moved && target != char_index).then_some(target))
     }
 }
 
 impl TextMeasure for DWriteMeasure {
-    fn measure(&self, text: &str, size: u32) -> (u32, u32) {
+    fn measure(&self, text: &str, size: u32, layout: TextLayout) -> (u32, u32) {
         // 度量失败时退回近似值，命中范围略有偏差但不影响成图
-        self.try_measure(text, size)
-            .unwrap_or_else(|_| ApproxMeasure.measure(text, size))
+        self.try_measure(text, size, layout)
+            .unwrap_or_else(|_| ApproxMeasure.measure(text, size, layout))
     }
 
-    fn caret(&self, text: &str, size: u32, char_index: usize) -> (i32, i32, u32) {
-        self.try_caret(text, size, char_index)
-            .unwrap_or_else(|_| ApproxMeasure.caret(text, size, char_index))
+    fn caret(
+        &self,
+        text: &str,
+        size: u32,
+        layout: TextLayout,
+        char_index: usize,
+    ) -> (i32, i32, u32) {
+        self.try_caret(text, size, layout, char_index)
+            .unwrap_or_else(|_| ApproxMeasure.caret(text, size, layout, char_index))
     }
+
+    fn step_block(
+        &self,
+        text: &str,
+        size: u32,
+        layout: TextLayout,
+        char_index: usize,
+        forward: bool,
+    ) -> Option<usize> {
+        // 没有排版就当作到头，调用方退回按逻辑行移动
+        self.try_step(text, size, layout, char_index, forward)
+            .ok()
+            .flatten()
+    }
+}
+
+/// 绕 `center` 顺时针旋转 `degrees` 度的变换，目标坐标；用画刷属性结构取得矩阵类型。
+fn rotation_properties(center: (f32, f32), degrees: i32) -> D2D1_BRUSH_PROPERTIES {
+    let radians = f32::from(i16::try_from(degrees.rem_euclid(360)).unwrap_or(0)).to_radians();
+    let (s, c) = radians.sin_cos();
+    let mut props = D2D1_BRUSH_PROPERTIES::default();
+    props.transform.M11 = c;
+    props.transform.M12 = s;
+    props.transform.M21 = -s;
+    props.transform.M22 = c;
+    props.transform.M31 = center.0 - center.0 * c + center.1 * s;
+    props.transform.M32 = center.1 - center.0 * s - center.1 * c;
+    props
 }
 
 fn channel(value: u8) -> f32 {
@@ -308,15 +439,37 @@ impl Painter<'_> {
         .map_err(win32("CreateSolidColorBrush"))
     }
 
+    /// 设置绕 `center`（目标坐标）顺时针旋转 `degrees` 度的变换，画完后要调用 [`Painter::reset_transform`]。
+    pub(crate) fn set_rotation(&self, center: (f32, f32), degrees: i32) {
+        let props = rotation_properties(center, degrees);
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，矩阵为局部变量。
+        unsafe { self.target.SetTransform(&props.transform) };
+    }
+
+    /// 恢复单位变换。
+    pub(crate) fn reset_transform(&self) {
+        let mut props = D2D1_BRUSH_PROPERTIES::default();
+        props.transform.M11 = 1.0;
+        props.transform.M22 = 1.0;
+        // SAFETY: 同 set_rotation。
+        unsafe { self.target.SetTransform(&props.transform) };
+    }
+
     /// 绘制一段文字；底色模式先画 85% 不透明的圆角底色，文字用与序号一致的对比色。
-    /// 调用方负责设置灰度抗锯齿。
+    /// 整块（底色与文字）绕框中心旋转。调用方负责设置灰度抗锯齿。
     pub(crate) fn draw_text_block(
         &self,
         brush: &ID2D1SolidColorBrush,
         block: &TextBlock<'_>,
         origin: Point,
     ) -> Result<(), OverlayError> {
-        let layout = text_layout(self.dwrite, block.text, block.size)?;
+        let spec = TextLayout {
+            wrap: block.wrap,
+            vertical: block.vertical,
+        };
+        let pad_px = text_padding(block.size, block.background);
+        let inner_width = block.bounds.width.saturating_sub(pad_px.saturating_mul(2));
+        let layout = text_layout(self.dwrite, block.text, block.size, spec, Some(inner_width))?;
         if let Some((start, length)) = block.underline {
             let range = DWRITE_TEXT_RANGE {
                 startPosition: u32::try_from(start).unwrap_or(0),
@@ -325,16 +478,20 @@ impl Painter<'_> {
             // SAFETY: layout 刚创建，range 为局部变量。
             unsafe { layout.SetUnderline(true, range) }.map_err(win32("SetUnderline"))?;
         }
-        let (width, height) = layout_size(&layout)?;
-        let pad = to_f32(i64::from(text_padding(block.size, block.background)));
-        let (left, top) = local(block.origin, origin);
+        let pad = to_f32(i64::from(pad_px));
+        let (left, top) = local(Point::new(block.bounds.x, block.bounds.y), origin);
+        let (width, height) = (
+            to_f32(i64::from(block.bounds.width)),
+            to_f32(i64::from(block.bounds.height)),
+        );
+        self.set_rotation((left + width / 2.0, top + height / 2.0), block.rotation);
         let text_color = if block.background {
             let rect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left,
                     top,
-                    right: left + width + pad * 2.0,
-                    bottom: top + height + pad * 2.0,
+                    right: left + width,
+                    bottom: top + height,
                 },
                 radiusX: TEXT_BACKGROUND_RADIUS,
                 radiusY: TEXT_BACKGROUND_RADIUS,
@@ -358,6 +515,7 @@ impl Painter<'_> {
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
         }
+        self.reset_transform();
         Ok(())
     }
 
@@ -446,16 +604,22 @@ impl Painter<'_> {
             )?,
             Shape::Mosaic { from, to, block } => self.draw_mosaic(*from, *to, *block, origin)?,
             Shape::Text {
-                origin: text_origin,
                 text,
                 color: c,
                 size,
                 background,
+                bounds,
+                rotation,
+                wrap,
+                vertical,
                 ..
             } => self.draw_text_block(
                 brush,
                 &TextBlock {
-                    origin: *text_origin,
+                    bounds: *bounds,
+                    rotation: *rotation,
+                    wrap: *wrap,
+                    vertical: *vertical,
                     text,
                     size: *size,
                     color: *c,

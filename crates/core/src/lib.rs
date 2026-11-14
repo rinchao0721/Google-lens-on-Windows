@@ -14,6 +14,7 @@ pub mod lens;
 pub mod monitor;
 pub mod selection;
 pub mod snip;
+pub mod text_box;
 pub mod text_edit;
 pub mod update;
 pub mod url;
