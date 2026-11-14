@@ -47,6 +47,12 @@ impl ActionRegistry {
             .map_err(|e| ActionError::Failed(format!("复制到剪贴板失败：{e}")))
     }
 
+    /// 读取剪贴板里的文本；没有文本时返回 `Ok(None)`。
+    pub fn clipboard_text(&self) -> Result<Option<String>, ActionError> {
+        clipboard::get_text(self.clipboard_owner)
+            .map_err(|e| ActionError::Failed(format!("读取剪贴板失败：{e}")))
+    }
+
     /// 取出指定种类的动作。
     pub fn get(&self, kind: ActionKind) -> Option<Arc<dyn Action>> {
         self.actions.iter().find(|a| a.kind() == kind).cloned()

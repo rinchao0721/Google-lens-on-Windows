@@ -3,11 +3,12 @@
 use std::time::Duration;
 
 use lenswin_core::frame::CroppedImage;
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 use crate::error::{PlatformError, last_error, win32};
@@ -18,6 +19,8 @@ use crate::window::MessageWindow;
 const OPEN_RETRIES: u32 = 10;
 /// 重试间隔。
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(15);
+/// 读取剪贴板文本时最多取的 UTF-16 单元数，防止异常大的内容被整块复制。
+const MAX_READ_UNITS: usize = 1 << 18;
 /// BITMAPINFOHEADER 大小。
 const DIB_HEADER_LEN: usize = 40;
 
@@ -81,6 +84,39 @@ pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), Plat
 /// 把文本写入剪贴板，会清空原有内容。
 pub fn set_text(owner: ClipboardOwner, text: &str) -> Result<(), PlatformError> {
     set_data(owner, u32::from(CF_UNICODETEXT.0), &utf16_with_nul(text))
+}
+
+/// 读取剪贴板里的 Unicode 文本；没有文本格式时返回 `Ok(None)`。
+pub fn get_text(owner: ClipboardOwner) -> Result<Option<String>, PlatformError> {
+    let format = u32::from(CF_UNICODETEXT.0);
+    let _clipboard = ClipboardGuard::open(owner)?;
+    // SAFETY: 剪贴板已由当前线程打开。
+    if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
+        return Ok(None);
+    }
+    // SAFETY: 剪贴板已打开；返回的句柄归系统所有，不可释放。
+    let handle = unsafe { GetClipboardData(format) }.map_err(win32("GetClipboardData"))?;
+    let global = HGLOBAL(handle.0);
+    // SAFETY: global 来自 GetClipboardData，剪贴板仍处于打开状态。
+    let bytes = unsafe { GlobalSize(global) };
+    // SAFETY: 同上。
+    let ptr = unsafe { GlobalLock(global) };
+    if ptr.is_null() {
+        return Err(last_error("GlobalLock"));
+    }
+    let units = (bytes / 2).min(MAX_READ_UNITS);
+    // SAFETY: 锁定期间 ptr 指向至少 bytes 字节的可读内存，可移动内存按 8 字节以上对齐，units 不超过其一半。
+    let text = decode_utf16_text(unsafe { std::slice::from_raw_parts(ptr.cast::<u16>(), units) });
+    // 数据已复制，解锁结果不影响后续
+    // SAFETY: 与上面的 GlobalLock 配对。
+    discard(unsafe { GlobalUnlock(global) });
+    Ok(Some(text))
+}
+
+/// 解码 UTF-16 文本：遇到 NUL 结束，非法单元以替换字符代替。
+fn decode_utf16_text(units: &[u16]) -> String {
+    let end = units.iter().position(|u| *u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(units.get(..end).unwrap_or_default())
 }
 
 /// 文本转为以 NUL 结尾的 UTF-16 小端字节。
@@ -166,6 +202,16 @@ fn rgba_to_dib(image: &CroppedImage) -> Result<Vec<u8>, PlatformError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_stops_at_nul_and_replaces_bad_units() {
+        let units: Vec<u16> = "中a😀".encode_utf16().chain([0, 0x41]).collect();
+        assert_eq!(decode_utf16_text(&units), "中a😀");
+        let bad = decode_utf16_text(&[0x41, 0xD800]);
+        assert_eq!(bad, format!("A{}", char::REPLACEMENT_CHARACTER));
+        assert_eq!(decode_utf16_text(&[]), "");
+        assert_eq!(decode_utf16_text(&[0, 0x41]), "");
+    }
 
     fn image_2x2() -> CroppedImage {
         // 第一行：红、绿；第二行：蓝、白

@@ -81,7 +81,7 @@ pub enum Glyph {
 
 impl ToolbarButton {
     /// 标注工具组。
-    pub const TOOLS: [ToolbarButton; 8] = [
+    pub const TOOLS: [ToolbarButton; 9] = [
         ToolbarButton::Tool(Tool::Rectangle),
         ToolbarButton::Tool(Tool::Ellipse),
         ToolbarButton::Tool(Tool::Line),
@@ -90,6 +90,7 @@ impl ToolbarButton {
         ToolbarButton::Tool(Tool::Highlighter),
         ToolbarButton::Tool(Tool::Mosaic),
         ToolbarButton::Tool(Tool::Number),
+        ToolbarButton::Tool(Tool::Text),
     ];
     /// 撤销重做组。
     pub const HISTORY: [ToolbarButton; 2] = [ToolbarButton::Undo, ToolbarButton::Redo];
@@ -112,6 +113,7 @@ impl ToolbarButton {
             ToolbarButton::Tool(Tool::Highlighter) => Glyph::Icon('\u{E7E6}'),
             ToolbarButton::Tool(Tool::Mosaic) => Glyph::Icon('\u{E80A}'),
             ToolbarButton::Tool(Tool::Number) => Glyph::Text("1"),
+            ToolbarButton::Tool(Tool::Text) => Glyph::Icon('\u{E8D2}'),
             ToolbarButton::Undo => Glyph::Icon('\u{E7A7}'),
             ToolbarButton::Redo => Glyph::Icon('\u{E7A6}'),
             ToolbarButton::Search => Glyph::Icon('\u{E721}'),
@@ -132,6 +134,7 @@ impl ToolbarButton {
             ToolbarButton::Tool(Tool::Highlighter) => "荧",
             ToolbarButton::Tool(Tool::Mosaic) => "马",
             ToolbarButton::Tool(Tool::Number) => "序",
+            ToolbarButton::Tool(Tool::Text) => "字",
             ToolbarButton::Undo => "撤",
             ToolbarButton::Redo => "重",
             ToolbarButton::Search => "搜索",
@@ -156,6 +159,8 @@ pub struct StripSpec {
     pub has_color: bool,
     /// 序号的「1 / A」切换。
     pub number_style: bool,
+    /// 文字的「纯文字 / 底色」切换。
+    pub appearance: bool,
 }
 
 /// 样式条内各控件的范围。
@@ -171,6 +176,8 @@ pub struct StripLayout {
     pub value: Rect,
     /// 编号风格切换，只有序号工具有。
     pub number_styles: Vec<(NumberStyle, Rect)>,
+    /// 外观切换（是否带底色），只有文字工具有。
+    pub appearance: Vec<(bool, Rect)>,
 }
 
 /// 点中的控件。
@@ -184,6 +191,8 @@ pub enum Hit {
     Preset(usize),
     /// 编号风格。
     NumberStyle(NumberStyle),
+    /// 文字外观：`true` 为底色。
+    Background(bool),
 }
 
 /// 工具栏与样式条的完整布局。
@@ -211,6 +220,9 @@ impl ToolbarLayout {
         }
         if let Some((style, _)) = strip.number_styles.iter().find(|(_, r)| r.contains(p)) {
             return Some(Hit::NumberStyle(*style));
+        }
+        if let Some((background, _)) = strip.appearance.iter().find(|(_, r)| r.contains(p)) {
+            return Some(Hit::Background(*background));
         }
         strip
             .presets
@@ -383,7 +395,7 @@ fn strip_layout(
     if spec.has_color {
         width += swatch_count * (swatch + gap);
     }
-    if spec.number_style {
+    if spec.number_style || spec.appearance {
         width += gap + style_w * 2;
     }
 
@@ -455,12 +467,27 @@ fn strip_layout(
             left += style_w;
         }
     }
+    let mut appearance = Vec::new();
+    if spec.appearance {
+        left += gap;
+        for background in [false, true] {
+            let r = Rect::from_edges(
+                left,
+                mid - chip_h / 2,
+                left + style_w,
+                mid - chip_h / 2 + chip_h,
+            )?;
+            appearance.push((background, r));
+            left += style_w;
+        }
+    }
     Some(StripLayout {
         rect,
         swatches,
         presets,
         value,
         number_styles,
+        appearance,
     })
 }
 
@@ -666,6 +693,7 @@ mod tests {
     const FULL_STRIP: StripSpec = StripSpec {
         has_color: true,
         number_style: true,
+        appearance: false,
     };
 
     fn bar_of(sel: &Rect, monitor: &Rect) -> ToolbarLayout {
@@ -676,18 +704,18 @@ mod tests {
     fn toolbar_single_row_below_right_aligned() {
         let sel = Rect::new(800, 100, 600, 300);
         let layout = bar_of(&sel, &MONITOR);
-        // 14 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
-        assert_eq!(layout.bar, Rect::new(870, 406, 530, 40));
-        assert_eq!(layout.buttons.len(), 14);
+        // 15 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
+        assert_eq!(layout.bar, Rect::new(834, 406, 566, 40));
+        assert_eq!(layout.buttons.len(), 15);
         assert_eq!(layout.separators.len(), 2);
         assert_eq!(layout.strip, None);
         assert_eq!(
             layout.button_rect(ToolbarButton::Tool(Tool::Rectangle)),
-            Some(Rect::new(874, 410, 36, 32))
+            Some(Rect::new(838, 410, 36, 32))
         );
         assert_eq!(
             layout.button_rect(ToolbarButton::Undo),
-            Some(Rect::new(874 + 8 * 36 + 9, 410, 36, 32))
+            Some(Rect::new(838 + 9 * 36 + 9, 410, 36, 32))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
         assert_eq!(copy.right(), 1400 - 4);
@@ -728,7 +756,7 @@ mod tests {
         let full = Rect::new(0, 0, 1920, 1080);
         let bar = bar_of(&full, &MONITOR).bar;
         assert_eq!(bar.y, 1080 - 6 - 40);
-        assert_eq!(bar.x, 1920 - 530);
+        assert_eq!(bar.x, 1920 - 566);
     }
 
     #[test]
@@ -742,12 +770,12 @@ mod tests {
 
     #[test]
     fn toolbar_wraps_to_two_rows_on_narrow_monitor() {
-        let monitor = Rect::new(0, 0, 400, 800);
+        let monitor = Rect::new(0, 0, 420, 800);
         let layout = bar_of(&Rect::new(100, 100, 200, 200), &monitor);
-        // 第一行 10 个按钮 + 1 条分隔 + 内边距
-        assert_eq!(layout.bar, Rect::new(0, 306, 377, 72));
+        // 第一行 11 个按钮 + 1 条分隔 + 内边距
+        assert_eq!(layout.bar, Rect::new(0, 306, 413, 72));
         assert_eq!(layout.separators.len(), 1);
-        assert_eq!(layout.buttons.len(), 14);
+        assert_eq!(layout.buttons.len(), 15);
         assert_eq!(
             layout.button_rect(ToolbarButton::Search),
             Some(Rect::new(4, 306 + 4 + 32, 36, 32))
@@ -775,7 +803,7 @@ mod tests {
     fn hit_finds_buttons_and_ignores_gaps() {
         let layout = bar_of(&Rect::new(800, 100, 600, 300), &MONITOR);
         assert_eq!(
-            layout.hit(Point::new(880, 420)),
+            layout.hit(Point::new(842, 420)),
             Some(Hit::Button(ToolbarButton::Tool(Tool::Rectangle)))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
@@ -784,10 +812,10 @@ mod tests {
             Some(Hit::Button(ToolbarButton::Copy))
         );
         // 内边距和分隔线不属于任何按钮，但仍在工具栏内
-        assert_eq!(layout.hit(Point::new(871, 407)), None);
-        assert!(layout.covers(Point::new(871, 407)));
-        assert!(!layout.covers(Point::new(869, 407)));
-        assert!(!layout.covers(Point::new(871, 446)));
+        assert_eq!(layout.hit(Point::new(835, 407)), None);
+        assert!(layout.covers(Point::new(835, 407)));
+        assert!(!layout.covers(Point::new(833, 407)));
+        assert!(!layout.covers(Point::new(835, 446)));
     }
 
     #[test]
@@ -823,11 +851,35 @@ mod tests {
     }
 
     #[test]
+    fn text_strip_has_appearance_switch_and_hits_it() {
+        let spec = StripSpec {
+            has_color: true,
+            number_style: false,
+            appearance: true,
+        };
+        let layout = toolbar_layout(&Rect::new(800, 100, 600, 300), &MONITOR, 96, Some(spec));
+        let strip = layout.strip.clone().expect("样式条");
+        assert!(strip.number_styles.is_empty());
+        assert_eq!(strip.appearance.len(), 2);
+        // 与序号工具的「1 / A」占同样宽度
+        assert_eq!(strip.rect.width, 8 + 8 * 28 + 3 * 28 + 36 + 6 + 64);
+        for (background, rect) in &strip.appearance {
+            let p = Point::new(rect.x + 3, rect.y + 3);
+            assert_eq!(layout.hit(p), Some(Hit::Background(*background)));
+            assert!(layout.covers(p));
+        }
+        let plain = strip.appearance.first().map(|(b, _)| *b);
+        let styled = strip.appearance.get(1).map(|(b, _)| *b);
+        assert_eq!((plain, styled), (Some(false), Some(true)));
+    }
+
+    #[test]
     fn strip_content_depends_on_tool() {
         let sel = Rect::new(800, 100, 600, 300);
         let plain = StripSpec {
             has_color: true,
             number_style: false,
+            appearance: false,
         };
         let strip = toolbar_layout(&sel, &MONITOR, 96, Some(plain))
             .strip
@@ -837,6 +889,7 @@ mod tests {
         let mosaic = StripSpec {
             has_color: false,
             number_style: false,
+            appearance: false,
         };
         let strip = toolbar_layout(&sel, &MONITOR, 96, Some(mosaic))
             .strip

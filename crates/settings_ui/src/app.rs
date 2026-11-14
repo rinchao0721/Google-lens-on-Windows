@@ -9,8 +9,8 @@ use lenswin_core::annotation::NumberStyle;
 use lenswin_core::config::{
     ANNOTATE_WIDTH_RANGE, Config, GlowMode, HIGHLIGHTER_WIDTH_RANGE, HISTORY_SIZE_RANGE,
     LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry, MOSAIC_BLOCK_RANGE,
-    NUMBER_SIZE_RANGE, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TIMEOUT_SECS_RANGE,
-    TrayLeftClick, UploadProvider, ValidationIssue, validate,
+    NUMBER_SIZE_RANGE, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TEXT_SIZE_RANGE,
+    TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider, ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
 use lenswin_core::selection::SelectionMode;
@@ -935,6 +935,7 @@ impl SettingsApp {
         );
         let mosaic_issue = self.issue("annotate.mosaic.block");
         let number_issue = pair(self, "annotate.number.color", "annotate.number.size");
+        let text_issue = pair(self, "annotate.text.color", "annotate.text.size");
         let a = &mut self.draft.config.annotate;
         let strokes = [
             ("矩形", &mut a.rectangle),
@@ -984,6 +985,26 @@ impl SettingsApp {
                         .range(MOSAIC_BLOCK_RANGE)
                         .suffix(" 像素"),
                 );
+            });
+        let text = &mut a.text;
+        Card::new("文字")
+            .icon(icons::COLOR)
+            .desc("颜色、字号与外观；底色模式下颜色用作底色")
+            .error(text_issue.as_deref())
+            .right_width(470.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut text.size)
+                        .range(TEXT_SIZE_RANGE)
+                        .suffix(" 像素"),
+                );
+                color_swatches(ui, &look, &mut text.color);
+                // right_to_left 布局下先添加的在右侧，逆序添加使视觉顺序为「纯文字、底色」
+                for (background, label) in [(true, "底色"), (false, "纯文字")] {
+                    if choice_chip(ui, &look, text.background == background, label).clicked() {
+                        text.background = background;
+                    }
+                }
             });
         let number = &mut a.number;
         Card::new("序号")

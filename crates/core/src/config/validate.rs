@@ -5,7 +5,7 @@ use std::ops::RangeInclusive;
 use super::{
     ANNOTATE_WIDTH_RANGE, Config, HIGHLIGHTER_WIDTH_RANGE, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE,
     LASSO_STROKE_WIDTH_RANGE, MAX_BYTES_RANGE, MOSAIC_BLOCK_RANGE, NUMBER_SIZE_RANGE, ResponseKind,
-    TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
+    TEXT_SIZE_RANGE, TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
 };
 use crate::annotation::Color;
 use crate::hotkey::Hotkey;
@@ -242,6 +242,8 @@ fn check_annotate(config: &Config, issues: &mut Vec<ValidationIssue>) {
         &NUMBER_SIZE_RANGE,
         issues,
     );
+    check_color("annotate.text.color", &a.text.color, issues);
+    check_range("annotate.text.size", a.text.size, &TEXT_SIZE_RANGE, issues);
 }
 
 fn check_misc(config: &Config, issues: &mut Vec<ValidationIssue>) {

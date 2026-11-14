@@ -32,6 +32,9 @@ pub const MOSAIC_BLOCK_RANGE: RangeInclusive<u32> = 4..=64;
 /// 序号圆直径（像素）的合法范围。
 pub const NUMBER_SIZE_RANGE: RangeInclusive<u32> = 16..=96;
 
+/// 文字字号（像素）的合法范围。
+pub const TEXT_SIZE_RANGE: RangeInclusive<u32> = 12..=96;
+
 /// 搜索引擎模板中图片地址的占位符。
 pub const URL_PLACEHOLDER: &str = "{url}";
 
@@ -467,6 +470,8 @@ pub struct AnnotateConfig {
     pub mosaic: MosaicConfig,
     /// 序号。
     pub number: NumberConfig,
+    /// 文字。
+    pub text: TextConfig,
 }
 
 /// 默认的标注红色。
@@ -542,6 +547,28 @@ impl Default for NumberConfig {
             color: DEFAULT_RED.to_string(),
             size: 28,
             style: NumberStyle::default(),
+        }
+    }
+}
+
+/// `[annotate.text]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextConfig {
+    /// `#RRGGBB`，底色模式下是底色。
+    pub color: String,
+    /// 字号（成图物理像素）。
+    pub size: u32,
+    /// 是否带底色。
+    pub background: bool,
+}
+
+impl Default for TextConfig {
+    fn default() -> Self {
+        Self {
+            color: DEFAULT_RED.to_string(),
+            size: 24,
+            background: false,
         }
     }
 }
@@ -827,6 +854,9 @@ auto_check = 1
         config.annotate.highlighter.color = "#34C759".to_string();
         config.annotate.mosaic.block = 20;
         config.annotate.number.style = NumberStyle::Letter;
+        config.annotate.text.size = 40;
+        config.annotate.text.background = true;
+        config.annotate.text.color = "#34C759".to_string();
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
         config.privacy.lens_acknowledged = true;
         config.search.backend = SearchBackend::ImageHost;
@@ -849,6 +879,9 @@ auto_check = 1
         assert_eq!(a.number.color, "#FF3B30");
         assert_eq!(a.number.size, 28);
         assert_eq!(a.number.style, NumberStyle::Number);
+        assert_eq!(a.text.color, "#FF3B30");
+        assert_eq!(a.text.size, 24);
+        assert!(!a.text.background);
         assert_eq!(validate(&Config::default()), Ok(()));
     }
 
@@ -897,6 +930,8 @@ auto_check = 1
             ("[annotate.mosaic]\nblock = 65\n", "annotate.mosaic.block"),
             ("[annotate.number]\nsize = 15\n", "annotate.number.size"),
             ("[annotate.number]\nsize = 97\n", "annotate.number.size"),
+            ("[annotate.text]\nsize = 11\n", "annotate.text.size"),
+            ("[annotate.text]\nsize = 97\n", "annotate.text.size"),
         ];
         for (text, field) in cases {
             match Config::from_toml_str(text) {
@@ -915,9 +950,21 @@ auto_check = 1
             "[annotate.mosaic]\nblock = 64\n",
             "[annotate.number]\nsize = 16\n",
             "[annotate.number]\nsize = 96\n",
+            "[annotate.text]\nsize = 12\n",
+            "[annotate.text]\nsize = 96\n",
         ] {
             assert!(Config::from_toml_str(text).is_ok(), "{text}");
         }
+    }
+
+    #[test]
+    fn annotate_text_parses_partial_tables_and_rejects_bad_values() {
+        let config = Config::from_toml_str("[annotate.text]\nbackground = true\n").expect("解析");
+        assert!(config.annotate.text.background);
+        assert_eq!(config.annotate.text.size, 24);
+        assert!(Config::from_toml_str("[annotate.text]\nbackground = 1\n").is_err());
+        assert!(Config::from_toml_str("[annotate.text]\nweight = 1\n").is_err());
+        assert!(Config::from_toml_str("[annotate.text]\ncolor = \"red\"\n").is_err());
     }
 
     #[test]
@@ -934,7 +981,7 @@ auto_check = 1
         // 不在色板内的合法颜色与小写写法都允许
         let ok = "[annotate.number]\ncolor = \"#123abc\"\n";
         assert!(Config::from_toml_str(ok).is_ok());
-        for field in ["highlighter", "number", "rectangle"] {
+        for field in ["highlighter", "number", "rectangle", "text"] {
             let text = format!("[annotate.{field}]\ncolor = \"nope\"\n");
             assert!(Config::from_toml_str(&text).is_err(), "{field}");
         }

@@ -1,5 +1,7 @@
 //! 鼠标键盘状态机：与 Win32 无关，窗口层只负责把消息翻译成这里的调用。
 
+use std::rc::Rc;
+
 use lenswin_core::annotation::{Document, PALETTE, Shape, Tool};
 use lenswin_core::config::AnnotateConfig;
 use lenswin_core::geometry::{Point, Rect};
@@ -8,7 +10,7 @@ use lenswin_core::selection::{Selection, SelectionShape};
 use lenswin_core::snip::{ColorFormat, OverlayFlow, ToolbarAction, topmost_containing};
 
 use crate::adjust::{self, Direction, Handle, NudgeMode};
-use crate::annotate::{Annotator, StyleView};
+use crate::annotate::{Annotator, EditKey, EditView, StyleView, TextMeasure};
 use crate::hint::{self, Features, Hint, HintState, Stage};
 use crate::layout::{self, Hit, StripSpec, ToolbarButton, ToolbarLayout};
 use crate::modes::{Preview, SelectionTool};
@@ -52,6 +54,10 @@ pub enum Key {
     NewerHistory,
     /// 显示或隐藏快捷键提示。
     ToggleHints,
+    /// 编辑文字时的编辑键。
+    Edit(EditKey),
+    /// 编辑文字时粘贴剪贴板快照。
+    Paste,
     /// 撤销上一个标注。
     Undo,
     /// 重做被撤销的标注。
@@ -72,6 +78,8 @@ pub enum KeyCommand {
 pub enum CursorKind {
     /// 十字。
     Cross,
+    /// 文字输入的 I 形光标。
+    Text,
     /// 箭头。
     Arrow,
     /// 四向移动。
@@ -114,6 +122,8 @@ pub struct Options {
     pub hints: HintState,
     /// 标注工具的初始样式，只在截屏流程用到。
     pub annotate: AnnotateConfig,
+    /// 冻结时的剪贴板文本快照，已清洗，文字标注粘贴用。
+    pub clipboard_text: Option<String>,
 }
 
 /// 矩形选区的边框装饰。
@@ -151,8 +161,19 @@ pub struct Annotations<'a> {
     pub shapes: &'a [Shape],
     /// 已完成图元的版本号，变化时绘制缓存失效。
     pub revision: u64,
+    /// 重新编辑时被隐藏的图元序号。
+    pub hidden: Option<usize>,
     /// 正在画的图元。
     pub draft: Option<Shape>,
+}
+
+/// 编辑中的文本框及光标状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorView {
+    /// 文本框内容与样式。
+    pub edit: EditView,
+    /// 光标闪烁到可见的相位。
+    pub caret_visible: bool,
 }
 
 /// 窗口层绘制某个显示器时需要的内容。
@@ -168,6 +189,8 @@ pub struct View<'a> {
     pub toolbar: Option<ToolbarView>,
     /// 标注图元。
     pub annotations: Annotations<'a>,
+    /// 编辑中的文本框，只在它所在的显示器上有值。
+    pub editor: Option<EditorView>,
     /// 放大镜：光标位置与颜色格式。
     pub magnifier: Option<(Point, ColorFormat)>,
     /// 快捷键提示，为空表示不显示。
@@ -212,6 +235,9 @@ pub struct Interaction {
     /// 尚未取走的常驻选框回投。
     commits: Vec<Selection>,
     annotator: Annotator,
+    caret_visible: bool,
+    blink_reset: bool,
+    focus_request: Option<usize>,
 }
 
 /// 窗口客户区坐标转虚拟桌面坐标；窗口左上角即显示器左上角。
@@ -263,7 +289,16 @@ impl Interaction {
             committed: None,
             commits: Vec::new(),
             annotator,
+            caret_visible: true,
+            blink_reset: false,
+            focus_request: None,
         }
+    }
+
+    /// 换上真实的文字度量，窗口层用 DirectWrite 提供。
+    pub fn with_measure(mut self, measure: Rc<dyn TextMeasure>) -> Self {
+        self.annotator.set_measure(measure);
+        self
     }
 
     fn is_live(&self) -> bool {
@@ -290,6 +325,7 @@ impl Interaction {
         let strip = self.annotator.tool().map(|tool| StripSpec {
             has_color: tool.has_color(),
             number_style: tool == Tool::Number,
+            appearance: tool == Tool::Text,
         });
         Some(layout::toolbar_layout(
             &adj.rect,
@@ -326,6 +362,7 @@ impl Interaction {
                 }
             }
             Some(Hit::NumberStyle(style)) => self.annotator.set_number_style(style),
+            Some(Hit::Background(on)) => self.annotator.set_text_background(on),
             Some(Hit::Preset(index)) => self.annotator.apply_preset(index),
             None => {}
         }
@@ -424,7 +461,19 @@ impl Interaction {
                 if let Some(toolbar) = self.toolbar(&adj)
                     && toolbar.covers(p)
                 {
-                    self.press_toolbar(adj, toolbar.hit(p));
+                    let hit = toolbar.hit(p);
+                    // 样式条改的是当前文本框，其它按钮先确认文字再执行
+                    if matches!(hit, Some(Hit::Button(_))) {
+                        self.annotator.confirm_text();
+                    }
+                    self.press_toolbar(adj, hit);
+                    return;
+                }
+                if self.annotator.is_editing() {
+                    // 点文本框外只确认，不新建文本框，也不缩放选区
+                    if !self.annotator.edit_bounds().is_some_and(|b| b.contains(p)) {
+                        self.annotator.confirm_text();
+                    }
                     return;
                 }
                 let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
@@ -432,7 +481,13 @@ impl Interaction {
                     // 有工具时选区内部用来画图，手柄仍然优先缩放
                     Some(Handle::Body) if self.annotating() => {
                         if let Some(bounds) = self.monitor_bounds(adj.monitor) {
-                            self.annotator.press(p, &bounds);
+                            if self.annotator.tool() == Some(Tool::Text) {
+                                self.annotator.begin_text(p, &bounds, adj.monitor);
+                                self.focus_request = Some(adj.monitor);
+                                self.touch_caret();
+                            } else {
+                                self.annotator.press(p, &bounds);
+                            }
                         }
                         return;
                     }
@@ -562,8 +617,41 @@ impl Interaction {
         }
     }
 
+    /// 文字工具下双击已有文字：重新编辑。双击的第一下若已建出空文本框先丢弃；
+    /// 没有命中文字时返回 `false`，按普通按下处理。
+    fn reedit_text(&mut self, window: usize, local: (i32, i32)) -> bool {
+        if self.options.flow != OverlayFlow::Toolbar || self.annotator.tool() != Some(Tool::Text) {
+            return false;
+        }
+        let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local)) else {
+            return false;
+        };
+        if !adj.rect.contains(p) || self.toolbar(&adj).is_some_and(|t| t.covers(p)) {
+            return false;
+        }
+        if self.annotator.editing_blank_new() {
+            self.annotator.discard_text();
+        }
+        if self.annotator.is_editing() {
+            return false;
+        }
+        let Some(index) = self.annotator.document().text_at(p) else {
+            return false;
+        };
+        if !self.annotator.begin_edit_existing(index, adj.monitor) {
+            return false;
+        }
+        self.hover = Some(p);
+        self.focus_request = Some(adj.monitor);
+        self.touch_caret();
+        true
+    }
+
     /// 双击：在调整中的选区内双击等同于复制，其余情况按普通按下处理；有工具时双击只是普通按下。
     pub fn double_click(&mut self, window: usize, local: (i32, i32)) {
+        if self.reedit_text(window, local) {
+            return;
+        }
         if let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local))
             && self.options.flow == OverlayFlow::Toolbar
             && self.annotator.tool().is_none()
@@ -582,6 +670,11 @@ impl Interaction {
             self.cancel();
             return;
         }
+        // 编辑中右键等同于点框外：确认文字
+        if self.annotator.is_editing() {
+            self.annotator.confirm_text();
+            return;
+        }
         if self.annotator.exit_tool() {
             return;
         }
@@ -598,6 +691,10 @@ impl Interaction {
     /// 按键；`repeat` 表示按住不放产生的重复消息。
     pub fn key(&mut self, key: Key, mode: NudgeMode, repeat: bool) -> Option<KeyCommand> {
         if self.outcome.is_some() {
+            return None;
+        }
+        if self.annotator.is_editing() {
+            self.editing_key(key);
             return None;
         }
         match key {
@@ -650,8 +747,87 @@ impl Interaction {
             Key::OlderHistory => self.step_history(true),
             Key::NewerHistory => self.step_history(false),
             Key::ToggleHints => self.options.hints = self.options.hints.toggled(),
+            Key::Edit(_) | Key::Paste => {}
         }
         None
+    }
+
+    /// 编辑文字时的按键：其它覆盖层快捷键全部暂停。
+    fn editing_key(&mut self, key: Key) {
+        match key {
+            Key::Escape | Key::Undo => {
+                self.annotator.edit_key(EditKey::Discard);
+            }
+            Key::Enter => {
+                self.annotator.edit_key(EditKey::Confirm);
+            }
+            Key::Edit(edit) => {
+                self.annotator.edit_key(edit);
+                self.touch_caret();
+            }
+            Key::Paste => {
+                if let Some(text) = &self.options.clipboard_text {
+                    self.annotator.insert_text(text);
+                    self.touch_caret();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn touch_caret(&mut self) {
+        self.caret_visible = true;
+        self.blink_reset = true;
+    }
+
+    /// 正在编辑文字。
+    pub fn is_editing(&self) -> bool {
+        self.annotator.is_editing()
+    }
+
+    /// 插入一个字符（`WM_CHAR`）。
+    pub fn char_input(&mut self, c: char) {
+        if self.annotator.insert_char(c) {
+            self.touch_caret();
+        }
+    }
+
+    /// 设置输入法组字串；`cursor` 是组字光标在其中的字符序号。
+    pub fn ime_composition(&mut self, text: &str, cursor: usize) {
+        self.annotator.set_composition(text, cursor);
+        self.touch_caret();
+    }
+
+    /// 输入法提交的结果，按普通输入插入。
+    pub fn ime_commit(&mut self, text: &str) {
+        if self.annotator.insert_text(text) {
+            self.touch_caret();
+        }
+    }
+
+    /// 组字结束。
+    pub fn ime_end(&mut self) {
+        self.annotator.clear_composition();
+    }
+
+    /// 光标所在显示器序号和所在行的范围（虚拟桌面坐标），输入法候选窗据此定位；没有编辑时为 `None`。
+    pub fn ime_target(&self) -> Option<(usize, Rect)> {
+        self.annotator.caret_line()
+    }
+
+    /// 切换光标闪烁相位。
+    pub fn toggle_caret(&mut self) {
+        self.caret_visible = !self.caret_visible;
+    }
+
+    /// 取走「光标计时器需要重新计时」的标记。
+    pub fn take_blink_reset(&mut self) -> bool {
+        std::mem::take(&mut self.blink_reset)
+    }
+
+    /// 取走键盘焦点应移到哪块显示器窗口的请求。
+    pub fn take_focus_request(&mut self) -> Option<usize> {
+        self.focus_request.take()
     }
 
     fn arrow(&mut self, direction: Direction, mode: NudgeMode) -> Option<KeyCommand> {
@@ -799,6 +975,7 @@ impl Interaction {
             Phase::Idle => Stage::Idle,
             Phase::Drawing { .. } => Stage::Drawing,
             Phase::Adjusting(_) if self.is_live() => Stage::LiveAdjusting,
+            Phase::Adjusting(_) if self.annotator.is_editing() => Stage::Editing,
             Phase::Adjusting(_) if self.annotating() => Stage::Annotating,
             Phase::Adjusting(_) => Stage::Adjusting,
         };
@@ -841,8 +1018,17 @@ impl Interaction {
             annotations: Annotations {
                 shapes: self.annotator.document().shapes(),
                 revision: self.annotator.document().revision(),
+                hidden: self.annotator.edit_view().and_then(|v| v.hidden),
                 draft: self.annotator.preview(),
             },
+            editor: self
+                .annotator
+                .edit_view()
+                .filter(|v| v.monitor == window)
+                .map(|edit| EditorView {
+                    edit,
+                    caret_visible: self.caret_visible,
+                }),
             magnifier: None,
             hints: Vec::new(),
             cursor: self
@@ -916,6 +1102,7 @@ impl Interaction {
         }
         let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
         match hit {
+            Some(Handle::Body) if self.annotator.tool() == Some(Tool::Text) => CursorKind::Text,
             Some(Handle::Body) if self.annotating() => CursorKind::Cross,
             Some(handle) => cursor_for(handle),
             None if self.annotating() => CursorKind::Arrow,
@@ -947,6 +1134,7 @@ impl Interaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotate::EditKey;
     use crate::modes::{LassoTool, RectTool};
     use lenswin_core::annotation::NumberStyle;
 
@@ -974,6 +1162,7 @@ mod tests {
             history: Vec::new(),
             hints: HintState::Shown,
             annotate: AnnotateConfig::default(),
+            clipboard_text: None,
         }
     }
 
@@ -1408,6 +1597,426 @@ mod tests {
         assert_eq!((style.size, style.preset), (32, Some(2)));
         assert!(it.view(1).annotations.shapes.is_empty());
         assert_eq!(it.annotate_change().map(|c| c.mosaic.block), Some(32));
+    }
+
+    fn text_session(clipboard: Option<&str>) -> Interaction {
+        let mut it = Interaction::new(
+            Box::new(RectTool::new()),
+            monitors(),
+            Options {
+                clipboard_text: clipboard.map(str::to_string),
+                ..options(OverlayFlow::Toolbar)
+            },
+        );
+        it.press(1, (100, 100));
+        it.mouse_move(1, (300, 300));
+        it.release(1, (500, 400));
+        click_button(&mut it, ToolbarButton::Tool(Tool::Text));
+        it
+    }
+
+    fn type_in(it: &mut Interaction, text: &str) {
+        for c in text.chars() {
+            it.char_input(c);
+        }
+    }
+
+    fn only_text(it: &Interaction) -> Option<(String, u32)> {
+        match it.view(1).annotations.shapes {
+            [Shape::Text { text, size, .. }] => Some((text.clone(), *size)),
+            _ => None,
+        }
+    }
+
+    fn click(it: &mut Interaction, at: (i32, i32)) {
+        it.press(1, at);
+        it.release(1, at);
+    }
+
+    #[test]
+    fn clicking_with_text_tool_starts_editing_on_that_monitor() {
+        let mut it = text_session(None);
+        assert!(!it.is_editing());
+        it.mouse_move(1, (200, 200));
+        assert_eq!(it.cursor_kind(), CursorKind::Text);
+        click(&mut it, (200, 200));
+        assert!(it.is_editing());
+        assert_eq!(it.take_focus_request(), Some(1));
+        assert_eq!(it.take_focus_request(), None);
+        assert!(it.view(1).editor.is_some());
+        assert!(it.view(0).editor.is_none());
+        let (monitor, line) = it.ime_target().expect("候选窗目标");
+        assert_eq!(monitor, 1);
+        assert_eq!((line.x, line.y), (200, 200));
+        assert!(!it.is_capturing());
+        let keys: Vec<_> = it.view(1).hints.iter().map(|h| h.keys).collect();
+        assert!(keys.contains(&"Shift + Enter") && !keys.contains(&"?"));
+    }
+
+    #[test]
+    fn typing_then_enter_confirms_and_enter_does_not_copy() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "ab");
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert!(!it.is_editing() && !it.is_finished());
+        assert_eq!(only_text(&it), Some(("ab".to_string(), 24)));
+        assert_eq!(it.ime_target(), None);
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert!(matches!(
+            it.take_outcome(),
+            Some(Outcome::Action(_, ToolbarAction::Copy))
+        ));
+    }
+
+    #[test]
+    fn clicking_outside_the_box_only_confirms() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "x");
+        click(&mut it, (400, 350));
+        assert!(!it.is_editing());
+        assert_eq!(only_text(&it).map(|t| t.0), Some("x".to_string()));
+        // 选区外和手柄上的点击同样只确认
+        click(&mut it, (200, 200));
+        type_in(&mut it, "y");
+        click(&mut it, (1000, 800));
+        assert!(!it.is_editing());
+        click(&mut it, (200, 200));
+        type_in(&mut it, "z");
+        it.press(1, (500, 400));
+        assert!(!it.is_editing() && !it.is_capturing());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+    }
+
+    #[test]
+    fn clicking_inside_the_box_keeps_editing() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "abcd");
+        click(&mut it, (210, 210));
+        assert!(it.is_editing());
+        assert!(only_text(&it).is_none());
+    }
+
+    #[test]
+    fn blank_box_confirms_to_nothing() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "  ");
+        click(&mut it, (400, 350));
+        assert!(!it.is_editing());
+        assert!(it.view(1).annotations.shapes.is_empty());
+        assert!(it.view(1).toolbar.is_some_and(|t| !t.can_undo));
+    }
+
+    #[test]
+    fn toolbar_buttons_confirm_first_but_strip_does_not() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "hi");
+        let dot = bar_layout(&it)
+            .strip
+            .and_then(|s| s.presets.get(2).copied())
+            .expect("预设圆点");
+        click(&mut it, (dot.x + 2, dot.y + 2));
+        assert!(it.is_editing(), "样式条不确认");
+        let swatch = bar_layout(&it)
+            .strip
+            .and_then(|s| s.swatches.get(4).copied())
+            .expect("色块");
+        click(&mut it, (swatch.x + 2, swatch.y + 2));
+        let chip = bar_layout(&it)
+            .strip
+            .and_then(|s| s.appearance.get(1).map(|(_, r)| *r))
+            .expect("外观切换");
+        click(&mut it, (chip.x + 2, chip.y + 2));
+        assert!(it.is_editing());
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        assert!(!it.is_editing());
+        match it.view(1).annotations.shapes {
+            [
+                Shape::Text {
+                    size,
+                    color,
+                    background,
+                    ..
+                },
+            ] => {
+                assert_eq!((*size, *color, *background), (36, PALETTE[4], true));
+            }
+            other => panic!("期望一个文字图元，实际为 {other:?}"),
+        }
+        assert_eq!(
+            it.view(1).toolbar.map(|t| t.active),
+            Some(Some(Tool::Rectangle))
+        );
+    }
+
+    #[test]
+    fn search_and_copy_buttons_confirm_before_finishing() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "hi");
+        click_button(&mut it, ToolbarButton::Copy);
+        assert!(!it.is_editing());
+        assert!(matches!(
+            it.take_outcome(),
+            Some(Outcome::Action(_, ToolbarAction::Copy))
+        ));
+        assert_eq!(it.document().shapes().len(), 1);
+    }
+
+    #[test]
+    fn escape_and_ctrl_z_discard_without_cancelling_overlay() {
+        for key in [Key::Escape, Key::Undo] {
+            let mut it = text_session(None);
+            click(&mut it, (200, 200));
+            type_in(&mut it, "gone");
+            it.key(key, NudgeMode::Move, false);
+            assert!(!it.is_editing() && !it.is_finished(), "{key:?}");
+            assert!(it.view(1).annotations.shapes.is_empty());
+            assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(Some(Tool::Text)));
+        }
+    }
+
+    #[test]
+    fn other_shortcuts_are_paused_while_editing() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        let shown = !it.view(1).hints.is_empty();
+        assert!(shown);
+        for key in [
+            Key::CopyColor,
+            Key::Shift,
+            Key::Tab,
+            Key::OlderHistory,
+            Key::NewerHistory,
+            Key::ToggleHints,
+            Key::Redo,
+            Key::Arrow(Direction::Left),
+            Key::CursorStep(Direction::Up),
+        ] {
+            assert_eq!(it.key(key, NudgeMode::Move, false), None, "{key:?}");
+        }
+        assert!(it.is_editing() && !it.is_finished());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        assert!(!it.view(1).hints.is_empty(), "提示不应被 ? 切换");
+    }
+
+    #[test]
+    fn edit_keys_and_newline_reach_the_buffer() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "ab");
+        it.key(Key::Edit(EditKey::Newline), NudgeMode::Move, false);
+        type_in(&mut it, "c");
+        it.key(Key::Edit(EditKey::Left), NudgeMode::Move, false);
+        it.key(Key::Edit(EditKey::Backspace), NudgeMode::Move, false);
+        it.key(Key::Edit(EditKey::Tab), NudgeMode::Move, false);
+        let text = it.view(1).editor.map(|e| e.edit.text);
+        assert_eq!(text, Some("ab    c".to_string()));
+    }
+
+    #[test]
+    fn paste_inserts_the_snapshot_or_nothing() {
+        let mut it = text_session(Some("x\ny"));
+        click(&mut it, (200, 200));
+        it.key(Key::Paste, NudgeMode::Move, false);
+        assert_eq!(
+            it.view(1).editor.map(|e| e.edit.text),
+            Some("x\ny".to_string())
+        );
+        let mut none = text_session(None);
+        click(&mut none, (200, 200));
+        none.key(Key::Paste, NudgeMode::Move, false);
+        assert_eq!(
+            none.view(1).editor.map(|e| e.edit.text),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn double_click_reedits_existing_text_and_hides_it() {
+        let mut it = text_session(None);
+        click(&mut it, (150, 150));
+        type_in(&mut it, "hello");
+        click(&mut it, (400, 350));
+        assert_eq!(only_text(&it).map(|t| t.0), Some("hello".to_string()));
+        // 真实的双击顺序：第一下建出空文本框，第二下是 WM_LBUTTONDBLCLK
+        it.press(1, (155, 155));
+        it.release(1, (155, 155));
+        assert!(it.is_editing());
+        it.double_click(1, (155, 155));
+        it.release(1, (155, 155));
+        assert!(it.is_editing());
+        assert_eq!(it.view(1).annotations.hidden, Some(0));
+        assert_eq!(
+            it.view(1).editor.map(|e| e.edit.text),
+            Some("hello".to_string())
+        );
+        assert_eq!(it.take_focus_request(), Some(1));
+        type_in(&mut it, "!");
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("hello!".to_string()));
+        assert_eq!(it.view(1).annotations.hidden, None);
+        click_button(&mut it, ToolbarButton::Undo);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn reedit_escape_restores_and_blank_deletes_with_undo() {
+        let mut it = text_session(None);
+        click(&mut it, (150, 150));
+        type_in(&mut it, "ab");
+        click(&mut it, (400, 350));
+        it.press(1, (152, 152));
+        it.double_click(1, (152, 152));
+        it.release(1, (152, 152));
+        it.key(Key::Edit(EditKey::Backspace), NudgeMode::Move, false);
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("ab".to_string()));
+
+        it.press(1, (152, 152));
+        it.double_click(1, (152, 152));
+        it.release(1, (152, 152));
+        it.key(Key::Edit(EditKey::Backspace), NudgeMode::Move, false);
+        it.key(Key::Edit(EditKey::Backspace), NudgeMode::Move, false);
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert!(it.view(1).annotations.shapes.is_empty());
+        click_button(&mut it, ToolbarButton::Undo);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("ab".to_string()));
+    }
+
+    #[test]
+    fn double_click_on_empty_space_just_opens_one_new_box() {
+        let mut it = text_session(None);
+        it.press(1, (300, 300));
+        it.release(1, (300, 300));
+        it.double_click(1, (300, 300));
+        it.release(1, (300, 300));
+        assert!(it.is_editing());
+        type_in(&mut it, "n");
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("n".to_string()));
+    }
+
+    #[test]
+    fn double_click_never_copies_with_text_tool() {
+        let mut it = text_session(None);
+        it.double_click(1, (300, 300));
+        assert!(!it.is_finished());
+    }
+
+    #[test]
+    fn right_click_confirms_text_then_next_one_leaves_the_tool() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "r");
+        it.right_click();
+        assert!(!it.is_editing());
+        assert_eq!(only_text(&it).map(|t| t.0), Some("r".to_string()));
+        it.right_click();
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
+        assert!(!it.is_finished());
+    }
+
+    #[test]
+    fn wheel_changes_the_font_size_of_the_box_being_edited() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        type_in(&mut it, "w");
+        it.wheel(2);
+        assert_eq!(it.view(1).editor.map(|e| e.edit.style.size), Some(28));
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(only_text(&it).map(|t| t.1), Some(28));
+        assert_eq!(it.annotate_change().map(|c| c.text.size), Some(28));
+    }
+
+    #[test]
+    fn handles_still_resize_and_outside_clicks_are_ignored_without_a_box() {
+        let mut it = text_session(None);
+        it.press(1, (500, 400));
+        it.mouse_move(1, (600, 450));
+        it.release(1, (600, 450));
+        assert!(!it.is_editing());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 500, 350)));
+        click(&mut it, (1000, 800));
+        assert!(!it.is_editing());
+    }
+
+    #[test]
+    fn ime_composition_is_inline_and_result_is_inserted() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        it.ime_composition("ni", 2);
+        let edit = it.view(1).editor.map(|e| e.edit).expect("编辑中");
+        assert_eq!(edit.text, "ni");
+        assert_eq!(edit.composition, Some((0, 2)));
+        it.ime_commit("你");
+        it.ime_composition("", 0);
+        it.ime_end();
+        let edit = it.view(1).editor.map(|e| e.edit).expect("编辑中");
+        assert_eq!((edit.text.as_str(), edit.composition), ("你", None));
+        it.ime_composition("hao", 3);
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert_eq!(only_text(&it).map(|t| t.0), Some("你".to_string()));
+        // 编辑结束后的输入法消息被忽略
+        it.ime_commit("x");
+        it.ime_composition("y", 1);
+        it.char_input('z');
+        assert_eq!(only_text(&it).map(|t| t.0), Some("你".to_string()));
+    }
+
+    #[test]
+    fn candidate_window_follows_the_caret() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        let first = it.ime_target().expect("目标").1;
+        type_in(&mut it, "ab");
+        let second = it.ime_target().expect("目标").1;
+        assert!(second.x > first.x);
+        assert_eq!(second.y, first.y);
+        it.ime_composition("cd", 1);
+        assert!(it.ime_target().expect("目标").1.x > second.x);
+    }
+
+    #[test]
+    fn caret_blink_toggles_and_input_resets_it() {
+        let mut it = text_session(None);
+        click(&mut it, (200, 200));
+        assert!(it.take_blink_reset());
+        assert!(!it.take_blink_reset());
+        assert_eq!(it.view(1).editor.map(|e| e.caret_visible), Some(true));
+        it.toggle_caret();
+        assert_eq!(it.view(1).editor.map(|e| e.caret_visible), Some(false));
+        it.char_input('a');
+        assert_eq!(it.view(1).editor.map(|e| e.caret_visible), Some(true));
+        assert!(it.take_blink_reset());
+        it.toggle_caret();
+        it.key(Key::Edit(EditKey::Left), NudgeMode::Move, false);
+        assert_eq!(it.view(1).editor.map(|e| e.caret_visible), Some(true));
+    }
+
+    #[test]
+    fn text_tool_strip_shows_appearance_switch_and_text_presets() {
+        let it = text_session(None);
+        let toolbar = it.view(1).toolbar.expect("工具栏");
+        let strip = toolbar.layout.strip.expect("样式条");
+        assert_eq!(strip.appearance.len(), 2);
+        let style = toolbar.style.expect("样式");
+        assert_eq!(
+            (style.size, style.preset, style.background),
+            (24, Some(1), Some(false))
+        );
+    }
+
+    #[test]
+    fn typing_outside_editing_is_ignored() {
+        let mut it = text_session(None);
+        it.char_input('a');
+        assert!(it.view(1).annotations.shapes.is_empty());
+        assert!(!it.take_blink_reset());
     }
 
     #[test]

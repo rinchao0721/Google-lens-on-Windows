@@ -23,7 +23,8 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_PROPERTY_TYPE_FLOAT, D2D1_QUADRATIC_BEZIER_SEGMENT,
     D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush,
     ID2D1BitmapRenderTarget, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget,
     ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
     ID2D1StrokeStyle,
@@ -47,14 +48,14 @@ use windows::Win32::System::Com::{
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::adjust;
-use crate::annotate::StyleView;
+use crate::annotate::{StyleView, TextMeasure, text_padding};
 use crate::error::{OverlayError, win32};
 use crate::glow::{self, Edge, GlowFrame, Rgb};
 use crate::hint::Hint;
-use crate::input::{Annotations, FrameStyle, ToolbarView, View};
+use crate::input::{Annotations, EditorView, FrameStyle, ToolbarView, View};
 use crate::layout::{self, Glyph, Hit, MagnifierLayout, ToolbarButton};
 use crate::modes::Preview;
-use crate::paint::{self, FrameRef, Painter};
+use crate::paint::{self, DWriteMeasure, FrameRef, Painter, TextBlock};
 use crate::stroke::{self, PointF};
 
 /// 选框描边宽度（像素，96 DPI 下）。
@@ -612,6 +613,8 @@ pub struct TargetResources {
 struct LayerCache {
     bitmap: ID2D1Bitmap,
     revision: u64,
+    /// 缓存时被隐藏的图元序号，重新编辑开始或结束时缓存要重画。
+    hidden: Option<usize>,
 }
 
 /// 绘制所需的窗口信息。
@@ -713,6 +716,9 @@ impl TargetResources {
                 self.draw_corners(&r, surface.origin, surface.effects.colorful);
             }
             _ => {}
+        }
+        if let Some(editor) = &view.editor {
+            self.draw_editor(editor, surface);
         }
         if let Some(r) = view.label {
             self.draw_label(&r, surface);
@@ -1330,6 +1336,91 @@ impl TargetResources {
             }
             self.chip_text(number_style.mark(), &r);
         }
+        for (background, cell) in &strip.appearance {
+            let r = local_rect(cell, origin);
+            if style.background == Some(*background) {
+                self.rounded(&r, &self.brushes.active);
+            } else if hovered == Some(Hit::Background(*background)) {
+                self.rounded(&r, &self.brushes.hover);
+            }
+            self.chip_text(if *background { "底" } else { "字" }, &r);
+        }
+    }
+
+    /// 编辑中的文本框：文字（组字串带下划线）、边框与闪烁的光标。
+    fn draw_editor(&self, editor: &EditorView, surface: &Surface<'_>) {
+        let edit = &editor.edit;
+        let frames = [FrameRef {
+            bounds: surface.monitor(),
+            bgra: surface.bgra,
+        }];
+        let painter = Painter {
+            target: &self.target,
+            factory: &self.factory,
+            dwrite: &self.dwrite,
+            round_stroke: &self.round_stroke,
+            flat_stroke: &self.flat_stroke,
+            frames: &frames,
+        };
+        let block = TextBlock {
+            origin: edit.origin,
+            text: &edit.text,
+            size: edit.style.size,
+            color: edit.style.color,
+            background: edit.style.background,
+            underline: edit.composition,
+        };
+        if let Ok(brush) = painter.new_brush() {
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，参数为合法枚举值。
+            unsafe {
+                self.target
+                    .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            }
+            // 编辑框只是临时反馈，绘制失败时这一帧不画，输入内容不受影响
+            painter
+                .draw_text_block(&brush, &block, surface.origin)
+                .unwrap_or(());
+            // SAFETY: 同上。
+            unsafe {
+                self.target
+                    .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+            }
+        }
+        let frame = local_rect(&edit.bounds, surface.origin);
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+        unsafe {
+            self.target
+                .DrawRectangle(&frame, &self.brushes.accent, 1.0, None);
+        }
+        if !editor.caret_visible {
+            return;
+        }
+        let measure = DWriteMeasure::from_factory(self.dwrite.clone());
+        let (cx, cy, height) = measure.caret(&edit.text, edit.style.size, edit.caret);
+        let pad = to_f32(i64::from(text_padding(
+            edit.style.size,
+            edit.style.background,
+        )));
+        let x = frame.left + pad + to_f32(i64::from(cx));
+        let y = frame.top + pad + to_f32(i64::from(cy));
+        let line = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + 1.0,
+            bottom: y + to_f32(i64::from(height)),
+        };
+        let shadow = D2D_RECT_F {
+            left: x - 1.0,
+            right: x + 2.0,
+            ..line
+        };
+        // 先垫一层半透明深色，白色光标在浅色底上也看得清
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+        unsafe {
+            self.brushes.swatch.SetColor(&color(0.0, 0.0, 0.0, 0.5));
+            self.target.FillRectangle(&shadow, &self.brushes.swatch);
+            self.target.FillRectangle(&line, &self.brushes.white);
+        }
     }
 
     fn chip_text(&self, text: &str, rect: &D2D_RECT_F) {
@@ -1359,7 +1450,7 @@ impl TargetResources {
             .map_err(|_| OverlayError::InvalidInput("标注缓存正被占用".to_string()))?;
         if cache
             .as_ref()
-            .is_some_and(|c| c.revision == annotations.revision)
+            .is_some_and(|c| c.revision == annotations.revision && c.hidden == annotations.hidden)
         {
             return Ok(());
         }
@@ -1394,7 +1485,13 @@ impl TargetResources {
             flat_stroke: &self.flat_stroke,
             frames: &frames,
         };
-        let drawn = painter.draw_shapes(annotations.shapes, surface.origin);
+        let visible = annotations
+            .shapes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != annotations.hidden)
+            .map(|(_, shape)| shape);
+        let drawn = painter.draw_shapes(visible, surface.origin);
         // SAFETY: 与上面的 BeginDraw 配对，出错时也要结束绘制。
         let ended = unsafe { layer.EndDraw(None, None) }.map_err(win32("EndDraw"));
         drawn?;
@@ -1404,6 +1501,7 @@ impl TargetResources {
         *cache = Some(LayerCache {
             bitmap,
             revision: annotations.revision,
+            hidden: annotations.hidden,
         });
         Ok(())
     }
@@ -1850,7 +1948,7 @@ pub(crate) fn to_f32(value: i64) -> f32 {
 }
 
 /// 非负有限的 `f32` 转 `u16`，超出范围饱和。
-fn f32_to_u16(value: f32) -> u16 {
+pub(crate) fn f32_to_u16(value: f32) -> u16 {
     let mut lo = 0u16;
     let mut hi = u16::MAX;
     // 不允许 `as` 截断，用二分找出不大于 value 的最大整数
@@ -2262,5 +2360,195 @@ mod tests {
                 .ok(),
             Some(16)
         );
+    }
+
+    // 文字：真实的 DirectWrite 排版与离屏合成。
+
+    const BIG: Rect = Rect::new(0, 0, 240, 120);
+
+    fn big_grey() -> Vec<u8> {
+        [200u8, 200, 200, 0].repeat(usize::try_from(BIG.width * BIG.height).expect("小"))
+    }
+
+    fn compose_big(shapes: &[Shape]) -> CroppedImage {
+        let renderer = Renderer::new().expect("创建渲染器");
+        let bgra = big_grey();
+        let frame = FrameRef {
+            bounds: BIG,
+            bgra: &bgra,
+        };
+        renderer.compose(frame, &BIG, shapes).expect("合成")
+    }
+
+    fn text_shape(text: &str, size: u32, background: bool) -> Shape {
+        let measure = DWriteMeasure::new().expect("度量");
+        let pad = crate::annotate::text_padding(size, background);
+        let (w, h) = measure.measure(text, size);
+        Shape::Text {
+            origin: Point::new(20, 20),
+            text: text.to_string(),
+            color: RED,
+            size,
+            background,
+            bounds: Rect::new(20, 20, w + pad * 2, h + pad * 2),
+        }
+    }
+
+    fn is_reddish(p: (u8, u8, u8, u8)) -> bool {
+        p.0 > 200 && p.1 < 150 && p.2 < 150
+    }
+
+    fn reddish_pixels(image: &CroppedImage) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                if is_reddish(pixel(image, x, y)) {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn plain_text_paints_the_glyphs_inside_its_bounds_only() {
+        let shape = text_shape("HHH", 40, false);
+        let Shape::Text { bounds, .. } = &shape else {
+            panic!("期望文字图元");
+        };
+        let bounds = *bounds;
+        let image = compose_big(&[shape]);
+        let pixels = reddish_pixels(&image);
+        assert!(
+            pixels.len() > 50,
+            "文字应当画出可见的笔画：{}",
+            pixels.len()
+        );
+        for (x, y) in pixels {
+            let p = Point::new(i32::try_from(x).expect("小"), i32::try_from(y).expect("小"));
+            assert!(
+                Rect::new(
+                    bounds.x - 1,
+                    bounds.y - 1,
+                    bounds.width + 2,
+                    bounds.height + 2
+                )
+                .contains(p),
+                "({x}, {y}) 超出外接框 {bounds:?}"
+            );
+        }
+        // 纯文字没有底色：外接框左上角仍是原图
+        assert_eq!(pixel(&image, 21, 21), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn plain_text_uses_grayscale_antialiasing() {
+        let image = compose_big(&[text_shape("HHH", 40, false)]);
+        // 灰度抗锯齿：边缘像素是文字色与底色的插值，红绿蓝的偏移方向一致；
+        // ClearType 会让三个通道分别向不同方向偏移（出现彩边）
+        let mut edge = 0;
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                let (r, g, b, _) = pixel(&image, x, y);
+                let covered = f32::from(200u8.saturating_sub(g)) / (200.0 - 59.0);
+                if covered > 0.1 && covered < 0.9 {
+                    edge += 1;
+                    let expect_r = 200.0 + (255.0 - 200.0) * covered;
+                    let expect_b = 200.0 + (48.0 - 200.0) * covered;
+                    assert!((f32::from(r) - expect_r).abs() < 12.0, "({x}, {y}) R={r}");
+                    assert!((f32::from(b) - expect_b).abs() < 12.0, "({x}, {y}) B={b}");
+                }
+            }
+        }
+        assert!(edge > 10, "应有抗锯齿的边缘像素");
+    }
+
+    #[test]
+    fn background_text_has_a_translucent_chip_and_contrasting_glyphs() {
+        let shape = text_shape("HHH", 40, true);
+        let Shape::Text { bounds, .. } = &shape else {
+            panic!("期望文字图元");
+        };
+        let bounds = *bounds;
+        let image = compose_big(&[shape]);
+        // 内边距 10：外接框内缘、字形之外的位置是 85% 的底色叠在原图上
+        let inset = |dx: i32, dy: i32| {
+            pixel(
+                &image,
+                u32::try_from(bounds.x + dx).expect("小"),
+                u32::try_from(bounds.y + dy).expect("小"),
+            )
+        };
+        let (r, g, b, _) = inset(5, 5);
+        assert!(
+            near(r, 247, 3) && near(g, 80, 3) && near(b, 71, 3),
+            "{r} {g} {b}"
+        );
+        assert_eq!(pixel(&image, 5, 5), (200, 200, 200, 255));
+        // 字形用对比色（红底配白字）
+        let white = (0..image.height())
+            .flat_map(|y| (0..image.width()).map(move |x| (x, y)))
+            .filter(|(x, y)| pixel(&image, *x, *y).1 > 230)
+            .count();
+        assert!(white > 30, "底色模式下应有白色字形：{white}");
+    }
+
+    #[test]
+    fn multiline_text_is_taller_than_one_line() {
+        let one = compose_big(&[text_shape("HH", 30, false)]);
+        let two = compose_big(&[text_shape("HH\nHH", 30, false)]);
+        let rows = |image: &CroppedImage| {
+            let ys: Vec<u32> = reddish_pixels(image).iter().map(|(_, y)| *y).collect();
+            ys.iter().max().copied().unwrap_or(0) - ys.iter().min().copied().unwrap_or(0)
+        };
+        assert!(
+            rows(&two) > rows(&one) + 20,
+            "{} {}",
+            rows(&one),
+            rows(&two)
+        );
+    }
+
+    #[test]
+    fn dwrite_measure_orders_widths_and_heights() {
+        let m = DWriteMeasure::new().expect("度量");
+        let (w_a, h_a) = m.measure("a", 24);
+        let (w_ab, _) = m.measure("ab", 24);
+        assert!(w_ab > w_a && w_a > 0 && h_a > 0);
+        let (w_cn, _) = m.measure("中文", 24);
+        assert!(w_cn > w_ab);
+        let (_, h_two) = m.measure("a\nb", 24);
+        assert!(h_two >= h_a * 2 - 2, "{h_two} vs {h_a}");
+        let (w_big, h_big) = m.measure("a", 48);
+        assert!(w_big > w_a && h_big > h_a);
+        // 空文字：宽 0、高为一行
+        let (w_empty, h_empty) = m.measure("", 24);
+        assert_eq!(w_empty, 0);
+        assert!(h_empty > 0);
+        // 末尾换行多出一行
+        assert!(m.measure("a\n", 24).1 > h_a);
+    }
+
+    #[test]
+    fn dwrite_caret_moves_with_index_lines_and_surrogates() {
+        let m = DWriteMeasure::new().expect("度量");
+        let (x0, y0, h) = m.caret("ab", 24, 0);
+        let (x2, y2, _) = m.caret("ab", 24, 2);
+        assert_eq!((x0, y0), (0, 0));
+        assert!(x2 > x0 && y2 == y0 && h > 0);
+        let (xl, yl, _) = m.caret("ab\nc", 24, 3);
+        assert_eq!(xl, 0);
+        assert!(yl >= i32::try_from(h).expect("小") - 2);
+        // 代理对按一个字符计：光标在表情之后、a 之前
+        let (xe, _, _) = m.caret("😀a", 24, 1);
+        let (xa, _, _) = m.caret("😀a", 24, 2);
+        assert!(xe > 0 && xa > xe);
+        // 空文字也有行高，光标在行首
+        let (xz, yz, hz) = m.caret("", 24, 0);
+        assert_eq!((xz, yz), (0, 0));
+        assert!(hz > 0);
+        // 序号越界时取末尾而不是失败
+        let (xo, _, _) = m.caret("ab", 24, 99);
+        assert_eq!(xo, x2);
     }
 }

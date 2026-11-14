@@ -45,6 +45,8 @@ pub enum Stage {
     LiveAdjusting,
     /// 已选中标注工具。
     Annotating,
+    /// 文字标注编辑中。
+    Editing,
 }
 
 /// 生成提示所需的可选功能。
@@ -105,6 +107,15 @@ pub fn hints(stage: Stage, features: Features) -> Vec<Hint> {
             out.push(hint("Ctrl + Y", "重做"));
             out.push(hint("右键 / Esc", "退出工具"));
             out.push(hint("Enter", "复制"));
+        }
+        Stage::Editing => {
+            out.push(hint("Enter", "确认"));
+            out.push(hint("Shift + Enter", "换行"));
+            out.push(hint("Esc", "放弃"));
+            out.push(hint("Ctrl + V", "粘贴"));
+            out.push(hint("滚轮", "字号"));
+            // 编辑中 ? 是普通字符，不再提示它能隐藏面板
+            return out;
         }
     }
     out.push(hint("?", "隐藏提示"));
@@ -168,6 +179,12 @@ mod tests {
             assert!(list.contains(&expected), "缺少 {expected}");
         }
         assert!(!list.contains(&"方向键"));
+    }
+
+    #[test]
+    fn editing_lists_edit_keys_without_toggle_hint() {
+        let list = keys(&hints(Stage::Editing, ALL));
+        assert_eq!(list, ["Enter", "Shift + Enter", "Esc", "Ctrl + V", "滚轮"]);
     }
 
     #[test]

@@ -11,27 +11,39 @@ use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::selection::Selection;
 use lenswin_core::snip::LiveEvent;
-use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use lenswin_core::text_edit::char_index_of_utf16;
+use windows::Win32::Foundation::{
+    GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::Ime::{
+    CANDIDATEFORM, CFS_EXCLUDE, CPS_CANCEL, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR, HIMC,
+    IACE_DEFAULT, IME_COMPOSITION_STRING, ISC_SHOWUICOMPOSITIONWINDOW, ImmAssociateContextEx,
+    ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME, ImmReleaseContext,
+    ImmSetCandidateWindow, NI_COMPOSITIONSTR,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_A, VK_C, VK_CONTROL, VK_D,
-    VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT,
-    VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_W, VK_Y, VK_Z,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_A, VK_BACK, VK_C,
+    VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_LEFT, VK_OEM_2,
+    VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_V, VK_W,
+    VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, PostQuitMessage,
-    RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetForegroundWindow,
-    SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGING,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG,
+    PostQuitMessage, RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos,
+    SetForegroundWindow, SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS,
+    WM_CHAR, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
+    WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::adjust::{Direction, NudgeMode};
+use crate::annotate::EditKey;
 use crate::error::{OverlayError, win32};
 use crate::glow;
 use crate::input::{CursorKind, Interaction, Key, KeyCommand, Outcome, point_from_lparam};
@@ -45,6 +57,10 @@ const CLASS_NAME: PCWSTR = w!("LenswinOverlayWindow");
 const GLOW_TIMER_ID: usize = 1;
 /// 辉光动画的帧间隔（毫秒），约 60 帧每秒。
 const GLOW_FRAME_MS: u32 = 16;
+/// 文字光标闪烁计时器的标识。
+const CARET_TIMER_ID: usize = 2;
+/// 文字光标闪烁周期的一半（毫秒）。
+const CARET_BLINK_MS: u32 = 530;
 
 /// 显式丢弃无法处理的返回值。
 fn discard<T>(_value: T) {}
@@ -68,6 +84,93 @@ struct Session {
     started: Instant,
     error: Option<OverlayError>,
     mode: SessionMode,
+    /// 当前关联了输入法的窗口序号，只有文字编辑期间才有。
+    ime_window: Option<usize>,
+    /// 最近一次交给输入法的候选窗排除区域，避免每次移动鼠标都重复设置。
+    candidate: Option<(usize, Rect)>,
+    /// `WM_CHAR` 里等待低位的高位代理项。
+    pending_high: Option<u16>,
+    /// 光标闪烁计时器正在运行。
+    caret_timer: bool,
+}
+
+/// 输入法上下文，离开作用域时释放。
+struct ImeContext {
+    hwnd: HWND,
+    himc: HIMC,
+}
+
+impl ImeContext {
+    fn get(hwnd: HWND) -> Option<Self> {
+        // SAFETY: hwnd 是本线程的有效窗口；没有输入法上下文时返回空句柄。
+        let himc = unsafe { ImmGetContext(hwnd) };
+        (!himc.0.is_null()).then_some(Self { hwnd, himc })
+    }
+
+    /// 读取组字或结果字符串；读不到按空串处理。
+    fn read(&self, kind: IME_COMPOSITION_STRING) -> String {
+        // SAFETY: himc 有效；缓冲区为空时只查询字节数。
+        let bytes = unsafe { ImmGetCompositionStringW(self.himc, kind, None, 0) };
+        let Some(units) = usize::try_from(bytes)
+            .ok()
+            .map(|b| b / 2)
+            .filter(|u| *u > 0)
+        else {
+            return String::new();
+        };
+        let mut buffer = vec![0u16; units];
+        let capacity = u32::try_from(units.saturating_mul(2)).unwrap_or(0);
+        // SAFETY: buffer 容纳 capacity 个字节，调用期间有效。
+        let written = unsafe {
+            ImmGetCompositionStringW(self.himc, kind, Some(buffer.as_mut_ptr().cast()), capacity)
+        };
+        let written = usize::try_from(written).unwrap_or(0) / 2;
+        String::from_utf16_lossy(buffer.get(..written.min(units)).unwrap_or_default())
+    }
+
+    /// 组字光标在组字串里的 UTF-16 偏移。
+    fn cursor(&self) -> usize {
+        // SAFETY: himc 有效；GCS_CURSORPOS 只返回位置，不读缓冲区。
+        let pos = unsafe { ImmGetCompositionStringW(self.himc, GCS_CURSORPOS, None, 0) };
+        usize::try_from(pos).unwrap_or(0)
+    }
+
+    /// 取消未完成的组字。
+    fn cancel_composition(&self) {
+        // 取消失败只会让输入法自己保留组字串，随后解除关联时也会被丢弃
+        // SAFETY: himc 有效。
+        discard(unsafe { ImmNotifyIME(self.himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0) });
+    }
+
+    /// 候选窗放在 `line` 下方，并排除该行不被遮挡；`line` 为窗口客户区坐标。
+    fn place_candidates(&self, line: &Rect) {
+        let clamp = |v: i64| i32::try_from(v).unwrap_or(0);
+        let form = CANDIDATEFORM {
+            dwIndex: 0,
+            dwStyle: CFS_EXCLUDE,
+            ptCurrentPos: POINT {
+                x: clamp(i64::from(line.x)),
+                y: clamp(line.bottom()),
+            },
+            rcArea: RECT {
+                left: clamp(i64::from(line.x)),
+                top: clamp(i64::from(line.y)),
+                right: clamp(line.right()),
+                bottom: clamp(line.bottom()),
+            },
+        };
+        // 定位失败时候选窗停在输入法默认位置，输入本身不受影响
+        // SAFETY: himc 有效，form 为局部变量。
+        discard(unsafe { ImmSetCandidateWindow(self.himc, &form) });
+    }
+}
+
+impl Drop for ImeContext {
+    fn drop(&mut self) {
+        // Drop 中无法上报，忽略释放失败
+        // SAFETY: 与 get 中取得的上下文配对，仅释放一次。
+        discard(unsafe { ImmReleaseContext(self.hwnd, self.himc) });
+    }
 }
 
 /// 会话的运行方式。
@@ -204,6 +307,85 @@ impl Session {
         )
     }
 
+    /// 开关窗口的输入法：关联默认上下文即启用，解除关联即禁用。
+    fn set_ime(&self, index: usize, enabled: bool) {
+        let Some(slot) = self.windows.get(index) else {
+            return;
+        };
+        if !enabled && let Some(context) = ImeContext::get(slot.hwnd) {
+            context.cancel_composition();
+        }
+        let flags = if enabled { IACE_DEFAULT } else { 0 };
+        // 切换失败只影响内联组字或单键快捷键，不中断截屏
+        // SAFETY: hwnd 是本会话创建的有效窗口，空上下文句柄表示默认上下文或禁用。
+        discard(unsafe { ImmAssociateContextEx(slot.hwnd, HIMC::default(), flags) });
+    }
+
+    /// 文字编辑与系统的同步：输入法关联、候选窗位置、键盘焦点和光标闪烁计时器。
+    fn sync_editing(&mut self) {
+        let target = self.interaction.ime_target();
+        let wanted = target.as_ref().map(|(index, _)| *index);
+        if self.ime_window != wanted {
+            if let Some(old) = self.ime_window {
+                self.set_ime(old, false);
+            }
+            if let Some(new) = wanted {
+                self.set_ime(new, true);
+            }
+            self.ime_window = wanted;
+            self.candidate = None;
+        }
+        if let Some(index) = self.interaction.take_focus_request()
+            && let Some(slot) = self.windows.get(index)
+        {
+            // 键盘焦点必须在文本框所在显示器的窗口上才能收到按键；失败时仍可点击确认
+            // SAFETY: hwnd 是本线程创建的有效窗口。
+            discard(unsafe { SetFocus(Some(slot.hwnd)) });
+        }
+        if let Some((index, line)) = target {
+            self.position_candidates(index, &line);
+        }
+        self.sync_caret_timer(wanted.is_some());
+    }
+
+    fn position_candidates(&mut self, index: usize, line: &Rect) {
+        if self.candidate == Some((index, *line)) {
+            return;
+        }
+        let Some(slot) = self.windows.get(index) else {
+            return;
+        };
+        let local = Rect::from_edges(
+            i64::from(line.x) - i64::from(slot.origin.x),
+            i64::from(line.y) - i64::from(slot.origin.y),
+            line.right() - i64::from(slot.origin.x),
+            line.bottom() - i64::from(slot.origin.y),
+        );
+        if let (Some(local), Some(context)) = (local, ImeContext::get(slot.hwnd)) {
+            context.place_candidates(&local);
+        }
+        self.candidate = Some((index, *line));
+    }
+
+    /// 编辑期间光标按固定周期闪烁；输入或移动光标后重新计时，让光标立即可见。
+    fn sync_caret_timer(&mut self, editing: bool) {
+        let reset = self.interaction.take_blink_reset();
+        let Some(hwnd) = self.windows.first().map(|s| s.hwnd) else {
+            return;
+        };
+        if editing && (!self.caret_timer || reset) {
+            // 启动失败时光标常亮，输入不受影响
+            // SAFETY: hwnd 是本线程创建的有效窗口，不使用回调函数。
+            discard(unsafe { SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None) });
+            self.caret_timer = true;
+        } else if !editing && self.caret_timer {
+            // 窗口销毁时计时器随之释放
+            // SAFETY: 计时器由该窗口持有。
+            discard(unsafe { KillTimer(Some(hwnd), CARET_TIMER_ID) });
+            self.caret_timer = false;
+        }
+    }
+
     fn elapsed_secs(&self) -> f32 {
         self.started.elapsed().as_secs_f32()
     }
@@ -279,6 +461,7 @@ fn update(hwnd: HWND, change: impl FnOnce(&mut Session)) {
             // SAFETY: 无前置条件。
             discard(unsafe { ReleaseCapture() });
         }
+        s.sync_editing();
         s.invalidate_windows(&before);
         s.invalidate_windows(&s.interaction.painted_windows());
     });
@@ -367,10 +550,41 @@ fn history_key(vk: VIRTUAL_KEY) -> Option<Key> {
     }
 }
 
+/// 编辑文字时的按键映射；不在表里的按键编辑中一律忽略，其它覆盖层快捷键全部暂停。
+fn editing_key_of(vk: VIRTUAL_KEY) -> Option<Key> {
+    let ctrl = is_down(VK_CONTROL);
+    let key = match vk {
+        VK_RETURN if is_down(VK_SHIFT) => Key::Edit(EditKey::Newline),
+        VK_RETURN => Key::Enter,
+        VK_ESCAPE => Key::Escape,
+        VK_BACK => Key::Edit(EditKey::Backspace),
+        VK_DELETE => Key::Edit(EditKey::Delete),
+        VK_LEFT => Key::Edit(EditKey::Left),
+        VK_RIGHT => Key::Edit(EditKey::Right),
+        VK_UP => Key::Edit(EditKey::Up),
+        VK_DOWN => Key::Edit(EditKey::Down),
+        VK_HOME => Key::Edit(EditKey::Home),
+        VK_END => Key::Edit(EditKey::End),
+        VK_TAB => Key::Edit(EditKey::Tab),
+        VK_V if ctrl => Key::Paste,
+        VK_Z if ctrl => Key::Undo,
+        _ => return None,
+    };
+    Some(key)
+}
+
 fn on_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     let Some(vk) = u16::try_from(wparam.0).ok().map(VIRTUAL_KEY) else {
         return;
     };
+    if with_session(|s| s.interaction.is_editing()).unwrap_or(false) {
+        if let Some(key) = editing_key_of(vk) {
+            update(hwnd, |s| {
+                s.interaction.key(key, NudgeMode::Move, false);
+            });
+        }
+        return;
+    }
     let Some(key) = history_key(vk).or_else(|| key_of(vk)) else {
         return;
     };
@@ -410,6 +624,7 @@ fn set_cursor() {
     let kind = with_session(|s| s.interaction.cursor_kind()).unwrap_or(CursorKind::Cross);
     let id = match kind {
         CursorKind::Cross => IDC_CROSS,
+        CursorKind::Text => IDC_IBEAM,
         CursorKind::Arrow => IDC_ARROW,
         CursorKind::Move => IDC_SIZEALL,
         CursorKind::SizeNs => IDC_SIZENS,
@@ -428,7 +643,7 @@ fn set_cursor() {
 fn on_glow_tick(hwnd: HWND) {
     with_session(|s| {
         if !glow::is_animating(s.visual.glow, s.elapsed_secs()) {
-            // 停不掉只会多几次无变化的重绘，窗口销毁时计时器也会随之释放
+            // 窗口销毁时计时器随之释放
             // SAFETY: hwnd 是本线程创建的窗口，计时器由它持有。
             discard(unsafe { KillTimer(Some(hwnd), GLOW_TIMER_ID) });
         }
@@ -476,6 +691,61 @@ fn wheel_notches(wparam: WPARAM) -> i32 {
     i32::from(i16::from_ne_bytes(high.to_ne_bytes())).signum()
 }
 
+/// 字符消息：UTF-16 代理对分两条消息到达，高位先暂存。
+fn on_char(hwnd: HWND, wparam: WPARAM) {
+    let unit = u16::try_from(wparam.0 & 0xFFFF).unwrap_or(0);
+    update(hwnd, |s| {
+        if !s.interaction.is_editing() {
+            s.pending_high = None;
+            return;
+        }
+        let c = match (s.pending_high.take(), unit) {
+            (Some(high), low) if (0xDC00..0xE000).contains(&low) => {
+                char::decode_utf16([high, low]).next().and_then(Result::ok)
+            }
+            (_, high) if (0xD800..0xDC00).contains(&high) => {
+                s.pending_high = Some(high);
+                None
+            }
+            (_, other) => char::from_u32(u32::from(other)),
+        };
+        if let Some(c) = c {
+            s.interaction.char_input(c);
+        }
+    });
+}
+
+/// 输入法组字消息：结果串按普通输入插入，组字串内联显示。
+fn on_ime_composition(hwnd: HWND, lparam: LPARAM) {
+    let flags = u32::try_from(lparam.0 & 0xFFFF_FFFF).unwrap_or(0);
+    let has_result = flags & GCS_RESULTSTR.0 != 0;
+    let has_comp = flags & GCS_COMPSTR.0 != 0;
+    if !has_result && !has_comp {
+        return;
+    }
+    let Some(context) = ImeContext::get(hwnd) else {
+        return;
+    };
+    let result = has_result.then(|| context.read(GCS_RESULTSTR));
+    let comp = if has_comp {
+        context.read(GCS_COMPSTR)
+    } else {
+        String::new()
+    };
+    let cursor = char_index_of_utf16(&comp, context.cursor());
+    // 先释放上下文再进入会话更新，更新里还会取一次上下文来定位候选窗
+    drop(context);
+    update(hwnd, |s| {
+        if !s.interaction.is_editing() {
+            return;
+        }
+        if let Some(text) = &result {
+            s.interaction.ime_commit(text);
+        }
+        s.interaction.ime_composition(&comp, cursor);
+    });
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -514,6 +784,32 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER if wparam.0 == GLOW_TIMER_ID => {
             on_glow_tick(hwnd);
             return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == CARET_TIMER_ID => {
+            with_session(|s| {
+                s.interaction.toggle_caret();
+                s.invalidate_windows(&s.interaction.painted_windows());
+            });
+            return LRESULT(0);
+        }
+        WM_CHAR => {
+            on_char(hwnd, wparam);
+            return LRESULT(0);
+        }
+        // 屏蔽系统自带的组字窗口，组字串由覆盖层自己内联绘制
+        WM_IME_STARTCOMPOSITION => return LRESULT(0),
+        WM_IME_COMPOSITION => {
+            on_ime_composition(hwnd, lparam);
+            return LRESULT(0);
+        }
+        WM_IME_ENDCOMPOSITION => {
+            update(hwnd, |s| s.interaction.ime_end());
+            return LRESULT(0);
+        }
+        WM_IME_SETCONTEXT => {
+            let hide = isize::try_from(ISC_SHOWUICOMPOSITIONWINDOW).unwrap_or(0);
+            // SAFETY: 参数原样来自系统传入的窗口消息，只去掉「显示组字窗口」标志，候选窗照常显示。
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, LPARAM(lparam.0 & !hide)) };
         }
         // 弹窗显示后点击覆盖层不激活，焦点和 Esc 留在弹窗
         WM_MOUSEACTIVATE if with_session(|s| s.yields_to_popup()).unwrap_or(false) => {
@@ -712,11 +1008,18 @@ fn open(input: SessionInput, mode: SessionMode) -> Result<Windows, OverlayError>
                 started: Instant::now(),
                 error: None,
                 mode,
+                ime_window: None,
+                candidate: None,
+                pending_high: None,
+                caret_timer: false,
             });
         })
         .map_err(|_| OverlayError::InvalidInput("无法初始化覆盖层会话".to_string()))?;
 
     for (hwnd, x, y, w, h) in placements {
+        // 非编辑时解除输入法，避免单键快捷键被截走
+        // SAFETY: hwnd 是刚创建的有效窗口，空上下文句柄加零标志表示禁用输入法。
+        discard(unsafe { ImmAssociateContextEx(hwnd, HIMC::default(), 0) });
         // SAFETY: hwnd 是刚创建的有效窗口。
         unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW) }
             .map_err(win32("SetWindowPos"))?;

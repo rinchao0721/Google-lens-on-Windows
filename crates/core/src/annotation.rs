@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     ANNOTATE_WIDTH_RANGE, HIGHLIGHTER_WIDTH_RANGE, MOSAIC_BLOCK_RANGE, NUMBER_SIZE_RANGE,
+    TEXT_SIZE_RANGE,
 };
 use crate::geometry::{Point, Rect};
 
@@ -27,6 +28,12 @@ pub const HIGHLIGHTER_WIDTH_STEP: u32 = 2;
 pub const MOSAIC_BLOCK_STEP: u32 = 2;
 /// 滚轮调整粗细的步长：序号直径。
 pub const NUMBER_SIZE_STEP: u32 = 2;
+/// 滚轮调整粗细的步长：文字字号。
+pub const TEXT_SIZE_STEP: u32 = 2;
+/// 底色文字的底色不透明度。
+pub const TEXT_BACKGROUND_ALPHA: f32 = 0.85;
+/// 底色文字的内边距相对字号的比例，用整数比表示：`字号 / 4`。
+pub const TEXT_PADDING_DIVISOR: u32 = 4;
 
 /// 标注工具，顺序即工具栏顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +54,13 @@ pub enum Tool {
     Mosaic,
     /// 序号。
     Number,
+    /// 文字。
+    Text,
 }
 
 impl Tool {
     /// 全部工具。
-    pub const ALL: [Tool; 8] = [
+    pub const ALL: [Tool; 9] = [
         Tool::Rectangle,
         Tool::Ellipse,
         Tool::Line,
@@ -60,6 +69,7 @@ impl Tool {
         Tool::Highlighter,
         Tool::Mosaic,
         Tool::Number,
+        Tool::Text,
     ];
 
     /// 面向用户的中文名称。
@@ -73,6 +83,7 @@ impl Tool {
             Tool::Highlighter => "荧光笔",
             Tool::Mosaic => "马赛克",
             Tool::Number => "序号",
+            Tool::Text => "文字",
         }
     }
 
@@ -88,6 +99,7 @@ impl Tool {
             Tool::Highlighter => [12, 20, 32],
             Tool::Mosaic => [8, 16, 32],
             Tool::Number => [20, 28, 40],
+            Tool::Text => [16, 24, 36],
         }
     }
 
@@ -109,6 +121,10 @@ impl Tool {
             Tool::Number => SizeSpec {
                 range: NUMBER_SIZE_RANGE,
                 step: NUMBER_SIZE_STEP,
+            },
+            Tool::Text => SizeSpec {
+                range: TEXT_SIZE_RANGE,
+                step: TEXT_SIZE_STEP,
             },
         }
     }
@@ -339,6 +355,21 @@ pub enum Shape {
         /// 圆的直径。
         size: u32,
     },
+    /// 文字，可多行，不自动换行。
+    Text {
+        /// 文本框左上角，底色模式下含内边距。
+        origin: Point,
+        /// 内容。
+        text: String,
+        /// 文字颜色；底色模式下为底色。
+        color: Color,
+        /// 字号（像素）。
+        size: u32,
+        /// 是否带底色。
+        background: bool,
+        /// 确认时量出的外接框，命中测试用。
+        bounds: Rect,
+    },
 }
 
 impl Shape {
@@ -353,15 +384,38 @@ impl Shape {
             Shape::Highlighter { .. } => Tool::Highlighter,
             Shape::Mosaic { .. } => Tool::Mosaic,
             Shape::Number { .. } => Tool::Number,
+            Shape::Text { .. } => Tool::Text,
         }
     }
 }
 
-/// 图元列表与重做栈；`revision` 在内容变化时递增，供绘制缓存判断是否失效。
+/// 撤销一步所需的信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UndoStep {
+    /// 撤销一次添加：弹出最后一个图元。
+    Push,
+    /// 撤销一次替换：把 `index` 处恢复为 `before`。
+    Replace { index: usize, before: Shape },
+    /// 撤销一次删除：把 `shape` 插回 `index`。
+    Remove { index: usize, shape: Shape },
+}
+
+/// 重做一步所需的信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedoStep {
+    Push(Shape),
+    Replace { index: usize, after: Shape },
+    Remove { index: usize },
+}
+
+/// 图元列表与撤销重做栈；`revision` 在内容变化时递增，供绘制缓存判断是否失效。
+///
+/// 添加、替换、删除各占一步撤销；任何新操作都会清空重做栈。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Document {
     shapes: Vec<Shape>,
-    redo: Vec<Shape>,
+    undo: Vec<UndoStep>,
+    redo: Vec<RedoStep>,
     revision: u64,
 }
 
@@ -386,40 +440,88 @@ impl Document {
         self.shapes.is_empty()
     }
 
-    /// 添加图元并清空重做栈。
+    /// 添加图元。
     pub fn push(&mut self, shape: Shape) {
         self.shapes.push(shape);
-        self.redo.clear();
-        self.bump();
+        self.record(UndoStep::Push);
     }
 
-    /// 撤销最后一个图元；没有可撤销的返回 `false`。
+    /// 把 `index` 处的图元换成 `shape`；序号越界返回 `false`。
+    pub fn replace(&mut self, index: usize, shape: Shape) -> bool {
+        let Some(slot) = self.shapes.get_mut(index) else {
+            return false;
+        };
+        let before = std::mem::replace(slot, shape);
+        self.record(UndoStep::Replace { index, before });
+        true
+    }
+
+    /// 删除 `index` 处的图元；序号越界返回 `false`。
+    pub fn remove(&mut self, index: usize) -> bool {
+        if index >= self.shapes.len() {
+            return false;
+        }
+        let shape = self.shapes.remove(index);
+        self.record(UndoStep::Remove { index, shape });
+        true
+    }
+
+    /// 撤销上一步；没有可撤销的返回 `false`。
     pub fn undo(&mut self) -> bool {
-        match self.shapes.pop() {
-            Some(shape) => {
-                self.redo.push(shape);
-                self.bump();
-                true
+        let Some(step) = self.undo.pop() else {
+            return false;
+        };
+        match step {
+            UndoStep::Push => {
+                if let Some(shape) = self.shapes.pop() {
+                    self.redo.push(RedoStep::Push(shape));
+                }
             }
-            None => false,
+            UndoStep::Replace { index, before } => {
+                if let Some(slot) = self.shapes.get_mut(index) {
+                    let after = std::mem::replace(slot, before);
+                    self.redo.push(RedoStep::Replace { index, after });
+                }
+            }
+            UndoStep::Remove { index, shape } => {
+                self.shapes.insert(index.min(self.shapes.len()), shape);
+                self.redo.push(RedoStep::Remove { index });
+            }
         }
+        self.bump();
+        true
     }
 
-    /// 重做最近撤销的图元；没有可重做的返回 `false`。
+    /// 重做最近撤销的一步；没有可重做的返回 `false`。
     pub fn redo(&mut self) -> bool {
-        match self.redo.pop() {
-            Some(shape) => {
+        let Some(step) = self.redo.pop() else {
+            return false;
+        };
+        match step {
+            RedoStep::Push(shape) => {
                 self.shapes.push(shape);
-                self.bump();
-                true
+                self.undo.push(UndoStep::Push);
             }
-            None => false,
+            RedoStep::Replace { index, after } => {
+                if let Some(slot) = self.shapes.get_mut(index) {
+                    let before = std::mem::replace(slot, after);
+                    self.undo.push(UndoStep::Replace { index, before });
+                }
+            }
+            RedoStep::Remove { index } => {
+                if index < self.shapes.len() {
+                    let shape = self.shapes.remove(index);
+                    self.undo.push(UndoStep::Remove { index, shape });
+                }
+            }
         }
+        self.bump();
+        true
     }
 
     /// 能否撤销。
     pub fn can_undo(&self) -> bool {
-        !self.shapes.is_empty()
+        !self.undo.is_empty()
     }
 
     /// 能否重做。
@@ -439,6 +541,19 @@ impl Document {
             })
             .max()
             .map_or(1, |max| max.saturating_add(1))
+    }
+
+    /// 命中点的文字图元序号：按外接框判断，后添加的优先。
+    pub fn text_at(&self, p: Point) -> Option<usize> {
+        self.shapes.iter().enumerate().rev().find_map(|(i, shape)| {
+            matches!(shape, Shape::Text { bounds, .. } if bounds.contains(p)).then_some(i)
+        })
+    }
+
+    fn record(&mut self, step: UndoStep) {
+        self.undo.push(step);
+        self.redo.clear();
+        self.bump();
     }
 
     fn bump(&mut self) {
@@ -660,6 +775,87 @@ mod tests {
         assert!(!doc.redo());
     }
 
+    fn text(value: &str, x: i32) -> Shape {
+        Shape::Text {
+            origin: p(x, 0),
+            text: value.to_string(),
+            color: PALETTE[0],
+            size: 24,
+            background: false,
+            bounds: Rect::new(x, 0, 20, 20),
+        }
+    }
+
+    #[test]
+    fn replace_is_one_undo_step_and_restores_original() {
+        let mut doc = Document::new();
+        doc.push(text("a", 0));
+        doc.push(line());
+        assert!(doc.replace(0, text("b", 0)));
+        assert_eq!(doc.shapes().len(), 2);
+        assert!(matches!(doc.shapes().first(), Some(Shape::Text { text, .. }) if text == "b"));
+        assert!(doc.undo());
+        assert!(matches!(doc.shapes().first(), Some(Shape::Text { text, .. }) if text == "a"));
+        assert_eq!(doc.shapes().len(), 2);
+        assert!(doc.redo());
+        assert!(matches!(doc.shapes().first(), Some(Shape::Text { text, .. }) if text == "b"));
+        assert!(!doc.replace(5, text("x", 0)));
+    }
+
+    #[test]
+    fn remove_is_one_undo_step_and_reinserts_in_place() {
+        let mut doc = Document::new();
+        doc.push(text("a", 0));
+        doc.push(line());
+        doc.push(text("c", 40));
+        assert!(doc.remove(1));
+        assert_eq!(doc.shapes().len(), 2);
+        assert!(doc.undo());
+        assert_eq!(doc.shapes().len(), 3);
+        assert_eq!(doc.shapes().get(1), Some(&line()));
+        assert!(doc.redo());
+        assert_eq!(doc.shapes().len(), 2);
+        assert!(!doc.remove(9));
+        for _ in 0..4 {
+            assert!(doc.undo());
+        }
+        assert!(doc.shapes().is_empty());
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn mixed_operations_unwind_in_reverse_order() {
+        let mut doc = Document::new();
+        doc.push(text("a", 0));
+        doc.replace(0, text("b", 0));
+        doc.push(line());
+        doc.remove(0);
+        assert_eq!(doc.shapes(), &[line()]);
+        for _ in 0..4 {
+            assert!(doc.undo());
+        }
+        assert!(doc.shapes().is_empty());
+        for _ in 0..4 {
+            assert!(doc.redo());
+        }
+        assert_eq!(doc.shapes(), &[line()]);
+        assert!(doc.undo());
+        doc.replace(0, text("z", 0));
+        assert!(!doc.can_redo(), "新操作应清空重做栈");
+    }
+
+    #[test]
+    fn text_hit_test_prefers_the_latest_shape() {
+        let mut doc = Document::new();
+        doc.push(text("old", 0));
+        doc.push(line());
+        doc.push(text("new", 10));
+        assert_eq!(doc.text_at(p(15, 5)), Some(2));
+        assert_eq!(doc.text_at(p(5, 5)), Some(0));
+        assert_eq!(doc.text_at(p(100, 5)), None);
+        assert_eq!(doc.text_at(p(5, 25)), None);
+    }
+
     #[test]
     fn revision_changes_on_every_mutation_only() {
         let mut doc = Document::new();
@@ -759,6 +955,18 @@ mod tests {
         assert_eq!(Tool::Highlighter.size_presets(), [12, 20, 32]);
         assert_eq!(Tool::Mosaic.size_presets(), [8, 16, 32]);
         assert_eq!(Tool::Number.size_presets(), [20, 28, 40]);
+    }
+
+    #[test]
+    fn text_tool_presets_are_16_24_36() {
+        assert_eq!(Tool::Text.size_presets(), [16, 24, 36]);
+        assert_eq!(Tool::Text.label(), "文字");
+        assert!(Tool::Text.has_color());
+        assert_eq!(*Tool::Text.size_spec().range.start(), 12);
+        assert_eq!(*Tool::Text.size_spec().range.end(), 96);
+        assert_eq!(Tool::Text.size_spec().step, 2);
+        assert_eq!(step_size(24, 1, &Tool::Text.size_spec()), 26);
+        assert_eq!(step_size(12, -1, &Tool::Text.size_spec()), 12);
     }
 
     #[test]

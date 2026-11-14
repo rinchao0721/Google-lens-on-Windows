@@ -55,6 +55,8 @@ pub struct SelectRequest<'a> {
     pub history: &'a [Rect],
     /// 标注工具的初始样式，只在截屏流程用到。
     pub annotate: &'a AnnotateConfig,
+    /// 冻结时的剪贴板文本快照，已清洗；文字标注粘贴用，overlay 自己不读剪贴板。
+    pub clipboard_text: Option<&'a str>,
 }
 
 /// 校验帧与显示器一一对应。
@@ -175,9 +177,12 @@ fn session_input(
             HintState::Hidden
         },
         annotate: request.annotate.clone(),
+        clipboard_text: request.clipboard_text.map(str::to_string),
     };
+    let measure = Rc::new(paint::DWriteMeasure::new()?);
     Ok(SessionInput {
-        interaction: Interaction::new(tool, request.monitors.to_vec(), options),
+        interaction: Interaction::new(tool, request.monitors.to_vec(), options)
+            .with_measure(measure),
         monitors: request.monitors.to_vec(),
         bgra_frames: request
             .frames
@@ -225,6 +230,7 @@ mod tests {
             windows: &[],
             history: &[],
             annotate,
+            clipboard_text: None,
         }
     }
 

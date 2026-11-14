@@ -2,14 +2,153 @@
 //!
 //! 图元坐标为虚拟桌面物理像素；所有输入点先限制在选区所在显示器内。
 
+use std::rc::Rc;
+
 use lenswin_core::annotation::{
-    Color, Document, NumberStyle, PALETTE, Shape, Tool, constrain_square, drag_is_valid,
-    palette_index, snap_angle, step_size,
+    Color, Document, NumberStyle, PALETTE, Shape, TEXT_PADDING_DIVISOR, Tool, constrain_square,
+    drag_is_valid, palette_index, snap_angle, step_size,
 };
 use lenswin_core::config::{
-    AnnotateConfig, HighlighterConfig, MosaicConfig, NumberConfig, StrokeConfig,
+    AnnotateConfig, HighlighterConfig, MosaicConfig, NumberConfig, StrokeConfig, TextConfig,
 };
 use lenswin_core::geometry::{Point, Rect};
+use lenswin_core::text_edit::TextBuffer;
+
+/// 文字排版度量，由窗口层的 DirectWrite 实现；状态机只依赖这个接口，保持与 Win32 无关。
+pub trait TextMeasure {
+    /// 排版后的（宽, 高）像素；空文字宽为 0、高为一行。
+    fn measure(&self, text: &str, size: u32) -> (u32, u32);
+    /// 第 `char_index` 个字符处光标的（x, y, 行高），相对文字左上角。
+    fn caret(&self, text: &str, size: u32, char_index: usize) -> (i32, i32, u32);
+}
+
+/// 不依赖系统字体的近似度量：每个字符宽 `字号 / 2`，行高 `字号 × 5 / 4`。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApproxMeasure;
+
+impl ApproxMeasure {
+    fn line_height(size: u32) -> u32 {
+        size.saturating_mul(5) / 4
+    }
+}
+
+impl TextMeasure for ApproxMeasure {
+    fn measure(&self, text: &str, size: u32) -> (u32, u32) {
+        let lines = text.split('\n');
+        let widest = lines
+            .clone()
+            .map(|l| u32::try_from(l.chars().count()).unwrap_or(u32::MAX))
+            .max()
+            .unwrap_or(0);
+        let count = u32::try_from(lines.count()).unwrap_or(1);
+        (
+            widest.saturating_mul(size / 2),
+            count.saturating_mul(Self::line_height(size)),
+        )
+    }
+
+    fn caret(&self, text: &str, size: u32, char_index: usize) -> (i32, i32, u32) {
+        let before: String = text.chars().take(char_index).collect();
+        let line = u32::try_from(before.matches('\n').count()).unwrap_or(0);
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count());
+        let x = u32::try_from(column).unwrap_or(0).saturating_mul(size / 2);
+        let height = Self::line_height(size);
+        (
+            i32::try_from(x).unwrap_or(0),
+            i32::try_from(line.saturating_mul(height)).unwrap_or(0),
+            height,
+        )
+    }
+}
+
+/// 编辑中的按键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKey {
+    /// 确认。
+    Confirm,
+    /// 换行。
+    Newline,
+    /// 丢弃本次编辑。
+    Discard,
+    /// 向前删除一个字符。
+    Backspace,
+    /// 向后删除一个字符。
+    Delete,
+    /// 光标左移。
+    Left,
+    /// 光标右移。
+    Right,
+    /// 光标上移一行。
+    Up,
+    /// 光标下移一行。
+    Down,
+    /// 行首。
+    Home,
+    /// 行尾。
+    End,
+    /// 插入 4 个空格。
+    Tab,
+}
+
+/// 文字样式：颜色、字号、是否带底色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextStyle {
+    /// 文字颜色，底色模式下是底色。
+    pub color: Color,
+    /// 字号。
+    pub size: u32,
+    /// 是否带底色。
+    pub background: bool,
+}
+
+/// 文字框内边距：底色模式下为字号的四分之一，纯文字为 0。
+pub fn text_padding(size: u32, background: bool) -> u32 {
+    if background {
+        size / TEXT_PADDING_DIVISOR
+    } else {
+        0
+    }
+}
+
+/// 未完成的输入法组字串。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Composition {
+    text: String,
+    /// 组字光标在组字串里的字符序号。
+    cursor: usize,
+}
+
+/// 正在编辑的文本框。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Editing {
+    origin: Point,
+    monitor: usize,
+    buffer: TextBuffer,
+    composition: Option<Composition>,
+    /// 重新编辑的图元序号。
+    replacing: Option<usize>,
+}
+
+/// 绘制编辑框所需的全部信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditView {
+    /// 文本框左上角（虚拟桌面坐标）。
+    pub origin: Point,
+    /// 所在显示器序号。
+    pub monitor: usize,
+    /// 含组字串的显示文字。
+    pub text: String,
+    /// 组字串在 `text` 中的 UTF-16 范围（起点, 长度）。
+    pub composition: Option<(usize, usize)>,
+    /// 光标在 `text` 中的字符序号。
+    pub caret: usize,
+    /// 当前文字样式。
+    pub style: TextStyle,
+    /// 文本框外接范围。
+    pub bounds: Rect,
+    /// 重新编辑时需要隐藏的原图元序号。
+    pub hidden: Option<usize>,
+}
 
 /// 线条类工具的样式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +181,7 @@ pub struct Styles {
     number_color: Color,
     number_size: u32,
     number_style: NumberStyle,
+    text: TextStyle,
 }
 
 impl Styles {
@@ -64,6 +204,11 @@ impl Styles {
             number_color: Color::from_hex(&config.number.color).unwrap_or(red),
             number_size: config.number.size,
             number_style: config.number.style,
+            text: TextStyle {
+                color: Color::from_hex(&config.text.color).unwrap_or(red),
+                size: config.text.size,
+                background: config.text.background,
+            },
         }
     }
 
@@ -91,6 +236,11 @@ impl Styles {
                 size: self.number_size,
                 style: self.number_style,
             },
+            text: TextConfig {
+                color: self.text.color.to_hex(),
+                size: self.text.size,
+                background: self.text.background,
+            },
         }
     }
 
@@ -102,7 +252,7 @@ impl Styles {
             Tool::Arrow => Some(&mut self.arrow),
             Tool::Pen => Some(&mut self.pen),
             Tool::Highlighter => Some(&mut self.highlighter),
-            Tool::Mosaic | Tool::Number => None,
+            Tool::Mosaic | Tool::Number | Tool::Text => None,
         }
     }
 
@@ -116,6 +266,7 @@ impl Styles {
             Tool::Pen => Some(self.pen.color),
             Tool::Highlighter => Some(self.highlighter.color),
             Tool::Number => Some(self.number_color),
+            Tool::Text => Some(self.text.color),
             Tool::Mosaic => None,
         }
     }
@@ -131,7 +282,13 @@ impl Styles {
             Tool::Highlighter => self.highlighter.width,
             Tool::Mosaic => self.mosaic_block,
             Tool::Number => self.number_size,
+            Tool::Text => self.text.size,
         }
+    }
+
+    /// 文字样式。
+    pub fn text(&self) -> TextStyle {
+        self.text
     }
 
     /// 序号的编号风格。
@@ -142,6 +299,8 @@ impl Styles {
     fn set_color(&mut self, tool: Tool, color: Color) {
         if tool == Tool::Number {
             self.number_color = color;
+        } else if tool == Tool::Text {
+            self.text.color = color;
         } else if let Some(stroke) = self.stroke_mut(tool) {
             stroke.color = color;
         }
@@ -151,6 +310,7 @@ impl Styles {
         match tool {
             Tool::Mosaic => self.mosaic_block = size,
             Tool::Number => self.number_size = size,
+            Tool::Text => self.text.size = size,
             _ => {
                 if let Some(stroke) = self.stroke_mut(tool) {
                     stroke.width = size;
@@ -182,17 +342,20 @@ pub struct StyleView {
     pub preset: Option<usize>,
     /// 序号工具的编号风格；其它工具为 `None`。
     pub number_style: Option<NumberStyle>,
+    /// 文字工具是否带底色；其它工具为 `None`。
+    pub background: Option<bool>,
 }
 
 /// 标注状态机。
-#[derive(Debug, Clone)]
 pub struct Annotator {
     document: Document,
     styles: Styles,
     initial: Styles,
     tool: Option<Tool>,
     drawing: Option<Drawing>,
+    editing: Option<Editing>,
     shift: bool,
+    measure: Rc<dyn TextMeasure>,
 }
 
 /// 把点限制在显示器范围内。
@@ -265,8 +428,15 @@ impl Annotator {
             styles,
             tool: None,
             drawing: None,
+            editing: None,
             shift: false,
+            measure: Rc::new(ApproxMeasure),
         }
+    }
+
+    /// 换上真实的文字度量。
+    pub fn set_measure(&mut self, measure: Rc<dyn TextMeasure>) {
+        self.measure = measure;
     }
 
     /// 当前工具。
@@ -277,6 +447,7 @@ impl Annotator {
     /// 点工具按钮：选中该工具，已选中同一个则退出工具。
     pub fn toggle_tool(&mut self, tool: Tool) {
         self.drawing = None;
+        self.editing = None;
         self.tool = if self.tool == Some(tool) {
             None
         } else {
@@ -287,6 +458,7 @@ impl Annotator {
     /// 退出工具；原本有工具返回 `true`。
     pub fn exit_tool(&mut self) -> bool {
         self.drawing = None;
+        self.editing = None;
         self.tool.take().is_some()
     }
 
@@ -324,6 +496,8 @@ impl Annotator {
                 });
             }
             Tool::Pen | Tool::Highlighter => self.drawing = Some(Drawing::Trail(vec![p])),
+            // 文字由 begin_text 开始编辑，不走拖拽
+            Tool::Text => {}
             _ => self.drawing = Some(Drawing::Drag { from: p, to: p }),
         }
     }
@@ -406,12 +580,14 @@ impl Annotator {
     /// 撤销；有图元被撤销返回 `true`。
     pub fn undo(&mut self) -> bool {
         self.drawing = None;
+        self.editing = None;
         self.document.undo()
     }
 
     /// 重做；有图元被恢复返回 `true`。
     pub fn redo(&mut self) -> bool {
         self.drawing = None;
+        self.editing = None;
         self.document.redo()
     }
 
@@ -443,7 +619,245 @@ impl Annotator {
                 .iter()
                 .position(|v| *v == self.styles.size(tool)),
             number_style: (tool == Tool::Number).then_some(self.styles.number_style),
+            background: (tool == Tool::Text).then_some(self.styles.text.background),
         })
+    }
+
+    /// 设置文字是否带底色。
+    pub fn set_text_background(&mut self, background: bool) {
+        self.styles.text.background = background;
+    }
+
+    /// 正在编辑文字。
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// 在 `p` 处开始新文本框；`bounds` 是所在显示器范围，`monitor` 是其序号。
+    pub fn begin_text(&mut self, p: Point, bounds: &Rect, monitor: usize) {
+        self.editing = Some(Editing {
+            origin: clamp_point(p, bounds),
+            monitor,
+            buffer: TextBuffer::new(),
+            composition: None,
+            replacing: None,
+        });
+    }
+
+    /// 重新编辑第 `index` 个图元（必须是文字）：载入它的内容与样式，样式同时成为当前文字样式。
+    pub fn begin_edit_existing(&mut self, index: usize, monitor: usize) -> bool {
+        let Some(Shape::Text {
+            origin,
+            text,
+            color,
+            size,
+            background,
+            ..
+        }) = self.document.shapes().get(index)
+        else {
+            return false;
+        };
+        self.styles.text = TextStyle {
+            color: *color,
+            size: *size,
+            background: *background,
+        };
+        self.editing = Some(Editing {
+            origin: *origin,
+            monitor,
+            buffer: TextBuffer::from_text(text),
+            composition: None,
+            replacing: Some(index),
+        });
+        true
+    }
+
+    /// 编辑中的文本框内容为空白，且不是重新编辑。
+    pub fn editing_blank_new(&self) -> bool {
+        self.editing
+            .as_ref()
+            .is_some_and(|e| e.replacing.is_none() && e.buffer.is_blank())
+    }
+
+    /// 确认编辑：空白的新文本框不生成图元，空白的重新编辑删除原文字，其余新增或替换；
+    /// 未完成的组字串丢弃。文档有变化返回 `true`。
+    pub fn confirm_text(&mut self) -> bool {
+        let Some(edit) = self.editing.take() else {
+            return false;
+        };
+        let blank = edit.buffer.is_blank();
+        match (edit.replacing, blank) {
+            (None, true) => false,
+            (Some(index), true) => self.document.remove(index),
+            (replacing, false) => {
+                let shape = self.text_shape(edit.origin, &edit.buffer.text());
+                match replacing {
+                    None => {
+                        self.document.push(shape);
+                        true
+                    }
+                    Some(index) if self.document.shapes().get(index) == Some(&shape) => false,
+                    Some(index) => self.document.replace(index, shape),
+                }
+            }
+        }
+    }
+
+    /// 丢弃本次编辑，文档不变。
+    pub fn discard_text(&mut self) {
+        self.editing = None;
+    }
+
+    fn text_shape(&self, origin: Point, text: &str) -> Shape {
+        let style = self.styles.text;
+        let pad = text_padding(style.size, style.background);
+        let (w, h) = self.measure.measure(text, style.size);
+        let bounds = Rect::new(
+            origin.x,
+            origin.y,
+            w.saturating_add(pad.saturating_mul(2)),
+            h.saturating_add(pad.saturating_mul(2)),
+        );
+        Shape::Text {
+            origin,
+            text: text.to_string(),
+            color: style.color,
+            size: style.size,
+            background: style.background,
+            bounds,
+        }
+    }
+
+    /// 编辑中的按键；返回内容是否有变化（用于重置光标闪烁）。
+    pub fn edit_key(&mut self, key: EditKey) -> bool {
+        match key {
+            EditKey::Confirm => {
+                self.confirm_text();
+                return true;
+            }
+            EditKey::Discard => {
+                self.discard_text();
+                return true;
+            }
+            _ => {}
+        }
+        let Some(edit) = self.editing.as_mut() else {
+            return false;
+        };
+        // 组字期间的按键由输入法处理，不会走到这里；残留的组字串在编辑操作前清掉
+        edit.composition = None;
+        let buffer = &mut edit.buffer;
+        match key {
+            EditKey::Newline => buffer.insert_newline(),
+            EditKey::Tab => buffer.insert_tab(),
+            EditKey::Backspace => {
+                buffer.backspace();
+            }
+            EditKey::Delete => {
+                buffer.delete();
+            }
+            EditKey::Left => buffer.move_left(),
+            EditKey::Right => buffer.move_right(),
+            EditKey::Up => buffer.move_up(),
+            EditKey::Down => buffer.move_down(),
+            EditKey::Home => buffer.move_home(),
+            EditKey::End => buffer.move_end(),
+            EditKey::Confirm | EditKey::Discard => {}
+        }
+        true
+    }
+
+    /// 插入一个字符（`WM_CHAR`）；控制字符被忽略。
+    pub fn insert_char(&mut self, c: char) -> bool {
+        self.editing
+            .as_mut()
+            .is_some_and(|e| e.buffer.insert_char(c))
+    }
+
+    /// 插入一段文字（粘贴或输入法结果），控制字符（换行除外）被忽略。
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        self.editing
+            .as_mut()
+            .is_some_and(|e| e.buffer.insert_str(text) > 0)
+    }
+
+    /// 设置组字串；`cursor` 是组字光标在其中的字符序号，空串表示没有组字。
+    pub fn set_composition(&mut self, text: &str, cursor: usize) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.composition = (!text.is_empty()).then(|| Composition {
+                text: text.to_string(),
+                cursor: cursor.min(text.chars().count()),
+            });
+        }
+    }
+
+    /// 清除组字串。
+    pub fn clear_composition(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.composition = None;
+        }
+    }
+
+    /// 带组字串的显示文字、组字串的 UTF-16 范围和光标的字符序号。
+    fn display(edit: &Editing) -> (String, Option<(usize, usize)>, usize) {
+        let before = edit.buffer.before_cursor();
+        let after = edit.buffer.after_cursor();
+        match &edit.composition {
+            Some(c) => {
+                let start = before.encode_utf16().count();
+                let len = c.text.encode_utf16().count();
+                let caret = edit.buffer.cursor() + c.cursor;
+                (
+                    format!("{before}{}{after}", c.text),
+                    Some((start, len)),
+                    caret,
+                )
+            }
+            None => (format!("{before}{after}"), None, edit.buffer.cursor()),
+        }
+    }
+
+    /// 文本框外接范围；没有编辑时为 `None`。宽度至少是半个字号，空文本框也点得到。
+    pub fn edit_bounds(&self) -> Option<Rect> {
+        let edit = self.editing.as_ref()?;
+        let (text, _, _) = Self::display(edit);
+        let style = self.styles.text;
+        let pad = text_padding(style.size, style.background);
+        let (w, h) = self.measure.measure(&text, style.size);
+        Some(Rect::new(
+            edit.origin.x,
+            edit.origin.y,
+            w.max(style.size / 2).saturating_add(pad.saturating_mul(2)),
+            h.saturating_add(pad.saturating_mul(2)),
+        ))
+    }
+
+    /// 绘制编辑框所需的信息。
+    pub fn edit_view(&self) -> Option<EditView> {
+        let edit = self.editing.as_ref()?;
+        let (text, composition, caret) = Self::display(edit);
+        Some(EditView {
+            origin: edit.origin,
+            monitor: edit.monitor,
+            composition,
+            caret,
+            style: self.styles.text,
+            bounds: self.edit_bounds()?,
+            hidden: edit.replacing,
+            text,
+        })
+    }
+
+    /// 光标所在的一行（虚拟桌面坐标，宽 1），输入法候选窗据此定位。
+    pub fn caret_line(&self) -> Option<(usize, Rect)> {
+        let edit = self.editing.as_ref()?;
+        let (text, _, caret) = Self::display(edit);
+        let style = self.styles.text;
+        let pad = i64::from(text_padding(style.size, style.background));
+        let (cx, cy, height) = self.measure.caret(&text, style.size, caret);
+        let x = i64::from(edit.origin.x) + pad + i64::from(cx);
+        let y = i64::from(edit.origin.y) + pad + i64::from(cy);
+        Rect::from_edges(x, y, x + 1, y + i64::from(height.max(1))).map(|r| (edit.monitor, r))
     }
 
     /// 样式相对会话开始时有变化才返回新配置。
@@ -822,6 +1236,349 @@ mod tests {
         let mut none = annotator();
         none.apply_preset(1);
         assert_eq!(none.changed_config(), None);
+    }
+
+    fn text_annotator() -> Annotator {
+        with_tool(Tool::Text)
+    }
+
+    fn type_text(a: &mut Annotator, text: &str) {
+        a.insert_text(text);
+    }
+
+    fn only_text(a: &Annotator) -> (String, Rect) {
+        match a.document().shapes() {
+            [Shape::Text { text, bounds, .. }] => (text.clone(), *bounds),
+            other => panic!("期望一个文字图元，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_text_is_created_on_confirm_with_measured_bounds() {
+        let mut a = text_annotator();
+        a.begin_text(p(100, 100), &MON, 0);
+        assert!(a.is_editing());
+        type_text(&mut a, "ab\ncde");
+        assert!(a.confirm_text());
+        assert!(!a.is_editing());
+        let (text, bounds) = only_text(&a);
+        assert_eq!(text, "ab\ncde");
+        // 字号 24：字符宽 12、行高 30，最宽一行 3 个字符、共 2 行
+        assert_eq!(bounds, Rect::new(100, 100, 36, 60));
+        assert!(a.can_undo());
+    }
+
+    #[test]
+    fn background_adds_padding_to_bounds() {
+        let mut a = text_annotator();
+        a.set_text_background(true);
+        a.begin_text(p(10, 10), &MON, 0);
+        type_text(&mut a, "ab");
+        a.confirm_text();
+        // 内边距 24 / 4 = 6
+        assert_eq!(only_text(&a).1, Rect::new(10, 10, 24 + 12, 30 + 12));
+        assert!(matches!(
+            a.document().shapes().first(),
+            Some(Shape::Text {
+                background: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn blank_new_box_produces_nothing() {
+        for content in ["", "   ", " \n "] {
+            let mut a = text_annotator();
+            a.begin_text(p(5, 5), &MON, 0);
+            type_text(&mut a, content);
+            if content.contains('\n') {
+                a.edit_key(EditKey::Newline);
+            }
+            assert!(!a.confirm_text(), "{content:?}");
+            assert!(a.document().is_empty());
+            assert!(!a.can_undo());
+        }
+    }
+
+    #[test]
+    fn discard_drops_new_box_and_keeps_original_when_reediting() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "x");
+        a.edit_key(EditKey::Discard);
+        assert!(!a.is_editing() && a.document().is_empty());
+
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "keep");
+        a.confirm_text();
+        assert!(a.begin_edit_existing(0, 0));
+        assert_eq!(a.edit_view().map(|v| v.hidden), Some(Some(0)));
+        a.edit_key(EditKey::Backspace);
+        a.discard_text();
+        assert_eq!(only_text(&a).0, "keep");
+    }
+
+    #[test]
+    fn reedit_replaces_in_one_undo_step() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "old");
+        a.confirm_text();
+        assert!(a.begin_edit_existing(0, 0));
+        a.edit_key(EditKey::Backspace);
+        type_text(&mut a, "ER");
+        assert!(a.confirm_text());
+        assert_eq!(only_text(&a).0, "olER");
+        assert!(a.undo());
+        assert_eq!(only_text(&a).0, "old");
+        assert!(a.redo());
+        assert_eq!(only_text(&a).0, "olER");
+    }
+
+    #[test]
+    fn reedit_without_change_is_not_an_undo_step() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "same");
+        a.confirm_text();
+        assert!(a.begin_edit_existing(0, 0));
+        assert!(!a.confirm_text());
+        assert!(a.undo());
+        assert!(a.document().is_empty());
+    }
+
+    #[test]
+    fn reedit_to_blank_removes_and_undo_restores() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "gone");
+        a.confirm_text();
+        assert!(a.begin_edit_existing(0, 0));
+        for _ in 0..4 {
+            a.edit_key(EditKey::Backspace);
+        }
+        assert!(a.confirm_text());
+        assert!(a.document().is_empty());
+        assert!(a.undo());
+        assert_eq!(only_text(&a).0, "gone");
+    }
+
+    #[test]
+    fn begin_edit_existing_rejects_non_text_and_loads_style() {
+        let mut a = with_tool(Tool::Line);
+        assert!(drag(&mut a, p(10, 10), p(100, 100)));
+        assert!(!a.begin_edit_existing(0, 0));
+        assert!(!a.begin_edit_existing(9, 0));
+        a.toggle_tool(Tool::Text);
+        a.set_color(PALETTE[4]);
+        a.set_text_background(true);
+        a.wheel(3);
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "s");
+        a.confirm_text();
+        a.set_color(PALETTE[1]);
+        a.set_text_background(false);
+        assert!(a.begin_edit_existing(1, 0));
+        let view = a.edit_view().expect("编辑中");
+        assert_eq!(view.style.color, PALETTE[4]);
+        assert!(view.style.background);
+        assert_eq!(view.style.size, 30);
+    }
+
+    #[test]
+    fn style_changes_apply_to_the_box_being_edited() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "hi");
+        a.apply_preset(2);
+        a.set_color(PALETTE[3]);
+        a.set_text_background(true);
+        a.confirm_text();
+        match a.document().shapes() {
+            [
+                Shape::Text {
+                    size,
+                    color,
+                    background,
+                    ..
+                },
+            ] => {
+                assert_eq!((*size, *color, *background), (36, PALETTE[3], true));
+            }
+            other => panic!("期望文字图元，实际为 {other:?}"),
+        }
+        let config = a.changed_config().expect("样式变化");
+        assert_eq!(config.text.size, 36);
+        assert_eq!(config.text.color, "#34C759");
+        assert!(config.text.background);
+    }
+
+    #[test]
+    fn edit_keys_move_and_delete() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "abc");
+        a.edit_key(EditKey::Left);
+        a.edit_key(EditKey::Backspace);
+        a.edit_key(EditKey::Delete);
+        assert_eq!(a.edit_view().map(|v| v.text), Some("a".to_string()));
+        a.edit_key(EditKey::Newline);
+        type_text(&mut a, "xy");
+        a.edit_key(EditKey::Up);
+        a.edit_key(EditKey::End);
+        a.edit_key(EditKey::Tab);
+        a.edit_key(EditKey::Home);
+        a.edit_key(EditKey::Right);
+        a.edit_key(EditKey::Down);
+        assert_eq!(a.edit_view().map(|v| v.text), Some("a    \nxy".to_string()));
+        assert_eq!(a.edit_view().map(|v| v.caret), Some(7));
+    }
+
+    #[test]
+    fn confirm_key_confirms_and_edit_keys_without_editing_do_nothing() {
+        let mut a = text_annotator();
+        assert!(!a.edit_key(EditKey::Left));
+        assert!(!a.insert_char('x'));
+        assert!(!a.insert_text("x"));
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "ok");
+        a.edit_key(EditKey::Confirm);
+        assert!(!a.is_editing());
+        assert_eq!(only_text(&a).0, "ok");
+    }
+
+    #[test]
+    fn insert_text_filters_controls_and_char_ignores_them() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        assert!(!a.insert_char('\u{7}'));
+        assert!(a.insert_text("a\nb\u{1}c"));
+        assert!(!a.insert_text("\u{1}"));
+        assert_eq!(a.edit_view().map(|v| v.text), Some("a\nbc".to_string()));
+    }
+
+    #[test]
+    fn composition_is_displayed_inline_and_dropped_on_confirm() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        type_text(&mut a, "ab");
+        a.edit_key(EditKey::Left);
+        a.set_composition("ni😀", 2);
+        let view = a.edit_view().expect("编辑中");
+        assert_eq!(view.text, "ani😀b");
+        // 组字串从 UTF-16 偏移 1 起，长 4 个单元
+        assert_eq!(view.composition, Some((1, 4)));
+        // 光标在组字串内第 2 个字符后：缓冲光标 1 + 2
+        assert_eq!(view.caret, 3);
+        a.set_composition("", 0);
+        assert_eq!(a.edit_view().map(|v| v.text), Some("ab".to_string()));
+        a.set_composition("zz", 9);
+        assert_eq!(a.edit_view().map(|v| v.caret), Some(3));
+        a.confirm_text();
+        assert_eq!(only_text(&a).0, "ab");
+    }
+
+    #[test]
+    fn composition_result_inserts_like_normal_input() {
+        let mut a = text_annotator();
+        a.begin_text(p(5, 5), &MON, 0);
+        a.set_composition("zhong", 5);
+        a.insert_text("中");
+        a.clear_composition();
+        assert_eq!(
+            a.edit_view().map(|v| (v.text, v.composition)),
+            Some(("中".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn edit_bounds_has_a_minimum_width_and_follows_text() {
+        let mut a = text_annotator();
+        a.begin_text(p(100, 50), &MON, 0);
+        assert_eq!(a.edit_bounds(), Some(Rect::new(100, 50, 12, 30)));
+        type_text(&mut a, "abcd");
+        assert_eq!(a.edit_bounds(), Some(Rect::new(100, 50, 48, 30)));
+        a.set_composition("xx", 2);
+        assert_eq!(a.edit_bounds().map(|r| r.width), Some(72));
+        a.discard_text();
+        assert_eq!(a.edit_bounds(), None);
+    }
+
+    #[test]
+    fn caret_line_follows_the_cursor_and_padding() {
+        let mut a = text_annotator();
+        assert_eq!(a.caret_line(), None);
+        a.begin_text(p(100, 50), &MON, 1);
+        type_text(&mut a, "ab");
+        a.edit_key(EditKey::Newline);
+        type_text(&mut a, "c");
+        assert_eq!(a.caret_line(), Some((1, Rect::new(112, 80, 1, 30))));
+        a.set_text_background(true);
+        assert_eq!(a.caret_line(), Some((1, Rect::new(118, 86, 1, 30))));
+    }
+
+    #[test]
+    fn text_origin_is_clamped_to_the_monitor() {
+        let mut a = text_annotator();
+        a.begin_text(p(-40, 5000), &MON, 0);
+        assert_eq!(a.edit_view().map(|v| v.origin), Some(p(0, 799)));
+    }
+
+    #[test]
+    fn leaving_the_tool_or_undoing_ends_editing() {
+        for action in 0..3 {
+            let mut a = text_annotator();
+            a.begin_text(p(5, 5), &MON, 0);
+            type_text(&mut a, "x");
+            match action {
+                0 => a.toggle_tool(Tool::Pen),
+                1 => {
+                    a.exit_tool();
+                }
+                _ => {
+                    a.undo();
+                }
+            }
+            assert!(!a.is_editing(), "{action}");
+            assert!(a.document().is_empty());
+        }
+    }
+
+    #[test]
+    fn text_tool_does_not_draw_and_shows_background_switch() {
+        let mut a = text_annotator();
+        a.press(p(10, 10), &MON);
+        assert!(!a.is_drawing());
+        let view = a.style_view().expect("样式条");
+        assert_eq!(view.background, Some(false));
+        assert_eq!(view.size, 24);
+        assert_eq!(view.preset, Some(1));
+        a.toggle_tool(Tool::Pen);
+        assert_eq!(a.style_view().and_then(|v| v.background), None);
+    }
+
+    #[test]
+    fn editing_blank_new_reports_only_new_blank_boxes() {
+        let mut a = text_annotator();
+        assert!(!a.editing_blank_new());
+        a.begin_text(p(5, 5), &MON, 0);
+        assert!(a.editing_blank_new());
+        type_text(&mut a, "a");
+        assert!(!a.editing_blank_new());
+        a.confirm_text();
+        a.begin_edit_existing(0, 0);
+        a.edit_key(EditKey::Backspace);
+        assert!(!a.editing_blank_new(), "重新编辑不算新文本框");
+    }
+
+    #[test]
+    fn approx_measure_handles_empty_and_multiline() {
+        let m = ApproxMeasure;
+        assert_eq!(m.measure("", 24), (0, 30));
+        assert_eq!(m.measure("a\nbcd\n", 20), (30, 75));
+        assert_eq!(m.caret("a\nbcd", 20, 4), (20, 25, 25));
+        assert_eq!(m.caret("abc", 20, 99), (30, 0, 25));
     }
 
     #[test]

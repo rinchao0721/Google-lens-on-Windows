@@ -3,29 +3,43 @@
 //! 渲染目标 DPI 固定为 96，1 个 DIP 等于 1 个物理像素，线宽直接取成图像素。
 
 use lenswin_core::annotation::{
-    HIGHLIGHTER_ALPHA, PixelOrder, Shape, arrow_head, mosaic_grid, number_label,
+    Color, HIGHLIGHTER_ALPHA, PixelOrder, Shape, TEXT_BACKGROUND_ALPHA, arrow_head, mosaic_grid,
+    number_label,
 };
 use lenswin_core::geometry::{Point, Rect};
+use lenswin_core::text_edit::utf16_offset_of_char;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_FIGURE_BEGIN_FILLED,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_QUADRATIC_BEZIER_SEGMENT, ID2D1Brush,
-    ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_QUADRATIC_BEZIER_SEGMENT,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    ID2D1Brush, ID2D1Factory, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-    IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
+    IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::w;
 
+use crate::annotate::{ApproxMeasure, TextMeasure, text_padding};
 use crate::error::{OverlayError, win32};
-use crate::render::{color, float_point, to_f32};
+use crate::render::{color, f32_to_u16, float_point, to_f32};
 use crate::stroke::{self, PointF, Segment};
+
+/// 文字字体，缺字时 DirectWrite 自动回退。
+const TEXT_FONT: windows::core::PCWSTR = w!("Microsoft YaHei UI");
+/// 文字排版区域的边长上限，不自动换行，只需要足够大。
+const TEXT_LAYOUT_LIMIT: f32 = 16_384.0;
+/// 底色圆角半径（像素）。
+const TEXT_BACKGROUND_RADIUS: f32 = 4.0;
 
 /// 序号文字大小相对圆直径的比例。
 const NUMBER_FONT_SCALE: f32 = 0.5;
@@ -72,14 +86,128 @@ fn box_rect(from: Point, to: Point, origin: Point) -> D2D_RECT_F {
     }
 }
 
+/// 一段要绘制的文字：位置、内容与外观。
+pub(crate) struct TextBlock<'a> {
+    /// 文本框左上角（虚拟桌面坐标），底色模式下含内边距。
+    pub origin: Point,
+    /// 内容。
+    pub text: &'a str,
+    /// 字号。
+    pub size: u32,
+    /// 文字颜色，底色模式下是底色。
+    pub color: Color,
+    /// 是否带底色。
+    pub background: bool,
+    /// 要加下划线的 UTF-16 范围（组字串）。
+    pub underline: Option<(usize, usize)>,
+}
+
+/// 按字号建立不自动换行的文字排版。
+pub(crate) fn text_layout(
+    dwrite: &IDWriteFactory,
+    text: &str,
+    size: u32,
+) -> Result<IDWriteTextLayout, OverlayError> {
+    // SAFETY: 字体名与区域名为静态字符串；字体不存在时 DirectWrite 自动回退。
+    let format = unsafe {
+        dwrite.CreateTextFormat(
+            TEXT_FONT,
+            None::<&IDWriteFontCollection>,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            to_f32(i64::from(size)),
+            w!("zh-CN"),
+        )
+    }
+    .map_err(win32("CreateTextFormat"))?;
+    // SAFETY: format 刚刚创建，参数为合法枚举值。
+    unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) }
+        .map_err(win32("SetWordWrapping"))?;
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    // SAFETY: wide 与 format 在调用期间有效。
+    unsafe { dwrite.CreateTextLayout(&wide, &format, TEXT_LAYOUT_LIMIT, TEXT_LAYOUT_LIMIT) }
+        .map_err(win32("CreateTextLayout"))
+}
+
+/// 排版后的（宽, 高）；空文字高度按一行算。
+fn layout_size(layout: &IDWriteTextLayout) -> Result<(f32, f32), OverlayError> {
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    // SAFETY: metrics 是有效的输出位置。
+    unsafe { layout.GetMetrics(&mut metrics) }.map_err(win32("GetMetrics"))?;
+    Ok((metrics.widthIncludingTrailingWhitespace, metrics.height))
+}
+
+/// 基于 DirectWrite 的文字度量，屏幕绘制与成图共用同一套排版，保证命中范围与所见一致。
+pub(crate) struct DWriteMeasure {
+    dwrite: IDWriteFactory,
+}
+
+impl DWriteMeasure {
+    /// 创建共享的 DirectWrite 工厂。
+    pub(crate) fn new() -> Result<Self, OverlayError> {
+        // SAFETY: 参数为合法的枚举值。
+        let dwrite = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) }
+            .map_err(win32("DWriteCreateFactory"))?;
+        Ok(Self { dwrite })
+    }
+
+    /// 复用已有的工厂。
+    pub(crate) fn from_factory(dwrite: IDWriteFactory) -> Self {
+        Self { dwrite }
+    }
+
+    fn try_measure(&self, text: &str, size: u32) -> Result<(u32, u32), OverlayError> {
+        // 空文字量不出行高，用一个空格代替，宽度仍按 0 算
+        let probe = if text.is_empty() { " " } else { text };
+        let (w, h) = layout_size(&text_layout(&self.dwrite, probe, size)?)?;
+        let width = if text.is_empty() { 0.0 } else { w };
+        Ok((
+            u32::from(f32_to_u16(width.max(0.0).ceil())),
+            u32::from(f32_to_u16(h.max(0.0).ceil())),
+        ))
+    }
+
+    fn try_caret(
+        &self,
+        text: &str,
+        size: u32,
+        char_index: usize,
+    ) -> Result<(i32, i32, u32), OverlayError> {
+        let layout = text_layout(&self.dwrite, text, size)?;
+        let position = u32::try_from(utf16_offset_of_char(text, char_index)).unwrap_or(u32::MAX);
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        // SAFETY: 三个输出参数都指向有效的局部变量。
+        unsafe { layout.HitTestTextPosition(position, false, &mut x, &mut y, &mut metrics) }
+            .map_err(win32("HitTestTextPosition"))?;
+        let height = u32::from(f32_to_u16(metrics.height.max(0.0).ceil()));
+        Ok((
+            i32::from(f32_to_u16(x.max(0.0).round())),
+            i32::from(f32_to_u16(y.max(0.0).round())),
+            height,
+        ))
+    }
+}
+
+impl TextMeasure for DWriteMeasure {
+    fn measure(&self, text: &str, size: u32) -> (u32, u32) {
+        // 度量失败时退回近似值，命中范围略有偏差但不影响成图
+        self.try_measure(text, size)
+            .unwrap_or_else(|_| ApproxMeasure.measure(text, size))
+    }
+
+    fn caret(&self, text: &str, size: u32, char_index: usize) -> (i32, i32, u32) {
+        self.try_caret(text, size, char_index)
+            .unwrap_or_else(|_| ApproxMeasure.caret(text, size, char_index))
+    }
+}
+
 fn channel(value: u8) -> f32 {
     f32::from(value) / 255.0
 }
 
-fn solid(
-    c: lenswin_core::annotation::Color,
-    alpha: f32,
-) -> windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
+fn solid(c: Color, alpha: f32) -> D2D1_COLOR_F {
     color(channel(c.r), channel(c.g), channel(c.b), alpha)
 }
 
@@ -145,18 +273,90 @@ fn triangle_path(
 
 impl Painter<'_> {
     /// 按顺序绘制一组图元，`origin` 是目标左上角对应的虚拟桌面坐标。
-    pub(crate) fn draw_shapes(&self, shapes: &[Shape], origin: Point) -> Result<(), OverlayError> {
-        if shapes.is_empty() {
+    pub(crate) fn draw_shapes<'s>(
+        &self,
+        shapes: impl IntoIterator<Item = &'s Shape>,
+        origin: Point,
+    ) -> Result<(), OverlayError> {
+        let mut shapes = shapes.into_iter().peekable();
+        if shapes.peek().is_none() {
             return Ok(());
         }
+        let brush = self.new_brush()?;
+        // 文字统一用灰度抗锯齿：缓存层是透明位图，ClearType 在上面会出彩边，屏幕与成图也要一致
+        // SAFETY: 目标有效，参数为合法枚举值。
+        unsafe {
+            self.target
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
+        let drawn = shapes.try_for_each(|shape| self.draw_shape(&brush, shape, origin));
+        // SAFETY: 同上；还原后工具栏等界面文字保持默认外观。
+        unsafe {
+            self.target
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
+        }
+        drawn
+    }
+
+    /// 新建一支可改色的实心画刷。
+    pub(crate) fn new_brush(&self) -> Result<ID2D1SolidColorBrush, OverlayError> {
         // SAFETY: 目标有效，颜色结构为局部变量。
-        let brush = unsafe {
+        unsafe {
             self.target
                 .CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 1.0), None)
         }
-        .map_err(win32("CreateSolidColorBrush"))?;
-        for shape in shapes {
-            self.draw_shape(&brush, shape, origin)?;
+        .map_err(win32("CreateSolidColorBrush"))
+    }
+
+    /// 绘制一段文字；底色模式先画 85% 不透明的圆角底色，文字用与序号一致的对比色。
+    /// 调用方负责设置灰度抗锯齿。
+    pub(crate) fn draw_text_block(
+        &self,
+        brush: &ID2D1SolidColorBrush,
+        block: &TextBlock<'_>,
+        origin: Point,
+    ) -> Result<(), OverlayError> {
+        let layout = text_layout(self.dwrite, block.text, block.size)?;
+        if let Some((start, length)) = block.underline {
+            let range = DWRITE_TEXT_RANGE {
+                startPosition: u32::try_from(start).unwrap_or(0),
+                length: u32::try_from(length).unwrap_or(0),
+            };
+            // SAFETY: layout 刚创建，range 为局部变量。
+            unsafe { layout.SetUnderline(true, range) }.map_err(win32("SetUnderline"))?;
+        }
+        let (width, height) = layout_size(&layout)?;
+        let pad = to_f32(i64::from(text_padding(block.size, block.background)));
+        let (left, top) = local(block.origin, origin);
+        let text_color = if block.background {
+            let rect = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left,
+                    top,
+                    right: left + width + pad * 2.0,
+                    bottom: top + height + pad * 2.0,
+                },
+                radiusX: TEXT_BACKGROUND_RADIUS,
+                radiusY: TEXT_BACKGROUND_RADIUS,
+            };
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与圆角矩形有效。
+            unsafe {
+                brush.SetColor(&solid(block.color, TEXT_BACKGROUND_ALPHA));
+                self.target.FillRoundedRectangle(&rect, brush);
+            }
+            block.color.label_color()
+        } else {
+            block.color
+        };
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，排版与画刷有效。
+        unsafe {
+            brush.SetColor(&solid(text_color, 1.0));
+            self.target.DrawTextLayout(
+                float_point(left + pad, top + pad).point,
+                &layout,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
         }
         Ok(())
     }
@@ -245,6 +445,25 @@ impl Painter<'_> {
                 origin,
             )?,
             Shape::Mosaic { from, to, block } => self.draw_mosaic(*from, *to, *block, origin)?,
+            Shape::Text {
+                origin: text_origin,
+                text,
+                color: c,
+                size,
+                background,
+                ..
+            } => self.draw_text_block(
+                brush,
+                &TextBlock {
+                    origin: *text_origin,
+                    text,
+                    size: *size,
+                    color: *c,
+                    background: *background,
+                    underline: None,
+                },
+                origin,
+            )?,
             Shape::Number {
                 center,
                 value,

@@ -18,6 +18,7 @@ use lenswin_core::lens::LensRequest;
 use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
 use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult, ToolbarAction, push_history};
+use lenswin_core::text_edit::sanitize_clipboard;
 use lenswin_core::update::is_release_page_url;
 use lenswin_overlay::{LiveSession, SelectRequest};
 use lenswin_platform::autostart::{self, AutostartState};
@@ -684,6 +685,7 @@ impl<'a> Dispatcher<'a> {
             windows: &frozen.windows,
             history: &frozen.history,
             annotate: &config.annotate,
+            clipboard_text: None,
         };
         let id = self.live_seq.get().wrapping_add(1);
         self.live_seq.set(id);
@@ -1179,6 +1181,10 @@ impl<'a> Dispatcher<'a> {
         }
         let frozen = self.freeze(mode)?;
         let config = self.shared.store.snapshot();
+        // 只有截屏流程有文字标注，其它流程不读剪贴板
+        let clipboard_text = (flow == OverlayFlow::Toolbar)
+            .then(|| self.clipboard_snapshot())
+            .flatten();
         let request = SelectRequest {
             frames: &frozen.frames,
             monitors: &frozen.monitors,
@@ -1190,6 +1196,7 @@ impl<'a> Dispatcher<'a> {
             windows: &frozen.windows,
             history: &frozen.history,
             annotate: &config.annotate,
+            clipboard_text: clipboard_text.as_deref(),
         };
         let outcome = lenswin_overlay::select(&request);
         // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
@@ -1211,6 +1218,19 @@ impl<'a> Dispatcher<'a> {
             Err(e) => {
                 log::error!("选区失败：{e}");
                 self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
+                None
+            }
+        }
+    }
+
+    /// 冻结时读一次剪贴板文本并清洗，供文字标注粘贴；读取失败或没有文本都按没有处理，不提示。
+    fn clipboard_snapshot(&self) -> Option<String> {
+        match self.registry.clipboard_text() {
+            Ok(text) => text
+                .map(|t| sanitize_clipboard(&t))
+                .filter(|t| !t.is_empty()),
+            Err(e) => {
+                log::debug!("读取剪贴板文本失败：{e}");
                 None
             }
         }
