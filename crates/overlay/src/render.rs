@@ -1,5 +1,9 @@
 //! Direct2D 绘制：冻结帧、遮罩、选框、套索轨迹、边缘辉光、手柄、尺寸标签、工具栏与放大镜。
 
+use std::cell::RefCell;
+
+use lenswin_core::annotation::{PALETTE, Shape};
+use lenswin_core::frame::CroppedImage;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::snip::ColorFormat;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
@@ -10,17 +14,19 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
+    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_PROPERTY_TYPE_FLOAT, D2D1_QUADRATIC_BEZIER_SEGMENT,
     D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush, ID2D1Brush,
-    ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1LinearGradientBrush,
-    ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1BitmapBrush,
+    ID2D1BitmapRenderTarget, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory, ID2D1HwndRenderTarget,
+    ID2D1LinearGradientBrush, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -30,16 +36,26 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
+    WICBitmapCacheOnLoad, WICBitmapLockRead, WICRect,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize,
+};
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::adjust;
+use crate::annotate::StyleView;
 use crate::error::{OverlayError, win32};
 use crate::glow::{self, Edge, GlowFrame, Rgb};
 use crate::hint::Hint;
-use crate::input::{FrameStyle, View};
-use crate::layout::{self, MagnifierLayout, ToolbarButton};
+use crate::input::{Annotations, FrameStyle, ToolbarView, View};
+use crate::layout::{self, Glyph, Hit, MagnifierLayout, ToolbarButton};
 use crate::modes::Preview;
-use crate::stroke::{self, PointF, Segment};
+use crate::paint::{self, FrameRef, Painter};
+use crate::stroke::{self, PointF};
 
 /// 选框描边宽度（像素，96 DPI 下）。
 const OUTLINE_WIDTH: u32 = 2;
@@ -70,6 +86,8 @@ const TIP_MIN_RADIUS: u32 = 12;
 /// 角标的角点、第一段方向、第二段方向（窗口坐标，方向为单位向量）。
 type Corner = ((f32, f32), (f32, f32), (f32, f32));
 
+/// 样式条里细、中、粗三个预设圆点的直径（96 DPI 下）。
+const PRESET_DOT_SIZES: [u32; 3] = [6, 10, 14];
 /// 常驻选框角标线宽（96 DPI 下）。
 const CORNER_LINE: u32 = 6;
 /// 常驻选框外侧光晕的宽度（96 DPI 下）。
@@ -84,7 +102,7 @@ const TIP_MID: D2D1_COLOR_F = color(0.541, 0.706, 0.973, 0.85);
 /// 按优先级尝试的图标字体。
 const ICON_FONTS: [PCWSTR; 2] = [w!("Segoe Fluent Icons"), w!("Segoe MDL2 Assets")];
 
-const fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
+pub(crate) const fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
@@ -206,17 +224,13 @@ impl Renderer {
             crosshair: brush(color(0.30, 0.60, 1.0, 0.45))?,
             muted: brush(color(1.0, 1.0, 1.0, 0.72))?,
             swatch: brush(color(0.0, 0.0, 0.0, 1.0))?,
+            active: brush(color(0.30, 0.60, 1.0, 0.40))?,
+            disabled: brush(color(1.0, 1.0, 1.0, 0.30))?,
+            separator: brush(color(1.0, 1.0, 1.0, 0.25))?,
         };
 
-        let stroke_props = D2D1_STROKE_STYLE_PROPERTIES {
-            startCap: D2D1_CAP_STYLE_ROUND,
-            endCap: D2D1_CAP_STYLE_ROUND,
-            lineJoin: D2D1_LINE_JOIN_ROUND,
-            ..Default::default()
-        };
-        // SAFETY: stroke_props 已完整填写，无自定义虚线。
-        let round_stroke = unsafe { self.factory.CreateStrokeStyle(&stroke_props, None) }
-            .map_err(win32("CreateStrokeStyle"))?;
+        let round_stroke = self.round_stroke_style()?;
+        let flat_stroke = self.flat_stroke_style()?;
 
         let px = |v: u32| to_f32(i64::from(layout::scaled(v, dpi)));
         let fonts = Fonts {
@@ -237,6 +251,12 @@ impl Renderer {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 px(12),
                 DWRITE_TEXT_ALIGNMENT_LEADING,
+            )?,
+            glyph_text: self.text_format(
+                w!("Segoe UI"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                px(15),
+                DWRITE_TEXT_ALIGNMENT_CENTER,
             )?,
             button: match self.button_style {
                 ButtonStyle::Icon(index) => self.text_format(
@@ -264,11 +284,135 @@ impl Renderer {
             frame_brush,
             brushes,
             round_stroke,
+            flat_stroke,
+            layer: RefCell::new(None),
             fonts,
             dwrite: self.dwrite.clone(),
             button_style: self.button_style,
             dpi,
         })
+    }
+
+    /// 圆头圆角线型。
+    fn round_stroke_style(&self) -> Result<ID2D1StrokeStyle, OverlayError> {
+        let props = D2D1_STROKE_STYLE_PROPERTIES {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            ..Default::default()
+        };
+        // SAFETY: props 已完整填写，无自定义虚线。
+        unsafe { self.factory.CreateStrokeStyle(&props, None) }.map_err(win32("CreateStrokeStyle"))
+    }
+
+    /// 离屏合成成图：从冻结帧裁出 `area`，再用与屏幕相同的绘制函数叠上标注。
+    pub fn compose(
+        &self,
+        frame: FrameRef<'_>,
+        area: &Rect,
+        shapes: &[Shape],
+    ) -> Result<CroppedImage, OverlayError> {
+        let area = area
+            .intersect(&frame.bounds)
+            .ok_or_else(|| OverlayError::InvalidInput("选区不在显示器范围内".to_string()))?;
+        let (width, height) = (area.width, area.height);
+        let base = crop_bgra(&frame, &area)?;
+        let pitch = width
+            .checked_mul(4)
+            .ok_or_else(|| OverlayError::InvalidInput("成图行字节数溢出".to_string()))?;
+        let _com = ComGuard::enter();
+        // SAFETY: CLSID 为静态常量；ComGuard 保证调用线程已初始化 COM。
+        let wic: IWICImagingFactory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+                .map_err(win32("CoCreateInstance(WICImagingFactory)"))?;
+        // SAFETY: 尺寸非零，像素格式为静态 GUID。
+        let wic_bitmap = unsafe {
+            wic.CreateBitmap(
+                width,
+                height,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnLoad,
+            )
+        }
+        .map_err(win32("IWICImagingFactory::CreateBitmap"))?;
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        // SAFETY: wic_bitmap 有效，属性结构为局部变量。
+        let target = unsafe {
+            self.factory
+                .CreateWicBitmapRenderTarget(&wic_bitmap, &props)
+        }
+        .map_err(win32("CreateWicBitmapRenderTarget"))?;
+        let round_stroke = self.round_stroke_style()?;
+        let flat_stroke = self.flat_stroke_style()?;
+        let frames = [frame];
+        // SAFETY: target 刚创建，BeginDraw/EndDraw 成对调用，出错时也会结束绘制。
+        unsafe { target.BeginDraw() };
+        let drawn = (|| -> Result<(), OverlayError> {
+            let bitmap_props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            // SAFETY: base 长度为宽×高×4，pitch 与之一致；调用期间数据有效且会被复制。
+            let source = unsafe {
+                target.CreateBitmap(
+                    D2D_SIZE_U { width, height },
+                    Some(base.as_ptr().cast()),
+                    pitch,
+                    &bitmap_props,
+                )
+            }
+            .map_err(win32("CreateBitmap"))?;
+            let whole = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: to_f32(i64::from(width)),
+                bottom: to_f32(i64::from(height)),
+            };
+            // SAFETY: 位图由同一目标创建，矩形为局部变量；1:1 贴图。
+            unsafe {
+                target.DrawBitmap(
+                    &source,
+                    Some(&whole),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                );
+            }
+            Painter {
+                target: &target,
+                factory: &self.factory,
+                dwrite: &self.dwrite,
+                round_stroke: &round_stroke,
+                flat_stroke: &flat_stroke,
+                frames: &frames,
+            }
+            .draw_shapes(shapes, Point::new(area.x, area.y))
+        })();
+        // SAFETY: 与上面的 BeginDraw 配对。
+        let ended = unsafe { target.EndDraw(None, None) }.map_err(win32("EndDraw"));
+        drawn?;
+        ended?;
+        read_back(&wic_bitmap, width, height)
+    }
+
+    /// 方头线型，荧光笔用；端点为方形，转角仍然圆滑。
+    fn flat_stroke_style(&self) -> Result<ID2D1StrokeStyle, OverlayError> {
+        let props = D2D1_STROKE_STYLE_PROPERTIES {
+            startCap: D2D1_CAP_STYLE_FLAT,
+            endCap: D2D1_CAP_STYLE_FLAT,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            ..Default::default()
+        };
+        // SAFETY: props 已完整填写，无自定义虚线。
+        unsafe { self.factory.CreateStrokeStyle(&props, None) }.map_err(win32("CreateStrokeStyle"))
     }
 
     fn text_format(
@@ -300,6 +444,108 @@ impl Renderer {
     }
 }
 
+/// 当前线程的 COM 初始化：已按其它模式初始化时沿用，成功初始化的才在离开时反初始化。
+struct ComGuard {
+    initialized: bool,
+}
+
+impl ComGuard {
+    fn enter() -> Self {
+        // SAFETY: 无前置条件；成功（含 S_FALSE）时必须与 CoUninitialize 配对。
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        Self {
+            initialized: hr.is_ok(),
+        }
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: 与 enter 中成功的 CoInitializeEx 配对，仅调用一次。
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// 从整屏 BGRA 里裁出 `area`（必须在 `frame` 范围内）。
+fn crop_bgra(frame: &FrameRef<'_>, area: &Rect) -> Result<Vec<u8>, OverlayError> {
+    let overflow = || OverlayError::InvalidInput("裁剪范围超出冻结帧".to_string());
+    let stride = usize::try_from(frame.bounds.width).map_err(|_| overflow())?;
+    let off_x =
+        usize::try_from(i64::from(area.x) - i64::from(frame.bounds.x)).map_err(|_| overflow())?;
+    let off_y =
+        usize::try_from(i64::from(area.y) - i64::from(frame.bounds.y)).map_err(|_| overflow())?;
+    let rows = usize::try_from(area.height).map_err(|_| overflow())?;
+    let row_bytes = usize::try_from(area.width)
+        .map_err(|_| overflow())?
+        .checked_mul(4)
+        .ok_or_else(overflow)?;
+    let mut out = Vec::with_capacity(row_bytes.checked_mul(rows).ok_or_else(overflow)?);
+    for row in 0..rows {
+        let start = off_y
+            .checked_add(row)
+            .and_then(|y| y.checked_mul(stride))
+            .and_then(|px| px.checked_add(off_x))
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(overflow)?;
+        let end = start.checked_add(row_bytes).ok_or_else(overflow)?;
+        out.extend_from_slice(frame.bgra.get(start..end).ok_or_else(overflow)?);
+    }
+    Ok(out)
+}
+
+/// 读回 WIC 位图，BGRA 转 RGBA；冻结帧不透明，alpha 一律置为 255。
+fn read_back(bitmap: &IWICBitmap, width: u32, height: u32) -> Result<CroppedImage, OverlayError> {
+    let invalid = |what: &str| OverlayError::InvalidInput(format!("读回成图失败：{what}"));
+    let rect = WICRect {
+        X: 0,
+        Y: 0,
+        Width: i32::try_from(width).map_err(|_| invalid("宽度过大"))?,
+        Height: i32::try_from(height).map_err(|_| invalid("高度过大"))?,
+    };
+    let lock_flags = u32::try_from(WICBitmapLockRead.0).map_err(|_| invalid("锁定标志无效"))?;
+    // SAFETY: rect 在位图范围内；锁在本函数结束时释放。
+    let lock = unsafe { bitmap.Lock(&rect, lock_flags) }.map_err(win32("IWICBitmap::Lock"))?;
+    // SAFETY: lock 有效。
+    let stride = unsafe { lock.GetStride() }.map_err(win32("IWICBitmapLock::GetStride"))?;
+    let mut size = 0u32;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: 两个输出参数都指向有效局部变量。
+    unsafe { lock.GetDataPointer(&mut size, &mut data) }
+        .map_err(win32("IWICBitmapLock::GetDataPointer"))?;
+    if data.is_null() {
+        return Err(invalid("没有像素数据"));
+    }
+    let len = usize::try_from(size).map_err(|_| invalid("缓冲区过大"))?;
+    // SAFETY: 锁有效期间 data 指向 size 字节的可读内存，下面只在 lock 存活时使用。
+    let pixels = unsafe { std::slice::from_raw_parts(data, len) };
+    let stride = usize::try_from(stride).map_err(|_| invalid("行距过大"))?;
+    let row_bytes = usize::try_from(width)
+        .map_err(|_| invalid("宽度过大"))?
+        .checked_mul(4)
+        .ok_or_else(|| invalid("行字节数溢出"))?;
+    let rows = usize::try_from(height).map_err(|_| invalid("高度过大"))?;
+    let mut rgba = Vec::with_capacity(
+        row_bytes
+            .checked_mul(rows)
+            .ok_or_else(|| invalid("尺寸溢出"))?,
+    );
+    for row in 0..rows {
+        let start = row.checked_mul(stride).ok_or_else(|| invalid("偏移溢出"))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| invalid("偏移溢出"))?;
+        let line = pixels.get(start..end).ok_or_else(|| invalid("像素不足"))?;
+        for px in line.chunks_exact(4) {
+            if let [b, g, r, _] = px {
+                rgba.extend_from_slice(&[*r, *g, *b, 255]);
+            }
+        }
+    }
+    CroppedImage::new(width, height, rgba).map_err(|e| invalid(&e.to_string()))
+}
+
 /// 系统字体集中第一个存在的图标字体序号。
 fn icon_font_index(dwrite: &IDWriteFactory) -> Option<usize> {
     let mut collection: Option<IDWriteFontCollection> = None;
@@ -327,6 +573,12 @@ struct Brushes {
     crosshair: ID2D1SolidColorBrush,
     muted: ID2D1SolidColorBrush,
     swatch: ID2D1SolidColorBrush,
+    /// 选中的工具与样式按钮底色。
+    active: ID2D1SolidColorBrush,
+    /// 不可用按钮的图标。
+    disabled: ID2D1SolidColorBrush,
+    /// 工具栏分隔线。
+    separator: ID2D1SolidColorBrush,
 }
 
 struct Fonts {
@@ -334,6 +586,8 @@ struct Fonts {
     info: IDWriteTextFormat,
     hint: IDWriteTextFormat,
     button: IDWriteTextFormat,
+    /// 工具栏上不依赖图标字体的固定文字，如序号按钮的「1」。
+    glyph_text: IDWriteTextFormat,
 }
 
 /// 单个窗口的渲染目标与资源，目标失效时整体丢弃重建。
@@ -345,10 +599,19 @@ pub struct TargetResources {
     frame_brush: ID2D1BitmapBrush,
     brushes: Brushes,
     round_stroke: ID2D1StrokeStyle,
+    flat_stroke: ID2D1StrokeStyle,
+    /// 已完成标注的缓存层，只在新增、撤销、重做时重建。
+    layer: RefCell<Option<LayerCache>>,
     fonts: Fonts,
     dwrite: IDWriteFactory,
     button_style: ButtonStyle,
     dpi: u32,
+}
+
+/// 与显示器同尺寸的离屏层，里面是已完成的标注。
+struct LayerCache {
+    bitmap: ID2D1Bitmap,
+    revision: u64,
 }
 
 /// 绘制所需的窗口信息。
@@ -399,18 +662,23 @@ impl TargetResources {
             None
         };
         let target = &self.target;
+        let dim = surface.effects.dim.clamp(0.0, 1.0);
         // SAFETY: 目标与资源均有效；BeginDraw/EndDraw 成对调用，期间所有指针参数都指向存活的局部数据。
         unsafe {
             target.BeginDraw();
             self.bitmap_into(&full, &full, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-            self.brushes
-                .dim
-                .SetOpacity(surface.effects.dim.clamp(0.0, 1.0));
+            self.brushes.dim.SetOpacity(dim);
             target.FillRectangle(&full, &self.brushes.dim);
-            if let Some(r) = region {
-                // 选区内还原为原图亮度，源矩形与目标矩形相同即 1:1 贴图
-                self.bitmap_into(&r, &r, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                if !surface.effects.colorful && view.frame != FrameStyle::Corners {
+        }
+        // 选区外的标注以遮罩后的亮度留作参照，成图会把它们裁掉
+        self.draw_layer(&view.annotations, surface, &full, 1.0 - DIM_ALPHA * dim);
+        if let Some(r) = region {
+            // 选区内还原为原图亮度，源矩形与目标矩形相同即 1:1 贴图
+            self.bitmap_into(&r, &r, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            self.draw_annotations(&view.annotations, surface, &r);
+            if !surface.effects.colorful && view.frame != FrameStyle::Corners {
+                // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+                unsafe {
                     target.DrawRectangle(&r, &self.brushes.accent, self.px(OUTLINE_WIDTH), None);
                 }
             }
@@ -449,8 +717,8 @@ impl TargetResources {
         if let Some(r) = view.label {
             self.draw_label(&r, surface);
         }
-        if let Some((bar, hovered)) = view.toolbar {
-            self.draw_toolbar(&bar, hovered, surface.origin);
+        if let Some(toolbar) = &view.toolbar {
+            self.draw_toolbar(toolbar, surface.origin);
         }
         if !view.hints.is_empty() {
             self.draw_hints(
@@ -609,37 +877,7 @@ impl TargetResources {
 
     /// 平滑后的轨迹曲线（窗口坐标），点数不足两个时返回 `None`。
     fn trail_geometry(&self, points: &[PointF]) -> Result<Option<ID2D1PathGeometry>, OverlayError> {
-        let Some((start, segments)) = stroke::smooth(points) else {
-            return Ok(None);
-        };
-        // SAFETY: 工厂有效，无参数。
-        let path =
-            unsafe { self.factory.CreatePathGeometry() }.map_err(win32("CreatePathGeometry"))?;
-        // SAFETY: path 刚创建，只打开一次。
-        let sink = unsafe { path.Open() }.map_err(win32("ID2D1PathGeometry::Open"))?;
-        // SAFETY: sink 处于打开状态，BeginFigure 与 EndFigure 成对调用，贝塞尔结构为局部变量。
-        unsafe {
-            sink.BeginFigure(
-                float_point(start.0, start.1).point,
-                D2D1_FIGURE_BEGIN_HOLLOW,
-            );
-            for segment in &segments {
-                match segment {
-                    Segment::Quad { control, end } => {
-                        let bezier = D2D1_QUADRATIC_BEZIER_SEGMENT {
-                            point1: float_point(control.0, control.1).point,
-                            point2: float_point(end.0, end.1).point,
-                        };
-                        sink.AddQuadraticBezier(&bezier);
-                    }
-                    Segment::Line { end } => sink.AddLine(float_point(end.0, end.1).point),
-                }
-            }
-            sink.EndFigure(D2D1_FIGURE_END_OPEN);
-        }
-        // SAFETY: 与上面的 Open 配对。
-        unsafe { sink.Close() }.map_err(win32("ID2D1GeometrySink::Close"))?;
-        Ok(Some(path))
+        paint::smooth_path(&self.factory, points)
     }
 
     /// 谷歌蓝平滑轨迹加笔尖光点：整条曲线一次描边，半透明光晕不会在分段处叠出亮点。
@@ -942,37 +1180,308 @@ impl TargetResources {
         }
     }
 
-    fn draw_toolbar(&self, bar: &Rect, hovered: Option<ToolbarButton>, origin: Point) {
-        self.panel(&local_rect(bar, origin));
-        for (index, button) in ToolbarButton::ALL.iter().enumerate() {
-            let Some(cell) = layout::button_rect(bar, index, self.dpi) else {
-                continue;
+    /// 工具栏：分组按钮、分隔线，以及选中工具后的样式条。
+    fn draw_toolbar(&self, toolbar: &ToolbarView, origin: Point) {
+        let layout = &toolbar.layout;
+        self.panel(&local_rect(&layout.bar, origin));
+        for (button, cell) in &layout.buttons {
+            let r = local_rect(cell, origin);
+            let enabled = match button {
+                ToolbarButton::Undo => toolbar.can_undo,
+                ToolbarButton::Redo => toolbar.can_redo,
+                _ => true,
             };
-            let r = local_rect(&cell, origin);
-            if hovered == Some(*button) {
+            if matches!(button, ToolbarButton::Tool(tool) if toolbar.active == Some(*tool)) {
+                self.rounded(&r, &self.brushes.active);
+            } else if enabled && toolbar.hovered == Some(Hit::Button(*button)) {
                 self.rounded(&r, &self.brushes.hover);
             }
-            let text: Vec<u16> = match self.button_style {
-                ButtonStyle::Icon(_) => button.glyph().to_string().encode_utf16().collect(),
-                ButtonStyle::Text => button.label().encode_utf16().collect(),
-            };
-            let brush = if *button == ToolbarButton::Copy {
+            let brush = if !enabled {
+                &self.brushes.disabled
+            } else if *button == ToolbarButton::Copy {
                 &self.brushes.accent
             } else {
                 &self.brushes.white
             };
-            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
+            self.draw_button_glyph(*button, &r, brush);
+        }
+        for sep in &layout.separators {
+            let r = local_rect(sep, origin);
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+            unsafe { self.target.FillRectangle(&r, &self.brushes.separator) };
+        }
+        if let (Some(strip), Some(style)) = (&layout.strip, toolbar.style) {
+            self.draw_strip(strip, &style, toolbar.hovered, origin);
+        }
+    }
+
+    fn draw_button_glyph(
+        &self,
+        button: ToolbarButton,
+        rect: &D2D_RECT_F,
+        brush: &ID2D1SolidColorBrush,
+    ) {
+        let (text, format): (Vec<u16>, &IDWriteTextFormat) =
+            match (self.button_style, button.glyph()) {
+                (_, Glyph::Text(t)) => (t.encode_utf16().collect(), &self.fonts.glyph_text),
+                (ButtonStyle::Icon(_), Glyph::Icon(c)) => {
+                    (c.to_string().encode_utf16().collect(), &self.fonts.button)
+                }
+                (ButtonStyle::Text, Glyph::Icon(_)) => {
+                    (button.label().encode_utf16().collect(), &self.fonts.button)
+                }
+            };
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
+        unsafe {
+            self.target.DrawText(
+                &text,
+                format,
+                rect,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    /// 样式条：8 个色块、粗细数值框，序号工具多一组「1 / A」。
+    fn draw_strip(
+        &self,
+        strip: &layout::StripLayout,
+        style: &StyleView,
+        hovered: Option<Hit>,
+        origin: Point,
+    ) {
+        self.panel(&local_rect(&strip.rect, origin));
+        for (index, cell) in strip.swatches.iter().enumerate() {
+            let Some(c) = PALETTE.get(index) else {
+                continue;
+            };
+            let r = local_rect(cell, origin);
+            let fill = color(
+                f32::from(c.r) / 255.0,
+                f32::from(c.g) / 255.0,
+                f32::from(c.b) / 255.0,
+                1.0,
+            );
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
             unsafe {
-                self.target.DrawText(
-                    &text,
-                    &self.fonts.button,
-                    &r,
-                    brush,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
+                self.brushes.swatch.SetColor(&fill);
+                self.target.FillRectangle(&r, &self.brushes.swatch);
+                // 细边让黑色和白色色块在深色底上都看得清
+                self.target
+                    .DrawRectangle(&r, &self.brushes.muted, 1.0, None);
+            }
+            if style.swatch == Some(index) {
+                let ring = self.px(2);
+                let outer = D2D_RECT_F {
+                    left: r.left - ring,
+                    top: r.top - ring,
+                    right: r.right + ring,
+                    bottom: r.bottom + ring,
+                };
+                // SAFETY: 同上。
+                unsafe {
+                    self.target
+                        .DrawRectangle(&outer, &self.brushes.white, 2.0, None);
+                }
+            } else if hovered == Some(Hit::Swatch(index)) {
+                // SAFETY: 同上。
+                unsafe {
+                    self.target
+                        .DrawRectangle(&r, &self.brushes.white, 2.0, None)
+                };
+            }
+        }
+        for (index, cell) in strip.presets.iter().enumerate() {
+            let r = local_rect(cell, origin);
+            if style.preset == Some(index) {
+                self.rounded(&r, &self.brushes.active);
+            } else if hovered == Some(Hit::Preset(index)) {
+                self.rounded(&r, &self.brushes.hover);
+            }
+            // 圆点固定画成细、中、粗三档视觉大小，不按实际粗细画
+            let diameter = self.px(PRESET_DOT_SIZES.get(index).copied().unwrap_or(10));
+            let mut dot = float_point((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
+            dot.radiusX = diameter / 2.0;
+            dot.radiusY = diameter / 2.0;
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，椭圆为局部变量，画刷有效。
+            unsafe { self.target.FillEllipse(&dot, &self.brushes.white) };
+        }
+        let value = local_rect(&strip.value, origin);
+        let text: Vec<u16> = style.size.to_string().encode_utf16().collect();
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
+        unsafe {
+            self.target.DrawText(
+                &text,
+                &self.fonts.hint,
+                &value,
+                &self.brushes.muted,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        for (number_style, cell) in &strip.number_styles {
+            let r = local_rect(cell, origin);
+            if style.number_style == Some(*number_style) {
+                self.rounded(&r, &self.brushes.active);
+            } else if hovered == Some(Hit::NumberStyle(*number_style)) {
+                self.rounded(&r, &self.brushes.hover);
+            }
+            self.chip_text(number_style.mark(), &r);
+        }
+    }
+
+    fn chip_text(&self, text: &str, rect: &D2D_RECT_F) {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
+        unsafe {
+            self.target.DrawText(
+                &wide,
+                &self.fonts.label,
+                rect,
+                &self.brushes.white,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    /// 缓存层的版本与标注一致；不一致时重画。
+    fn ensure_layer(
+        &self,
+        annotations: &Annotations<'_>,
+        surface: &Surface<'_>,
+    ) -> Result<(), OverlayError> {
+        let mut cache = self
+            .layer
+            .try_borrow_mut()
+            .map_err(|_| OverlayError::InvalidInput("标注缓存正被占用".to_string()))?;
+        if cache
+            .as_ref()
+            .is_some_and(|c| c.revision == annotations.revision)
+        {
+            return Ok(());
+        }
+        let size = D2D_SIZE_F {
+            width: to_f32(i64::from(surface.size.0)),
+            height: to_f32(i64::from(surface.size.1)),
+        };
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，size 为有效局部变量；兼容目标与本目标共享设备资源。
+        let layer: ID2D1BitmapRenderTarget = unsafe {
+            self.target.CreateCompatibleRenderTarget(
+                Some(&size),
+                None,
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )
+        }
+        .map_err(win32("CreateCompatibleRenderTarget"))?;
+        // SAFETY: layer 刚创建，BeginDraw/EndDraw 成对调用，期间只在 layer 上绘制。
+        unsafe {
+            layer.BeginDraw();
+            layer.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+        }
+        let frames = [FrameRef {
+            bounds: surface.monitor(),
+            bgra: surface.bgra,
+        }];
+        let painter = Painter {
+            target: &layer,
+            factory: &self.factory,
+            dwrite: &self.dwrite,
+            round_stroke: &self.round_stroke,
+            flat_stroke: &self.flat_stroke,
+            frames: &frames,
+        };
+        let drawn = painter.draw_shapes(annotations.shapes, surface.origin);
+        // SAFETY: 与上面的 BeginDraw 配对，出错时也要结束绘制。
+        let ended = unsafe { layer.EndDraw(None, None) }.map_err(win32("EndDraw"));
+        drawn?;
+        ended?;
+        // SAFETY: layer 已结束绘制，位图内容有效。
+        let bitmap = unsafe { layer.GetBitmap() }.map_err(win32("GetBitmap"))?;
+        *cache = Some(LayerCache {
+            bitmap,
+            revision: annotations.revision,
+        });
+        Ok(())
+    }
+
+    /// 把已完成的标注缓存层整体贴到窗口上。
+    fn draw_layer(
+        &self,
+        annotations: &Annotations<'_>,
+        surface: &Surface<'_>,
+        dst: &D2D_RECT_F,
+        opacity: f32,
+    ) {
+        if annotations.shapes.is_empty() {
+            return;
+        }
+        // 标注只是叠加层，缓存失败时本帧不画，选区和成图不受影响
+        if self.ensure_layer(annotations, surface).is_err() {
+            return;
+        }
+        let Ok(cache) = self.layer.try_borrow() else {
+            return;
+        };
+        if let Some(cache) = cache.as_ref() {
+            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，位图由本目标的兼容目标创建。
+            unsafe {
+                self.target.DrawBitmap(
+                    &cache.bitmap,
+                    Some(dst),
+                    opacity.clamp(0.0, 1.0),
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
                 );
             }
         }
+    }
+
+    /// 选区内的标注：缓存层加正在画的图元，裁在选区范围内。
+    fn draw_annotations(
+        &self,
+        annotations: &Annotations<'_>,
+        surface: &Surface<'_>,
+        clip: &D2D_RECT_F,
+    ) {
+        if annotations.shapes.is_empty() && annotations.draft.is_none() {
+            return;
+        }
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，与下面的弹出成对。
+        unsafe {
+            self.target
+                .PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        let full = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: to_f32(i64::from(surface.size.0)),
+            bottom: to_f32(i64::from(surface.size.1)),
+        };
+        self.draw_layer(annotations, surface, &full, 1.0);
+        if let Some(draft) = &annotations.draft {
+            let frames = [FrameRef {
+                bounds: surface.monitor(),
+                bgra: surface.bgra,
+            }];
+            let painter = Painter {
+                target: &self.target,
+                factory: &self.factory,
+                dwrite: &self.dwrite,
+                round_stroke: &self.round_stroke,
+                flat_stroke: &self.flat_stroke,
+                frames: &frames,
+            };
+            // 预览只是临时反馈，失败时这一帧不画，松手后图元仍会正常加入
+            painter
+                .draw_shapes(std::slice::from_ref(draft), surface.origin)
+                .unwrap_or(());
+        }
+        // SAFETY: 与上面的 PushAxisAlignedClip 配对。
+        unsafe { self.target.PopAxisAlignedClip() };
     }
 
     fn draw_magnifier(&self, cursor: Point, format: ColorFormat, surface: &Surface<'_>) {
@@ -1189,8 +1698,11 @@ fn hint_obstacles(view: &View<'_>, surface: &Surface<'_>, dpi: u32) -> Vec<Rect>
     if let Preview::Rect(r) = view.preview {
         out.push(r);
     }
-    if let Some((bar, _)) = view.toolbar {
-        out.push(bar);
+    if let Some(toolbar) = &view.toolbar {
+        out.push(toolbar.layout.bar);
+        if let Some(strip) = &toolbar.layout.strip {
+            out.push(strip.rect);
+        }
     }
     if let Some((cursor, _)) = view.magnifier {
         let m = layout::magnifier_layout(cursor, &surface.monitor(), dpi);
@@ -1324,7 +1836,7 @@ fn local_point(p: Point, origin: Point) -> D2D1_ELLIPSE {
 }
 
 /// 窗口坐标下的浮点点，取其 `.point` 传给 `DrawLine`，原因同 [`local_point`]。
-fn float_point(x: f32, y: f32) -> D2D1_ELLIPSE {
+pub(crate) fn float_point(x: f32, y: f32) -> D2D1_ELLIPSE {
     let mut holder = D2D1_ELLIPSE::default();
     holder.point.X = x;
     holder.point.Y = y;
@@ -1332,7 +1844,7 @@ fn float_point(x: f32, y: f32) -> D2D1_ELLIPSE {
 }
 
 /// 坐标转 `f32`。显示器像素尺寸远小于 `i16` 范围，超出的值饱和到边界即可。
-fn to_f32(value: i64) -> f32 {
+pub(crate) fn to_f32(value: i64) -> f32 {
     let clamped = value.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
     f32::from(i16::try_from(clamped).unwrap_or(0))
 }
@@ -1455,5 +1967,300 @@ mod tests {
         assert_eq!(f32_to_u16(0.0), 0);
         assert_eq!(f32_to_u16(41.7), 41);
         assert_eq!(f32_to_u16(70_000.0), u16::MAX);
+    }
+
+    // 以下测试在内存里走真实的 D2D + WIC 合成路径，不需要窗口。
+
+    use lenswin_core::annotation::{Color, NumberStyle, Shape};
+
+    const FRAME: Rect = Rect::new(100, 50, 40, 30);
+
+    /// 冻结帧：R 随 x 变化、G 随 y 变化、B 固定，BGRA 排列。
+    fn gradient_frame() -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in 0..FRAME.height {
+            for x in 0..FRAME.width {
+                let (x, y) = (u8::try_from(x).expect("小"), u8::try_from(y).expect("小"));
+                out.extend_from_slice(&[40, y * 6, x * 6, 0]);
+            }
+        }
+        out
+    }
+
+    fn grey_frame() -> Vec<u8> {
+        [200u8, 200, 200, 0].repeat(usize::try_from(FRAME.width * FRAME.height).expect("小"))
+    }
+
+    fn compose(bgra: &[u8], area: &Rect, shapes: &[Shape]) -> CroppedImage {
+        let renderer = Renderer::new().expect("创建渲染器");
+        let frame = FrameRef {
+            bounds: FRAME,
+            bgra,
+        };
+        renderer.compose(frame, area, shapes).expect("合成")
+    }
+
+    fn pixel(image: &CroppedImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let index = usize::try_from(y * image.width() + x).expect("小") * 4;
+        match image.rgba().get(index..index + 4) {
+            Some([r, g, b, a]) => (*r, *g, *b, *a),
+            _ => panic!("像素越界：({x}, {y})"),
+        }
+    }
+
+    fn near(actual: u8, expected: u8, tolerance: u8) -> bool {
+        actual.abs_diff(expected) <= tolerance
+    }
+
+    const RED: Color = Color::rgb(0xFF, 0x3B, 0x30);
+
+    #[test]
+    fn compose_without_shapes_is_an_exact_crop() {
+        let image = compose(&gradient_frame(), &Rect::new(110, 60, 10, 8), &[]);
+        assert_eq!((image.width(), image.height()), (10, 8));
+        for y in 0..8u32 {
+            for x in 0..10u32 {
+                let fx = u8::try_from(x + 10).expect("小");
+                let fy = u8::try_from(y + 10).expect("小");
+                assert_eq!(pixel(&image, x, y), (fx * 6, fy * 6, 40, 255), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_clips_area_to_the_frame() {
+        let image = compose(&grey_frame(), &Rect::new(130, 70, 100, 100), &[]);
+        assert_eq!((image.width(), image.height()), (10, 10));
+    }
+
+    #[test]
+    fn rectangle_outline_is_drawn_in_selection_coordinates() {
+        let rect = Shape::Rectangle {
+            from: Point::new(105, 55),
+            to: Point::new(125, 75),
+            color: RED,
+            width: 2,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[rect]);
+        // 线宽 2 以边为中心，恰好盖住 x=4、5 两列
+        assert_eq!(pixel(&image, 4, 15), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 5, 15), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 15, 15), (200, 200, 200, 255));
+        assert_eq!(pixel(&image, 0, 0), (200, 200, 200, 255));
+        assert_eq!(pixel(&image, 30, 25), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn shapes_outside_the_selection_are_cropped_away() {
+        let rect = Shape::Rectangle {
+            from: Point::new(105, 55),
+            to: Point::new(125, 75),
+            color: RED,
+            width: 2,
+        };
+        // 选区只取右下角，与矩形没有重叠
+        let image = compose(&grey_frame(), &Rect::new(128, 78, 10, 2), &[rect]);
+        for x in 0..10 {
+            for y in 0..2 {
+                assert_eq!(pixel(&image, x, y), (200, 200, 200, 255));
+            }
+        }
+        // 选区左移到 x=102：矩形左边（屏幕 x=105）落在选区内 x=3
+        let image = compose(
+            &grey_frame(),
+            &Rect::new(102, 60, 10, 10),
+            &[Shape::Rectangle {
+                from: Point::new(105, 55),
+                to: Point::new(125, 75),
+                color: RED,
+                width: 2,
+            }],
+        );
+        assert_eq!(pixel(&image, 2, 5), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 3, 5), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 8, 5), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn line_and_arrow_head_are_drawn() {
+        let arrow = Shape::Arrow {
+            from: Point::new(105, 65),
+            to: Point::new(135, 65),
+            color: RED,
+            width: 3,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[arrow]);
+        // 杆身：y=15 附近线宽 3
+        assert_eq!(pixel(&image, 15, 15), (0xFF, 0x3B, 0x30, 255));
+        // 头部比杆身宽，杆身覆盖不到的 y=11 只可能是箭头
+        assert_eq!(pixel(&image, 25, 11), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 15, 11), (200, 200, 200, 255));
+        let line = Shape::Line {
+            from: Point::new(105, 55),
+            to: Point::new(105, 75),
+            color: RED,
+            width: 4,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[line]);
+        assert_eq!(pixel(&image, 4, 15), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 6, 15), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 8, 15), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn highlighter_is_translucent_and_overlap_does_not_darken() {
+        let there_and_back = Shape::Highlighter {
+            points: vec![
+                Point::new(105, 65),
+                Point::new(135, 65),
+                Point::new(105, 65),
+            ],
+            color: Color::rgb(0xFF, 0xCC, 0x00),
+            width: 10,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[there_and_back]);
+        // 0.6 × 200 + 0.4 × 通道值
+        let (r, g, b, a) = pixel(&image, 20, 15);
+        assert!(
+            near(r, 222, 3) && near(g, 202, 3) && near(b, 120, 3),
+            "{r} {g} {b}"
+        );
+        assert_eq!(a, 255);
+        assert_eq!(pixel(&image, 20, 2), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn pen_stroke_is_opaque() {
+        let pen = Shape::Pen {
+            points: vec![Point::new(105, 65), Point::new(125, 65)],
+            color: RED,
+            width: 4,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[pen]);
+        assert_eq!(pixel(&image, 15, 15), (0xFF, 0x3B, 0x30, 255));
+        assert_eq!(pixel(&image, 15, 20), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn mosaic_fills_blocks_with_the_average_of_the_original() {
+        let bgra = gradient_frame();
+        let mosaic = Shape::Mosaic {
+            from: Point::new(100, 50),
+            to: Point::new(140, 80),
+            block: 10,
+        };
+        let image = compose(&bgra, &FRAME, &[mosaic]);
+        // 每个 10×10 块内部颜色一致
+        for (bx, by) in [(0u32, 0u32), (10, 10), (30, 20)] {
+            let first = pixel(&image, bx, by);
+            assert_eq!(pixel(&image, bx + 9, by + 9), first);
+            assert_eq!(pixel(&image, bx + 4, by + 5), first);
+        }
+        // 第一块：x∈0..10 的 R 平均为 (0+…+9)/10 × 6 = 27，y 平均 27
+        let (r, g, b, _) = pixel(&image, 3, 3);
+        assert!(near(r, 27, 1) && near(g, 27, 1) && b == 40, "{r} {g} {b}");
+        assert_ne!(pixel(&image, 0, 0), pixel(&image, 10, 0));
+    }
+
+    #[test]
+    fn mosaic_samples_the_frame_not_other_shapes() {
+        let rect = Shape::Rectangle {
+            from: Point::new(100, 50),
+            to: Point::new(140, 80),
+            color: RED,
+            width: 30,
+        };
+        let mosaic = Shape::Mosaic {
+            from: Point::new(110, 60),
+            to: Point::new(130, 70),
+            block: 20,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[rect, mosaic]);
+        // 马赛克按冻结帧取色，是灰色，盖在红色矩形之上
+        assert_eq!(pixel(&image, 15, 15), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn mosaic_partial_edge_block_stays_inside_the_area() {
+        let mosaic = Shape::Mosaic {
+            from: Point::new(100, 50),
+            to: Point::new(125, 75),
+            block: 10,
+        };
+        let image = compose(&gradient_frame(), &FRAME, &[mosaic]);
+        // 区域 25×25，最后一块只有 5 像素宽，区域之外保持原图
+        assert_eq!(pixel(&image, 24, 0), pixel(&image, 20, 0));
+        assert_eq!(pixel(&image, 26, 0), (26 * 6, 0, 40, 255));
+        assert_eq!(pixel(&image, 0, 26), (0, 26 * 6, 40, 255));
+    }
+
+    #[test]
+    fn number_badge_is_a_filled_circle() {
+        let badge = Shape::Number {
+            center: Point::new(120, 65),
+            value: 1,
+            style: NumberStyle::Number,
+            color: Color::rgb(0x00, 0x7A, 0xFF),
+            size: 20,
+        };
+        let image = compose(&grey_frame(), &FRAME, &[badge]);
+        // 圆心在 (20, 15)，半径 10：偏离文字的位置是纯色
+        assert_eq!(pixel(&image, 26, 15), (0x00, 0x7A, 0xFF, 255));
+        assert_eq!(pixel(&image, 20, 8), (0x00, 0x7A, 0xFF, 255));
+        // 圆外与外接正方形的角保持原图
+        assert_eq!(pixel(&image, 11, 6), (200, 200, 200, 255));
+        assert_eq!(pixel(&image, 30, 25), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn shapes_are_painted_in_insertion_order() {
+        let red = Shape::Rectangle {
+            from: Point::new(105, 55),
+            to: Point::new(125, 75),
+            color: RED,
+            width: 6,
+        };
+        let blue = Shape::Rectangle {
+            from: Point::new(105, 55),
+            to: Point::new(125, 75),
+            color: Color::rgb(0, 0, 255),
+            width: 6,
+        };
+        let a = compose(&grey_frame(), &FRAME, &[red.clone(), blue.clone()]);
+        let b = compose(&grey_frame(), &FRAME, &[blue, red]);
+        assert_eq!(pixel(&a, 5, 15), (0, 0, 255, 255));
+        assert_eq!(pixel(&b, 5, 15), (0xFF, 0x3B, 0x30, 255));
+    }
+
+    #[test]
+    fn compose_rejects_area_outside_the_frame() {
+        let renderer = Renderer::new().expect("创建渲染器");
+        let bgra = grey_frame();
+        let frame = FrameRef {
+            bounds: FRAME,
+            bgra: &bgra,
+        };
+        assert!(
+            renderer
+                .compose(frame, &Rect::new(0, 0, 5, 5), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn crop_bgra_rejects_out_of_range_area() {
+        let bgra = grey_frame();
+        let frame = FrameRef {
+            bounds: FRAME,
+            bgra: &bgra,
+        };
+        assert!(crop_bgra(&frame, &Rect::new(130, 70, 20, 20)).is_err());
+        assert!(crop_bgra(&frame, &Rect::new(90, 50, 5, 5)).is_err());
+        assert_eq!(
+            crop_bgra(&frame, &Rect::new(100, 50, 2, 2))
+                .map(|v| v.len())
+                .ok(),
+            Some(16)
+        );
     }
 }

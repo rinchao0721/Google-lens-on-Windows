@@ -1,13 +1,16 @@
 //! 鼠标键盘状态机：与 Win32 无关，窗口层只负责把消息翻译成这里的调用。
 
+use lenswin_core::annotation::{Document, PALETTE, Shape, Tool};
+use lenswin_core::config::AnnotateConfig;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::{MonitorInfo, index_at};
 use lenswin_core::selection::{Selection, SelectionShape};
 use lenswin_core::snip::{ColorFormat, OverlayFlow, ToolbarAction, topmost_containing};
 
 use crate::adjust::{self, Direction, Handle, NudgeMode};
+use crate::annotate::{Annotator, StyleView};
 use crate::hint::{self, Features, Hint, HintState, Stage};
-use crate::layout::{self, ToolbarButton};
+use crate::layout::{self, Hit, StripSpec, ToolbarButton, ToolbarLayout};
 use crate::modes::{Preview, SelectionTool};
 
 /// 按下和松开相距不超过该像素数时视为单击，用于窗口吸附。
@@ -49,6 +52,10 @@ pub enum Key {
     NewerHistory,
     /// 显示或隐藏快捷键提示。
     ToggleHints,
+    /// 撤销上一个标注。
+    Undo,
+    /// 重做被撤销的标注。
+    Redo,
 }
 
 /// 需要窗口层调用系统 API 完成的按键效果。
@@ -105,6 +112,8 @@ pub struct Options {
     pub history: Vec<Rect>,
     /// 快捷键提示的初始状态。
     pub hints: HintState,
+    /// 标注工具的初始样式，只在截屏流程用到。
+    pub annotate: AnnotateConfig,
 }
 
 /// 矩形选区的边框装饰。
@@ -118,6 +127,34 @@ pub enum FrameStyle {
     Corners,
 }
 
+/// 工具栏与样式条的绘制内容。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolbarView {
+    /// 布局。
+    pub layout: ToolbarLayout,
+    /// 光标悬停的控件。
+    pub hovered: Option<Hit>,
+    /// 当前选中的标注工具。
+    pub active: Option<Tool>,
+    /// 撤销按钮可用。
+    pub can_undo: bool,
+    /// 重做按钮可用。
+    pub can_redo: bool,
+    /// 样式条内容，没有选中工具时为 `None`。
+    pub style: Option<StyleView>,
+}
+
+/// 需要画在冻结帧上的标注。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotations<'a> {
+    /// 已完成的图元，按添加顺序。
+    pub shapes: &'a [Shape],
+    /// 已完成图元的版本号，变化时绘制缓存失效。
+    pub revision: u64,
+    /// 正在画的图元。
+    pub draft: Option<Shape>,
+}
+
 /// 窗口层绘制某个显示器时需要的内容。
 #[derive(Debug, Clone, PartialEq)]
 pub struct View<'a> {
@@ -127,8 +164,10 @@ pub struct View<'a> {
     pub frame: FrameStyle,
     /// 需要标注尺寸的矩形。
     pub label: Option<Rect>,
-    /// 工具栏范围与悬停的按钮。
-    pub toolbar: Option<(Rect, Option<ToolbarButton>)>,
+    /// 工具栏与样式条。
+    pub toolbar: Option<ToolbarView>,
+    /// 标注图元。
+    pub annotations: Annotations<'a>,
     /// 放大镜：光标位置与颜色格式。
     pub magnifier: Option<(Point, ColorFormat)>,
     /// 快捷键提示，为空表示不显示。
@@ -172,6 +211,7 @@ pub struct Interaction {
     committed: Option<Adjusting>,
     /// 尚未取走的常驻选框回投。
     commits: Vec<Selection>,
+    annotator: Annotator,
 }
 
 /// 窗口客户区坐标转虚拟桌面坐标；窗口左上角即显示器左上角。
@@ -207,18 +247,10 @@ fn cursor_for(handle: Handle) -> CursorKind {
     }
 }
 
-fn action_of(button: ToolbarButton) -> Option<ToolbarAction> {
-    match button {
-        ToolbarButton::Search => Some(ToolbarAction::Search),
-        ToolbarButton::Save => Some(ToolbarAction::Save),
-        ToolbarButton::Copy => Some(ToolbarAction::Copy),
-        ToolbarButton::Cancel => None,
-    }
-}
-
 impl Interaction {
     /// 创建交互，`monitors` 的顺序即窗口序号。
     pub fn new(tool: Box<dyn SelectionTool>, monitors: Vec<MonitorInfo>, options: Options) -> Self {
+        let annotator = Annotator::new(&options.annotate);
         Self {
             tool,
             monitors,
@@ -230,6 +262,7 @@ impl Interaction {
             outcome: None,
             committed: None,
             commits: Vec::new(),
+            annotator,
         }
     }
 
@@ -249,21 +282,53 @@ impl Interaction {
         self.monitors.get(index).map_or(96, |m| m.dpi)
     }
 
-    fn toolbar(&self, adj: &Adjusting) -> Option<Rect> {
+    fn toolbar(&self, adj: &Adjusting) -> Option<ToolbarLayout> {
         if self.options.flow != OverlayFlow::Toolbar {
             return None;
         }
         let monitor = self.monitor_bounds(adj.monitor)?;
-        Some(layout::toolbar_rect(
+        let strip = self.annotator.tool().map(|tool| StripSpec {
+            has_color: tool.has_color(),
+            number_style: tool == Tool::Number,
+        });
+        Some(layout::toolbar_layout(
             &adj.rect,
             &monitor,
             self.dpi(adj.monitor),
+            strip,
         ))
     }
 
-    fn toolbar_button_at(&self, adj: &Adjusting, p: Point) -> Option<ToolbarButton> {
-        let bar = self.toolbar(adj)?;
-        layout::button_at(&bar, p, self.dpi(adj.monitor))
+    /// 截屏流程里已选中标注工具。
+    fn annotating(&self) -> bool {
+        self.options.flow == OverlayFlow::Toolbar && self.annotator.tool().is_some()
+    }
+
+    /// 处理按在工具栏或样式条上的点击。
+    fn press_toolbar(&mut self, adj: Adjusting, hit: Option<Hit>) {
+        match hit {
+            Some(Hit::Button(button)) => match button {
+                ToolbarButton::Tool(tool) => self.annotator.toggle_tool(tool),
+                ToolbarButton::Undo => {
+                    self.annotator.undo();
+                }
+                ToolbarButton::Redo => {
+                    self.annotator.redo();
+                }
+                ToolbarButton::Search => self.finish_with_action(adj, ToolbarAction::Search),
+                ToolbarButton::Save => self.finish_with_action(adj, ToolbarAction::Save),
+                ToolbarButton::Copy => self.finish_with_action(adj, ToolbarAction::Copy),
+                ToolbarButton::Cancel => self.finish(Outcome::Cancelled),
+            },
+            Some(Hit::Swatch(index)) => {
+                if let Some(color) = PALETTE.get(index) {
+                    self.annotator.set_color(*color);
+                }
+            }
+            Some(Hit::NumberStyle(style)) => self.annotator.set_number_style(style),
+            Some(Hit::Preset(index)) => self.annotator.apply_preset(index),
+            None => {}
+        }
     }
 
     /// 光标下可吸附的窗口范围，已限制在光标所在显示器内。
@@ -356,27 +421,36 @@ impl Interaction {
         match self.phase {
             Phase::Drawing { .. } => return,
             Phase::Adjusting(mut adj) => {
-                if let Some(button) = self.toolbar_button_at(&adj, p) {
-                    match action_of(button) {
-                        Some(action) => self.finish_with_action(adj, action),
-                        None => self.finish(Outcome::Cancelled),
-                    }
-                    return;
-                }
-                if let Some(handle) =
-                    adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)))
+                if let Some(toolbar) = self.toolbar(&adj)
+                    && toolbar.covers(p)
                 {
-                    adj.grab = Some(Grab {
-                        handle,
-                        origin: p,
-                        start: adj.rect,
-                    });
-                    self.phase = Phase::Adjusting(adj);
+                    self.press_toolbar(adj, toolbar.hit(p));
                     return;
                 }
-                // 在选区外按下：放弃当前选区，重新框选
-                self.phase = Phase::Idle;
-                self.history_index = None;
+                let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
+                match hit {
+                    // 有工具时选区内部用来画图，手柄仍然优先缩放
+                    Some(Handle::Body) if self.annotating() => {
+                        if let Some(bounds) = self.monitor_bounds(adj.monitor) {
+                            self.annotator.press(p, &bounds);
+                        }
+                        return;
+                    }
+                    Some(handle) => {
+                        adj.grab = Some(Grab {
+                            handle,
+                            origin: p,
+                            start: adj.rect,
+                        });
+                        self.phase = Phase::Adjusting(adj);
+                        return;
+                    }
+                    None if self.annotating() => return,
+                    None => {
+                        self.phase = Phase::Idle;
+                        self.history_index = None;
+                    }
+                }
             }
             Phase::Idle => {}
         }
@@ -397,6 +471,14 @@ impl Interaction {
             return;
         };
         self.hover = Some(p);
+        if self.annotator.is_drawing() {
+            if let Phase::Adjusting(adj) = self.phase
+                && let Some(bounds) = self.monitor_bounds(adj.monitor)
+            {
+                self.annotator.drag(p, &bounds);
+            }
+            return;
+        }
         match self.phase {
             Phase::Drawing { .. } => self.tool.drag(p),
             Phase::Adjusting(mut adj) => {
@@ -420,6 +502,10 @@ impl Interaction {
     /// 松开左键；单击且光标下有可吸附窗口时选中该窗口，否则无效选区回到空闲。
     pub fn release(&mut self, window: usize, local: (i32, i32)) {
         if self.outcome.is_some() {
+            return;
+        }
+        if self.annotator.is_drawing() {
+            self.finish_annotation(window, local);
             return;
         }
         match self.phase {
@@ -461,12 +547,28 @@ impl Interaction {
         }
     }
 
-    /// 双击：在调整中的选区内双击等同于复制，其余情况按普通按下处理。
+    /// 标注拖拽结束：图元有效就加入文档。
+    fn finish_annotation(&mut self, window: usize, local: (i32, i32)) {
+        let bounds = match self.phase {
+            Phase::Adjusting(adj) => self.monitor_bounds(adj.monitor),
+            _ => None,
+        };
+        match (self.point(window, local), bounds) {
+            (Some(p), Some(bounds)) => {
+                self.hover = Some(p);
+                self.annotator.release(p, &bounds);
+            }
+            _ => self.annotator.cancel_drawing(),
+        }
+    }
+
+    /// 双击：在调整中的选区内双击等同于复制，其余情况按普通按下处理；有工具时双击只是普通按下。
     pub fn double_click(&mut self, window: usize, local: (i32, i32)) {
         if let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local))
             && self.options.flow == OverlayFlow::Toolbar
+            && self.annotator.tool().is_none()
             && adj.rect.contains(p)
-            && self.toolbar_button_at(&adj, p).is_none()
+            && !self.toolbar(&adj).is_some_and(|t| t.covers(p))
         {
             self.finish_with_action(adj, ToolbarAction::Copy);
             return;
@@ -478,6 +580,9 @@ impl Interaction {
     pub fn right_click(&mut self) {
         if self.is_live() {
             self.cancel();
+            return;
+        }
+        if self.annotator.exit_tool() {
             return;
         }
         match self.phase {
@@ -496,7 +601,22 @@ impl Interaction {
             return None;
         }
         match key {
-            Key::Escape => self.cancel(),
+            Key::Escape => {
+                if self.is_live() || !self.annotator.exit_tool() {
+                    self.cancel();
+                }
+            }
+            Key::Undo | Key::Redo => {
+                if matches!(self.phase, Phase::Adjusting(_))
+                    && self.options.flow == OverlayFlow::Toolbar
+                {
+                    if key == Key::Undo {
+                        self.annotator.undo();
+                    } else {
+                        self.annotator.redo();
+                    }
+                }
+            }
             Key::Enter => {
                 if let (Phase::Adjusting(adj), OverlayFlow::Toolbar) =
                     (self.phase, self.options.flow)
@@ -540,7 +660,7 @@ impl Interaction {
             return Some(KeyCommand::MoveCursor(dx, dy));
         };
         // 常驻选框每次微调都会触发搜索，容易被限流，不支持键盘微调
-        if adj.grab.is_some() || self.is_live() {
+        if adj.grab.is_some() || self.is_live() || self.annotator.is_drawing() {
             return None;
         }
         let monitor = self.monitor_bounds(adj.monitor)?;
@@ -558,7 +678,7 @@ impl Interaction {
         }
         let busy = match self.phase {
             Phase::Drawing { .. } => true,
-            Phase::Adjusting(adj) => adj.grab.is_some(),
+            Phase::Adjusting(adj) => adj.grab.is_some() || self.annotator.is_drawing(),
             Phase::Idle => false,
         };
         if busy {
@@ -572,6 +692,7 @@ impl Interaction {
             (Some(0), false) => {
                 self.history_index = None;
                 self.phase = Phase::Idle;
+                self.annotator.exit_tool();
                 return;
             }
             (Some(i), false) => i - 1,
@@ -611,6 +732,9 @@ impl Interaction {
 
     /// 是否需要捕获鼠标：拖拽框选或拖动手柄期间。
     pub fn is_capturing(&self) -> bool {
+        if self.annotator.is_drawing() {
+            return true;
+        }
         match self.phase {
             Phase::Drawing { .. } => true,
             Phase::Adjusting(adj) => adj.grab.is_some(),
@@ -625,8 +749,32 @@ impl Interaction {
         match self.phase {
             Phase::Idle => true,
             Phase::Drawing { .. } => matches!(self.tool.preview(), Preview::Rect(_)),
-            Phase::Adjusting(adj) => adj.grab.is_some() && !self.is_live(),
+            Phase::Adjusting(adj) => {
+                adj.grab.is_some() && !self.is_live() && self.annotator.tool().is_none()
+            }
         }
+    }
+
+    /// 记录 Shift 是否按下，标注拖拽时据此约束形状。
+    pub fn set_shift(&mut self, down: bool) {
+        self.annotator.set_shift(down);
+    }
+
+    /// 滚轮：`notches` 为正表示向上滚；调整当前标注工具的粗细，没有工具时无作用。
+    pub fn wheel(&mut self, notches: i32) {
+        if matches!(self.phase, Phase::Adjusting(_)) && self.options.flow == OverlayFlow::Toolbar {
+            self.annotator.wheel(notches);
+        }
+    }
+
+    /// 已完成的标注，合成成图时使用。
+    pub fn document(&self) -> &Document {
+        self.annotator.document()
+    }
+
+    /// 本次会话改动了标注样式时的新样式。
+    pub fn annotate_change(&self) -> Option<AnnotateConfig> {
+        self.annotator.changed_config()
     }
 
     /// 覆盖层打开时的光标位置，让提示面板和放大镜在第一次移动鼠标前就能显示。
@@ -651,6 +799,7 @@ impl Interaction {
             Phase::Idle => Stage::Idle,
             Phase::Drawing { .. } => Stage::Drawing,
             Phase::Adjusting(_) if self.is_live() => Stage::LiveAdjusting,
+            Phase::Adjusting(_) if self.annotating() => Stage::Annotating,
             Phase::Adjusting(_) => Stage::Adjusting,
         };
         let features = Features {
@@ -663,6 +812,12 @@ impl Interaction {
 
     /// 当前有内容需要绘制的窗口序号，状态变化前后取并集即为需要重绘的窗口。
     pub fn painted_windows(&self) -> Vec<usize> {
+        // 标注可能留在别的显示器上，撤销重做要让所有窗口跟着变
+        if self.options.flow == OverlayFlow::Toolbar
+            && (!self.annotator.document().is_empty() || self.annotator.can_redo())
+        {
+            return (0..self.monitors.len()).collect();
+        }
         let mut out = Vec::with_capacity(2);
         out.push(self.hint_window());
         let active = match self.phase {
@@ -683,6 +838,11 @@ impl Interaction {
             frame: FrameStyle::Plain,
             label: None,
             toolbar: None,
+            annotations: Annotations {
+                shapes: self.annotator.document().shapes(),
+                revision: self.annotator.document().revision(),
+                draft: self.annotator.preview(),
+            },
             magnifier: None,
             hints: Vec::new(),
             cursor: self
@@ -713,11 +873,13 @@ impl Interaction {
                     view.frame = FrameStyle::Handles;
                     view.label = Some(adj.rect);
                     if adj.grab.is_none() {
-                        view.toolbar = self.toolbar(&adj).map(|bar| {
-                            let hovered = self
-                                .hover
-                                .and_then(|p| layout::button_at(&bar, p, self.dpi(window)));
-                            (bar, hovered)
+                        view.toolbar = self.toolbar(&adj).map(|layout| ToolbarView {
+                            hovered: self.hover.and_then(|p| layout.hit(p)),
+                            layout,
+                            active: self.annotator.tool(),
+                            can_undo: self.annotator.can_undo(),
+                            can_redo: self.annotator.can_redo(),
+                            style: self.annotator.style_view(),
                         });
                     }
                 }
@@ -743,14 +905,22 @@ impl Interaction {
         if let Some(grab) = adj.grab {
             return cursor_for(grab.handle);
         }
+        if self.annotator.is_drawing() {
+            return CursorKind::Cross;
+        }
         let Some(p) = self.hover else {
             return CursorKind::Cross;
         };
-        if self.toolbar_button_at(&adj, p).is_some() {
+        if self.toolbar(&adj).is_some_and(|t| t.covers(p)) {
             return CursorKind::Arrow;
         }
-        adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)))
-            .map_or(CursorKind::Cross, cursor_for)
+        let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
+        match hit {
+            Some(Handle::Body) if self.annotating() => CursorKind::Cross,
+            Some(handle) => cursor_for(handle),
+            None if self.annotating() => CursorKind::Arrow,
+            None => CursorKind::Cross,
+        }
     }
 
     /// 取走常驻选框尚未回投的选区，按发生顺序排列。
@@ -778,6 +948,7 @@ impl Interaction {
 mod tests {
     use super::*;
     use crate::modes::{LassoTool, RectTool};
+    use lenswin_core::annotation::NumberStyle;
 
     fn monitors() -> Vec<MonitorInfo> {
         vec![
@@ -802,6 +973,7 @@ mod tests {
             windows: Vec::new(),
             history: Vec::new(),
             hints: HintState::Shown,
+            annotate: AnnotateConfig::default(),
         }
     }
 
@@ -953,15 +1125,33 @@ mod tests {
         assert_eq!(adjusted_rect(&it), Some(Rect::new(1000, 800, 100, 100)));
     }
 
+    fn bar_layout(it: &Interaction) -> ToolbarLayout {
+        it.view(1).toolbar.map(|t| t.layout).expect("工具栏")
+    }
+
+    /// 在主显示器窗口上点按钮中心。
+    fn click_button(it: &mut Interaction, button: ToolbarButton) {
+        let r = bar_layout(it).button_rect(button).expect("按钮");
+        it.press(1, (r.x + 2, r.y + 2));
+        it.release(1, (r.x + 2, r.y + 2));
+    }
+
+    fn drag_on_window(it: &mut Interaction, from: (i32, i32), to: (i32, i32)) {
+        it.press(1, from);
+        it.mouse_move(1, to);
+        it.release(1, to);
+    }
+
     #[test]
     fn toolbar_buttons_finish_with_action_or_cancel() {
         let mut it = adjusting();
-        let bar = it.view(1).toolbar.map(|(b, _)| b).expect("工具栏");
-        let save = layout::button_rect(&bar, 1, 96).expect("按钮");
+        let save = bar_layout(&it)
+            .button_rect(ToolbarButton::Save)
+            .expect("按钮");
         it.mouse_move(1, (save.x + 2, save.y + 2));
         assert_eq!(
-            it.view(1).toolbar.map(|(_, h)| h),
-            Some(Some(ToolbarButton::Save))
+            it.view(1).toolbar.map(|t| t.hovered),
+            Some(Some(Hit::Button(ToolbarButton::Save)))
         );
         assert_eq!(it.cursor_kind(), CursorKind::Arrow);
         it.press(1, (save.x + 2, save.y + 2));
@@ -973,10 +1163,328 @@ mod tests {
         }
 
         let mut it = adjusting();
-        let bar = it.view(1).toolbar.map(|(b, _)| b).expect("工具栏");
-        let cancel = layout::button_rect(&bar, 2, 96).expect("按钮");
-        it.press(1, (cancel.x + 2, cancel.y + 2));
+        click_button(&mut it, ToolbarButton::Cancel);
         assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
+
+        for (button, expected) in [
+            (ToolbarButton::Search, ToolbarAction::Search),
+            (ToolbarButton::Copy, ToolbarAction::Copy),
+        ] {
+            let mut it = adjusting();
+            click_button(&mut it, button);
+            assert!(matches!(
+                it.take_outcome(),
+                Some(Outcome::Action(_, action)) if action == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn pressing_toolbar_padding_does_not_start_a_new_selection() {
+        let mut it = adjusting();
+        let bar = bar_layout(&it).bar;
+        it.press(1, (bar.x + 1, bar.y + 1));
+        it.release(1, (bar.x + 1, bar.y + 1));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+    }
+
+    #[test]
+    fn tool_button_selects_tool_and_shows_strip() {
+        let mut it = adjusting();
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
+        assert!(bar_layout(&it).strip.is_none());
+        click_button(&mut it, ToolbarButton::Tool(Tool::Arrow));
+        let toolbar = it.view(1).toolbar.expect("工具栏");
+        assert_eq!(toolbar.active, Some(Tool::Arrow));
+        assert!(toolbar.layout.strip.is_some());
+        assert_eq!(toolbar.style.map(|s| s.size), Some(3));
+        click_button(&mut it, ToolbarButton::Tool(Tool::Arrow));
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
+    }
+
+    #[test]
+    fn drawing_inside_selection_adds_shape_and_captures_mouse() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        it.press(1, (200, 200));
+        assert!(it.is_capturing());
+        assert_eq!(it.cursor_kind(), CursorKind::Cross);
+        it.mouse_move(1, (300, 260));
+        assert!(it.view(1).annotations.draft.is_some());
+        it.release(1, (300, 260));
+        assert!(!it.is_capturing());
+        let view = it.view(1);
+        assert_eq!(view.annotations.shapes.len(), 1);
+        assert!(view.annotations.draft.is_none());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        assert!(view.toolbar.is_some_and(|t| t.can_undo && !t.can_redo));
+    }
+
+    #[test]
+    fn handles_win_over_drawing_and_outside_is_ignored() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        // 右下角手柄：缩放选区而不是画图
+        it.press(1, (500, 400));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeNwse);
+        it.mouse_move(1, (600, 450));
+        it.release(1, (600, 450));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 500, 350)));
+        assert!(it.view(1).annotations.shapes.is_empty());
+        drag_on_window(&mut it, (1000, 800), (1100, 900));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 500, 350)));
+        assert!(it.view(1).annotations.shapes.is_empty());
+        assert_eq!(it.cursor_kind(), CursorKind::Arrow);
+    }
+
+    #[test]
+    fn shapes_stay_in_place_when_selection_moves() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (150, 150), (250, 250));
+        it.right_click();
+        drag_on_window(&mut it, (300, 300), (320, 310));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(120, 110, 400, 300)));
+        let shapes = it.view(1).annotations.shapes.to_vec();
+        assert!(matches!(
+            shapes.first(),
+            Some(Shape::Line { from, to, .. }) if *from == Point::new(150, 150) && *to == Point::new(250, 250)
+        ));
+    }
+
+    #[test]
+    fn escape_and_right_click_leave_tool_before_cancelling() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert!(!it.is_finished());
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        it.right_click();
+        assert!(!it.is_finished());
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        it.right_click();
+        assert_eq!(adjusted_rect(&it), None);
+        it.right_click();
+        assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
+
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        it.key(Key::Escape, NudgeMode::Move, false);
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
+    }
+
+    #[test]
+    fn escape_during_drawing_discards_the_stroke() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        it.press(1, (200, 200));
+        it.mouse_move(1, (230, 230));
+        it.key(Key::Escape, NudgeMode::Move, false);
+        assert!(!it.is_capturing());
+        assert!(!it.is_finished());
+        it.release(1, (230, 230));
+        assert!(it.view(1).annotations.shapes.is_empty());
+    }
+
+    #[test]
+    fn undo_redo_via_buttons_and_keys() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (150, 150), (250, 250));
+        drag_on_window(&mut it, (150, 200), (250, 300));
+        assert_eq!(it.view(1).annotations.shapes.len(), 2);
+        click_button(&mut it, ToolbarButton::Undo);
+        assert_eq!(it.view(1).annotations.shapes.len(), 1);
+        assert!(it.view(1).toolbar.is_some_and(|t| t.can_redo));
+        it.key(Key::Redo, NudgeMode::Move, false);
+        assert_eq!(it.view(1).annotations.shapes.len(), 2);
+        it.key(Key::Undo, NudgeMode::Move, false);
+        it.key(Key::Undo, NudgeMode::Move, false);
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert!(it.view(1).annotations.shapes.is_empty());
+        assert!(
+            it.view(1)
+                .toolbar
+                .is_some_and(|t| !t.can_undo && t.can_redo)
+        );
+        click_button(&mut it, ToolbarButton::Redo);
+        assert_eq!(it.view(1).annotations.shapes.len(), 1);
+        // 新图元清空重做栈
+        drag_on_window(&mut it, (150, 220), (250, 320));
+        assert!(it.view(1).toolbar.is_some_and(|t| !t.can_redo));
+    }
+
+    #[test]
+    fn undo_keys_do_nothing_outside_adjusting_or_other_flows() {
+        let mut idle = rect(OverlayFlow::Toolbar);
+        idle.key(Key::Undo, NudgeMode::Move, false);
+        assert!(idle.document().is_empty());
+        let mut direct = rect(OverlayFlow::Direct);
+        direct.key(Key::Redo, NudgeMode::Move, false);
+        assert!(!direct.is_finished());
+    }
+
+    #[test]
+    fn wheel_changes_size_only_with_a_tool() {
+        let mut it = adjusting();
+        it.wheel(3);
+        assert_eq!(it.annotate_change(), None);
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        it.wheel(2);
+        assert_eq!(
+            it.view(1).toolbar.and_then(|t| t.style).map(|s| s.size),
+            Some(5)
+        );
+        it.wheel(-10);
+        assert_eq!(
+            it.view(1).toolbar.and_then(|t| t.style).map(|s| s.size),
+            Some(1)
+        );
+        assert_eq!(it.annotate_change().map(|c| c.rectangle.width), Some(1));
+        let mut direct = rect(OverlayFlow::Direct);
+        direct.wheel(2);
+        assert_eq!(direct.annotate_change(), None);
+    }
+
+    #[test]
+    fn strip_swatches_and_number_style_change_styles() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Number));
+        let strip = bar_layout(&it).strip.expect("样式条");
+        let swatch = strip.swatches.get(4).copied().expect("色块");
+        it.press(1, (swatch.x + 2, swatch.y + 2));
+        it.release(1, (swatch.x + 2, swatch.y + 2));
+        let style = it.view(1).toolbar.and_then(|t| t.style).expect("样式");
+        assert_eq!(style.swatch, Some(4));
+        let letter = bar_layout(&it)
+            .strip
+            .and_then(|s| s.number_styles.get(1).map(|(_, r)| *r))
+            .expect("风格按钮");
+        it.press(1, (letter.x + 2, letter.y + 2));
+        it.release(1, (letter.x + 2, letter.y + 2));
+        assert_eq!(
+            it.view(1)
+                .toolbar
+                .and_then(|t| t.style)
+                .and_then(|s| s.number_style),
+            Some(NumberStyle::Letter)
+        );
+        // 点击样式条不会在其下方画出序号
+        assert!(it.view(1).annotations.shapes.is_empty());
+        let change = it.annotate_change().expect("样式变化");
+        assert_eq!(change.number.color, "#007AFF");
+        assert_eq!(change.number.style, NumberStyle::Letter);
+        it.press(1, (300, 300));
+        it.release(1, (300, 300));
+        assert!(matches!(
+            it.view(1).annotations.shapes.first(),
+            Some(Shape::Number {
+                value: 1,
+                style: NumberStyle::Letter,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn preset_dot_sets_size_without_drawing_beneath() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Mosaic));
+        let dot = bar_layout(&it)
+            .strip
+            .and_then(|s| s.presets.get(2).copied())
+            .expect("预设圆点");
+        it.mouse_move(1, (dot.x + 2, dot.y + 2));
+        assert_eq!(
+            it.view(1).toolbar.map(|t| t.hovered),
+            Some(Some(Hit::Preset(2)))
+        );
+        it.press(1, (dot.x + 2, dot.y + 2));
+        assert!(!it.is_capturing());
+        it.release(1, (dot.x + 2, dot.y + 2));
+        let style = it.view(1).toolbar.and_then(|t| t.style).expect("样式");
+        assert_eq!((style.size, style.preset), (32, Some(2)));
+        assert!(it.view(1).annotations.shapes.is_empty());
+        assert_eq!(it.annotate_change().map(|c| c.mosaic.block), Some(32));
+    }
+
+    #[test]
+    fn tool_mode_hides_magnifier_and_ignores_double_click_copy() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        it.mouse_move(1, (300, 300));
+        assert_eq!(it.view(1).magnifier, None);
+        it.double_click(1, (300, 300));
+        assert!(!it.is_finished());
+        // 双击等同于普通按下，开始了一次拖拽
+        assert!(it.is_capturing());
+        it.release(1, (300, 300));
+        it.key(Key::Enter, NudgeMode::Move, false);
+        assert!(matches!(
+            it.take_outcome(),
+            Some(Outcome::Action(_, ToolbarAction::Copy))
+        ));
+    }
+
+    #[test]
+    fn arrows_still_nudge_with_tool_but_not_mid_stroke() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        it.key(Key::Arrow(Direction::Left), NudgeMode::Move, false);
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(99, 100, 400, 300)));
+        it.press(1, (200, 200));
+        it.key(Key::Arrow(Direction::Left), NudgeMode::Move, false);
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(99, 100, 400, 300)));
+    }
+
+    #[test]
+    fn annotation_hints_replace_adjusting_hints() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        let keys: Vec<_> = it.view(1).hints.iter().map(|h| h.keys).collect();
+        assert!(keys.contains(&"滚轮") && keys.contains(&"Ctrl + Z"));
+        assert!(!keys.contains(&"方向键"));
+    }
+
+    #[test]
+    fn shift_constrains_square_through_interaction() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        it.set_shift(true);
+        drag_on_window(&mut it, (150, 150), (250, 200));
+        assert!(matches!(
+            it.view(1).annotations.shapes.first(),
+            Some(Shape::Rectangle { to, .. }) if *to == Point::new(250, 250)
+        ));
+    }
+
+    #[test]
+    fn painted_windows_cover_all_when_shapes_exist() {
+        let mut it = adjusting();
+        assert_eq!(it.painted_windows().len(), 1);
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (150, 150), (250, 250));
+        assert_eq!(it.painted_windows(), vec![0, 1]);
+    }
+
+    #[test]
+    fn history_back_to_idle_leaves_tool() {
+        let mut it = Interaction::new(
+            Box::new(RectTool::new()),
+            monitors(),
+            Options {
+                history: vec![Rect::new(10, 10, 50, 50)],
+                ..options(OverlayFlow::Toolbar)
+            },
+        );
+        it.key(Key::OlderHistory, NudgeMode::Move, false);
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        it.key(Key::NewerHistory, NudgeMode::Move, false);
+        assert_eq!(it.view(1).preview, Preview::None);
+        it.key(Key::OlderHistory, NudgeMode::Move, false);
+        assert_eq!(it.view(1).toolbar.map(|t| t.active), Some(None));
     }
 
     #[test]

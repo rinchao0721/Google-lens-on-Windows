@@ -9,6 +9,7 @@ use lenswin_actions::{
     ActionRegistry, check_update, default_file_name, prepare_lens_request, save_to,
 };
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
+use lenswin_core::config::AnnotateConfig;
 use lenswin_core::config::{Config, SEARCH_ENGINE_PRESETS, SearchBackend, TrayLeftClick};
 use lenswin_core::frame::{CroppedImage, Frame};
 use lenswin_core::geometry::Rect;
@@ -606,7 +607,7 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         match result {
-            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _) => {
+            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _, _) => {
                 if let Some(image) = self.crop(&selection, &frames) {
                     self.search_image(image, &selection.bounds());
                 }
@@ -624,16 +625,19 @@ impl<'a> Dispatcher<'a> {
         ) else {
             return;
         };
-        let (selection, action) = match result {
-            OverlayResult::Action(selection, action) => (selection, action),
-            OverlayResult::Selected(selection) => (selection, ToolbarAction::Copy),
+        // 工具栏流程的成图由覆盖层合成，已含标注
+        let (selection, action, image) = match result {
+            OverlayResult::Action(selection, action, image) => (selection, action, image),
+            OverlayResult::Selected(selection) => {
+                let Some(image) = self.crop(&selection, &frames) else {
+                    return;
+                };
+                (selection, ToolbarAction::Copy, image)
+            }
             OverlayResult::Color(text) => {
                 self.copy_color(&text);
                 return;
             }
-        };
-        let Some(image) = self.crop(&selection, &frames) else {
-            return;
         };
         match action {
             ToolbarAction::Copy => self.copy_image(image),
@@ -679,6 +683,7 @@ impl<'a> Dispatcher<'a> {
             search: &config.search,
             windows: &frozen.windows,
             history: &frozen.history,
+            annotate: &config.annotate,
         };
         let id = self.live_seq.get().wrapping_add(1);
         self.live_seq.set(id);
@@ -1184,24 +1189,42 @@ impl<'a> Dispatcher<'a> {
             search: &config.search,
             windows: &frozen.windows,
             history: &frozen.history,
+            annotate: &config.annotate,
         };
         let outcome = lenswin_overlay::select(&request);
         // 覆盖层期间积压的热键和托盘左键不应在结束后再次触发
         discard_pending_triggers();
         match outcome {
-            Ok(Some(result)) => {
-                self.remember(&result, config.screenshot.history_size);
-                Some((result, frozen.frames))
-            }
-            Ok(None) => {
-                log::info!("选区已取消");
-                None
+            Ok(output) => {
+                self.save_annotate(output.annotate);
+                match output.result {
+                    Some(result) => {
+                        self.remember(&result, config.screenshot.history_size);
+                        Some((result, frozen.frames))
+                    }
+                    None => {
+                        log::info!("选区已取消");
+                        None
+                    }
+                }
             }
             Err(e) => {
                 log::error!("选区失败：{e}");
                 self.balloon(NotifyLevel::Error, "lenswin", &format!("选区失败：{e}"));
                 None
             }
+        }
+    }
+
+    /// 覆盖层结束时样式有变化，就把新样式写进配置；失败只记日志。
+    fn save_annotate(&self, annotate: Option<AnnotateConfig>) {
+        let Some(annotate) = annotate else {
+            return;
+        };
+        let mut config = self.shared.store.snapshot();
+        config.annotate = annotate;
+        if let Err(e) = self.shared.store.apply(config) {
+            log::warn!("保存标注样式失败：{e}");
         }
     }
 
@@ -1248,7 +1271,7 @@ impl<'a> Dispatcher<'a> {
     /// 把矩形选区记入历史。
     fn remember(&self, result: &OverlayResult, capacity: u32) {
         let selection = match result {
-            OverlayResult::Selected(s) | OverlayResult::Action(s, _) => s,
+            OverlayResult::Selected(s) | OverlayResult::Action(s, _, _) => s,
             OverlayResult::Color(_) => return,
         };
         log::info!(

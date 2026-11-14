@@ -5,9 +5,11 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use eframe::egui;
+use lenswin_core::annotation::NumberStyle;
 use lenswin_core::config::{
-    Config, GlowMode, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE,
-    LitterboxExpiry, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TIMEOUT_SECS_RANGE,
+    ANNOTATE_WIDTH_RANGE, Config, GlowMode, HIGHLIGHTER_WIDTH_RANGE, HISTORY_SIZE_RANGE,
+    LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry, MOSAIC_BLOCK_RANGE,
+    NUMBER_SIZE_RANGE, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TIMEOUT_SECS_RANGE,
     TrayLeftClick, UploadProvider, ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
@@ -27,8 +29,8 @@ use crate::recorder::{self, Capture};
 use crate::theme::{self, CARD_GAP, FONT_DESC, Look, NAV_WIDTH, PAGE_MARGIN_X, Palette, ThemeKind};
 use crate::update_status::{UpdateChecker, UpdateStatus};
 use crate::widgets::{
-    BannerKind, Card, banner, group_label, key_caps, modifier_chip, nav_item, page_title,
-    primary_button, record_button, secondary_button, text_input, toggle,
+    BannerKind, Card, banner, choice_chip, color_swatches, group_label, key_caps, modifier_chip,
+    nav_item, page_title, primary_button, record_button, secondary_button, text_input, toggle,
 };
 
 /// 上传大小上限的界面范围（MiB），与 `MAX_BYTES_RANGE` 的上下界一致。
@@ -909,6 +911,99 @@ impl SettingsApp {
             .right_width(48.0)
             .show(ui, &look, |ui| {
                 toggle(ui, &look, show_bounds);
+            });
+        self.annotate_cards(ui);
+    }
+
+    /// 标注工具的默认样式：每个工具一行；截屏结束时会自动记住最近一次的改动。
+    fn annotate_cards(&mut self, ui: &mut egui::Ui) {
+        let look = self.look;
+        group_label(ui, &look, "标注");
+        let pair =
+            |app: &Self, color: &str, size: &str| app.issue(color).or_else(|| app.issue(size));
+        let stroke_issues = [
+            pair(self, "annotate.rectangle.color", "annotate.rectangle.width"),
+            pair(self, "annotate.ellipse.color", "annotate.ellipse.width"),
+            pair(self, "annotate.line.color", "annotate.line.width"),
+            pair(self, "annotate.arrow.color", "annotate.arrow.width"),
+            pair(self, "annotate.pen.color", "annotate.pen.width"),
+        ];
+        let highlighter_issue = pair(
+            self,
+            "annotate.highlighter.color",
+            "annotate.highlighter.width",
+        );
+        let mosaic_issue = self.issue("annotate.mosaic.block");
+        let number_issue = pair(self, "annotate.number.color", "annotate.number.size");
+        let a = &mut self.draft.config.annotate;
+        let strokes = [
+            ("矩形", &mut a.rectangle),
+            ("椭圆", &mut a.ellipse),
+            ("直线", &mut a.line),
+            ("箭头", &mut a.arrow),
+            ("画笔", &mut a.pen),
+        ];
+        for ((title, stroke), issue) in strokes.into_iter().zip(&stroke_issues) {
+            Card::new(title)
+                .icon(icons::COLOR)
+                .desc("颜色与线宽")
+                .error(issue.as_deref())
+                .right_width(340.0)
+                .show(ui, &look, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut stroke.width)
+                            .range(ANNOTATE_WIDTH_RANGE)
+                            .suffix(" 像素"),
+                    );
+                    color_swatches(ui, &look, &mut stroke.color);
+                });
+        }
+        let highlighter = &mut a.highlighter;
+        Card::new("荧光笔")
+            .icon(icons::COLOR)
+            .desc("颜色与线宽，绘制时固定为 40% 不透明")
+            .error(highlighter_issue.as_deref())
+            .right_width(340.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut highlighter.width)
+                        .range(HIGHLIGHTER_WIDTH_RANGE)
+                        .suffix(" 像素"),
+                );
+                color_swatches(ui, &look, &mut highlighter.color);
+            });
+        let mosaic = &mut a.mosaic;
+        Card::new("马赛克")
+            .icon(icons::COLOR)
+            .desc("像素化的块大小")
+            .error(mosaic_issue.as_deref())
+            .right_width(110.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut mosaic.block)
+                        .range(MOSAIC_BLOCK_RANGE)
+                        .suffix(" 像素"),
+                );
+            });
+        let number = &mut a.number;
+        Card::new("序号")
+            .icon(icons::COLOR)
+            .desc("颜色、圆的直径与编号风格")
+            .error(number_issue.as_deref())
+            .right_width(450.0)
+            .show(ui, &look, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut number.size)
+                        .range(NUMBER_SIZE_RANGE)
+                        .suffix(" 像素"),
+                );
+                color_swatches(ui, &look, &mut number.color);
+                // right_to_left 布局下先添加的在右侧，逆序添加使视觉顺序为「数字、字母」
+                for style in NumberStyle::ALL.iter().rev() {
+                    if choice_chip(ui, &look, number.style == *style, style.label()).clicked() {
+                        number.style = *style;
+                    }
+                }
             });
     }
 

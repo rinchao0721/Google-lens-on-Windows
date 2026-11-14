@@ -6,6 +6,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod adjust;
+pub mod annotate;
 pub mod error;
 pub mod glow;
 pub mod hint;
@@ -14,17 +15,18 @@ pub mod layout;
 pub mod modes;
 pub mod stroke;
 
+mod paint;
 mod render;
 mod window;
 
 use std::rc::Rc;
 
-use lenswin_core::config::{GlowMode, LassoConfig, ScreenshotConfig, SearchConfig};
+use lenswin_core::config::{AnnotateConfig, GlowMode, LassoConfig, ScreenshotConfig, SearchConfig};
 use lenswin_core::frame::Frame;
 use lenswin_core::geometry::Rect;
 use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::selection::SelectionMode;
-use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult};
+use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayOutput, OverlayResult};
 
 pub use crate::error::OverlayError;
 use crate::hint::HintState;
@@ -51,6 +53,8 @@ pub struct SelectRequest<'a> {
     pub windows: &'a [Rect],
     /// 历史选区，最新的在前。
     pub history: &'a [Rect],
+    /// 标注工具的初始样式，只在截屏流程用到。
+    pub annotate: &'a AnnotateConfig,
 }
 
 /// 校验帧与显示器一一对应。
@@ -94,20 +98,32 @@ fn visual_for(flow: OverlayFlow, search: &SearchConfig) -> Visual {
 
 /// 冻结所有显示器并让用户选区。
 ///
-/// 用户完成选区或取色返回 `Some`，按 Esc 或右键取消返回 `None`。
-/// 必须在创建了消息循环的主线程调用；函数内部自带消息循环，返回前所有窗口已销毁。
-pub fn select(request: &SelectRequest<'_>) -> Result<Option<OverlayResult>, OverlayError> {
+/// 用户完成选区或取色时 `result` 为 `Some`，按 Esc 或右键取消为 `None`；
+/// 标注样式有变化时无论是否取消都会带回新样式。
+/// 截屏流程的动作结果直接携带合成好的成图（含标注）。
+/// 必须在创建了消息循环的主线程调用，且线程已初始化 COM；函数内部自带消息循环，返回前所有窗口已销毁。
+pub fn select(request: &SelectRequest<'_>) -> Result<OverlayOutput, OverlayError> {
     if request.flow == OverlayFlow::Live {
         return Err(OverlayError::InvalidInput(
             "常驻选框请使用 LiveSession".to_string(),
         ));
     }
     let input = session_input(request, request.flow)?;
-    Ok(match window::run(input)? {
+    let run = window::run(input)?;
+    let result = match run.outcome {
         Outcome::Selected(selection) => Some(OverlayResult::Selected(selection)),
-        Outcome::Action(selection, action) => Some(OverlayResult::Action(selection, action)),
+        Outcome::Action(selection, action) => {
+            let image = run
+                .image
+                .ok_or_else(|| OverlayError::InvalidInput("缺少合成好的成图".to_string()))?;
+            Some(OverlayResult::Action(selection, action, image))
+        }
         Outcome::Color(text) => Some(OverlayResult::Color(text)),
         Outcome::Cancelled => None,
+    };
+    Ok(OverlayOutput {
+        result,
+        annotate: run.annotate,
     })
 }
 
@@ -158,6 +174,7 @@ fn session_input(
         } else {
             HintState::Hidden
         },
+        annotate: request.annotate.clone(),
     };
     Ok(SessionInput {
         interaction: Interaction::new(tool, request.monitors.to_vec(), options),
@@ -195,6 +212,7 @@ mod tests {
         lasso: &'a LassoConfig,
         screenshot: &'a ScreenshotConfig,
         search: &'a SearchConfig,
+        annotate: &'a AnnotateConfig,
     ) -> SelectRequest<'a> {
         SelectRequest {
             frames,
@@ -206,6 +224,7 @@ mod tests {
             search,
             windows: &[],
             history: &[],
+            annotate,
         }
     }
 
@@ -214,7 +233,8 @@ mod tests {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
         let search = SearchConfig::default();
-        assert!(validate(&request(&[], &[], &lasso, &shot, &search)).is_err());
+        let annotate = AnnotateConfig::default();
+        assert!(validate(&request(&[], &[], &lasso, &shot, &search, &annotate)).is_err());
     }
 
     #[test]
@@ -222,9 +242,15 @@ mod tests {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
         let search = SearchConfig::default();
+        let annotate = AnnotateConfig::default();
         let frames = [frame(0)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_err());
+        assert!(
+            validate(&request(
+                &frames, &monitors, &lasso, &shot, &search, &annotate
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -232,9 +258,15 @@ mod tests {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
         let search = SearchConfig::default();
+        let annotate = AnnotateConfig::default();
         let frames = [frame(0), frame(5)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_err());
+        assert!(
+            validate(&request(
+                &frames, &monitors, &lasso, &shot, &search, &annotate
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -265,8 +297,14 @@ mod tests {
         let lasso = LassoConfig::default();
         let shot = ScreenshotConfig::default();
         let search = SearchConfig::default();
+        let annotate = AnnotateConfig::default();
         let frames = [frame(0), frame(2)];
         let monitors = [monitor(0), monitor(2)];
-        assert!(validate(&request(&frames, &monitors, &lasso, &shot, &search)).is_ok());
+        assert!(
+            validate(&request(
+                &frames, &monitors, &lasso, &shot, &search, &annotate
+            ))
+            .is_ok()
+        );
     }
 }

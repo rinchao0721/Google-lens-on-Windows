@@ -5,9 +5,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use lenswin_core::config::GlowMode;
+use lenswin_core::config::{AnnotateConfig, GlowMode};
+use lenswin_core::frame::CroppedImage;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::MonitorInfo;
+use lenswin_core::selection::Selection;
 use lenswin_core::snip::LiveEvent;
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
@@ -15,7 +17,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_A, VK_C, VK_CONTROL, VK_D,
     VK_DOWN, VK_ESCAPE, VK_F1, VK_LEFT, VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT,
-    VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_W,
+    VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_W, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
@@ -24,8 +26,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos, SetForegroundWindow,
     SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS, WM_ERASEBKGND,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -34,6 +36,7 @@ use crate::error::{OverlayError, win32};
 use crate::glow;
 use crate::input::{CursorKind, Interaction, Key, KeyCommand, Outcome, point_from_lparam};
 use crate::layout;
+use crate::paint::FrameRef;
 use crate::render::{DrawStatus, Effects, Renderer, Surface, TargetResources};
 
 /// 覆盖层窗口类名。
@@ -163,6 +166,44 @@ impl Session {
         Some((sink, events))
     }
 
+    /// 阻塞模式结束时的产出：取走结局，工具栏动作要先合成成图。
+    fn finish_run(&mut self) -> Result<RunOutput, OverlayError> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        let annotate = self.interaction.annotate_change();
+        let outcome = self
+            .interaction
+            .take_outcome()
+            .unwrap_or(Outcome::Cancelled);
+        let image = match &outcome {
+            Outcome::Action(selection, _) => Some(self.compose(selection)?),
+            _ => None,
+        };
+        Ok(RunOutput {
+            outcome,
+            image,
+            annotate,
+        })
+    }
+
+    /// 把选区所在显示器的冻结帧与标注合成为成图。
+    fn compose(&self, selection: &Selection) -> Result<CroppedImage, OverlayError> {
+        let slot = self
+            .windows
+            .get(selection.monitor_index())
+            .ok_or_else(|| OverlayError::InvalidInput("选区所在显示器不存在".to_string()))?;
+        let frame = FrameRef {
+            bounds: Rect::new(slot.origin.x, slot.origin.y, slot.size.0, slot.size.1),
+            bgra: &slot.bgra,
+        };
+        self.renderer.compose(
+            frame,
+            &selection.bounds(),
+            self.interaction.document().shapes(),
+        )
+    }
+
     fn elapsed_secs(&self) -> f32 {
         self.started.elapsed().as_secs_f32()
     }
@@ -256,10 +297,12 @@ fn deliver_live_events() {
 
 fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
     let local = point_from_lparam(lparam.0);
+    let shift = is_down(VK_SHIFT);
     update(hwnd, |s| {
         let Some(index) = s.index_of(hwnd) else {
             return;
         };
+        s.interaction.set_shift(shift);
         match event {
             Mouse::Down => s.interaction.press(index, local),
             Mouse::DoubleClick => s.interaction.double_click(index, local),
@@ -311,19 +354,35 @@ fn nudge_mode() -> NudgeMode {
     }
 }
 
+/// Ctrl+Z 撤销，Ctrl+Y 与 Ctrl+Shift+Z 重做。
+fn history_key(vk: VIRTUAL_KEY) -> Option<Key> {
+    if !is_down(VK_CONTROL) {
+        return None;
+    }
+    match vk {
+        VK_Z if is_down(VK_SHIFT) => Some(Key::Redo),
+        VK_Z => Some(Key::Undo),
+        VK_Y => Some(Key::Redo),
+        _ => None,
+    }
+}
+
 fn on_key(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
-    let Some(key) = u16::try_from(wparam.0)
-        .ok()
-        .map(VIRTUAL_KEY)
-        .and_then(key_of)
-    else {
+    let Some(vk) = u16::try_from(wparam.0).ok().map(VIRTUAL_KEY) else {
+        return;
+    };
+    let Some(key) = history_key(vk).or_else(|| key_of(vk)) else {
         return;
     };
     // lparam 第 30 位为 1 表示按下前该键已处于按下状态，即自动重复
     let repeat = (lparam.0 >> 30) & 1 == 1;
     let mode = nudge_mode();
+    let shift = is_down(VK_SHIFT);
     let mut command = None;
-    update(hwnd, |s| command = s.interaction.key(key, mode, repeat));
+    update(hwnd, |s| {
+        s.interaction.set_shift(shift);
+        command = s.interaction.key(key, mode, repeat);
+    });
     match command {
         Some(KeyCommand::MoveCursor(dx, dy)) => move_cursor(dx, dy),
         Some(KeyCommand::PickColor(p)) => update(hwnd, |s| {
@@ -411,6 +470,12 @@ fn keep_z_order(lparam: LPARAM) {
     }
 }
 
+/// `WM_MOUSEWHEEL` 的滚动方向：向上为正，每条消息按一格计，高精度滚轮的细碎增量也不会被吞掉。
+fn wheel_notches(wparam: WPARAM) -> i32 {
+    let high = u16::try_from((wparam.0 >> 16) & 0xFFFF).unwrap_or(0);
+    i32::from(i16::from_ne_bytes(high.to_ne_bytes())).signum()
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -437,6 +502,11 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONUP => on_mouse(hwnd, lparam, Mouse::Up),
         WM_RBUTTONDOWN => update(hwnd, |s| s.interaction.right_click()),
+        WM_MOUSEWHEEL => {
+            let notches = wheel_notches(wparam);
+            update(hwnd, |s| s.interaction.wheel(notches));
+            return LRESULT(0);
+        }
         WM_KEYDOWN => {
             on_key(hwnd, wparam, lparam);
             return LRESULT(0);
@@ -518,15 +588,25 @@ pub(crate) struct SessionInput {
     pub visual: Visual,
 }
 
+/// 阻塞会话的产出。
+pub(crate) struct RunOutput {
+    /// 结局。
+    pub outcome: Outcome,
+    /// 工具栏动作对应的合成成图，其它结局为 `None`。
+    pub image: Option<CroppedImage>,
+    /// 标注样式有变化时的新样式。
+    pub annotate: Option<AnnotateConfig>,
+}
+
 /// 显示覆盖层并运行消息循环，直到用户完成或取消选区。
-pub(crate) fn run(input: SessionInput) -> Result<Outcome, OverlayError> {
+pub(crate) fn run(input: SessionInput) -> Result<RunOutput, OverlayError> {
     let _owner = open(input, SessionMode::Blocking)?;
     pump_until_finished()?;
-    match with_session(|s| (s.error.take(), s.interaction.take_outcome())) {
-        Some((Some(error), _)) => Err(error),
-        Some((None, Some(outcome))) => Ok(outcome),
-        _ => Ok(Outcome::Cancelled),
-    }
+    with_session(Session::finish_run).unwrap_or(Ok(RunOutput {
+        outcome: Outcome::Cancelled,
+        image: None,
+        annotate: None,
+    }))
 }
 
 /// 常驻会话的窗口所有者；销毁时关闭全部覆盖层窗口。

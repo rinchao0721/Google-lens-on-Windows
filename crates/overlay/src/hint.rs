@@ -43,6 +43,8 @@ pub enum Stage {
     Adjusting,
     /// 常驻选框搜索的调整阶段，松手即重新搜索。
     LiveAdjusting,
+    /// 已选中标注工具。
+    Annotating,
 }
 
 /// 生成提示所需的可选功能。
@@ -96,6 +98,14 @@ pub fn hints(stage: Stage, features: Features) -> Vec<Hint> {
             out.push(hint("框外拖动", "重新圈选"));
             out.push(hint("右键 / Esc", "退出"));
         }
+        Stage::Annotating => {
+            out.push(hint("滚轮", "调整粗细"));
+            out.push(hint("Shift", "约束正方形 / 角度"));
+            out.push(hint("Ctrl + Z", "撤销"));
+            out.push(hint("Ctrl + Y", "重做"));
+            out.push(hint("右键 / Esc", "退出工具"));
+            out.push(hint("Enter", "复制"));
+        }
     }
     out.push(hint("?", "隐藏提示"));
     out
@@ -144,12 +154,30 @@ mod tests {
     }
 
     #[test]
+    fn annotating_lists_annotation_keys() {
+        let list = keys(&hints(Stage::Annotating, NONE));
+        for expected in [
+            "滚轮",
+            "Shift",
+            "Ctrl + Z",
+            "Ctrl + Y",
+            "右键 / Esc",
+            "Enter",
+            "?",
+        ] {
+            assert!(list.contains(&expected), "缺少 {expected}");
+        }
+        assert!(!list.contains(&"方向键"));
+    }
+
+    #[test]
     fn every_stage_ends_with_toggle_hint() {
         for stage in [
             Stage::Idle,
             Stage::Drawing,
             Stage::Adjusting,
             Stage::LiveAdjusting,
+            Stage::Annotating,
         ] {
             assert_eq!(hints(stage, ALL).last().map(|h| h.keys), Some("?"));
         }

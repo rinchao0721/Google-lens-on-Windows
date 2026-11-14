@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
+pub mod annotation;
 pub mod config;
 pub mod error;
 pub mod frame;

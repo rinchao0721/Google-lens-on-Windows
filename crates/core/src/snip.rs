@@ -1,5 +1,7 @@
 //! 截屏覆盖层与调用方之间传递的数据：流程、结果、取色格式、历史选区与窗口吸附。
 
+use crate::config::AnnotateConfig;
+use crate::frame::CroppedImage;
 use crate::geometry::{Point, Rect};
 use crate::selection::Selection;
 
@@ -41,10 +43,19 @@ pub enum ToolbarAction {
 pub enum OverlayResult {
     /// 直接流程得到的选区。
     Selected(Selection),
-    /// 工具栏流程得到的选区和用户选的动作。
-    Action(Selection, ToolbarAction),
+    /// 工具栏流程得到的选区、用户选的动作和合成好的成图（含标注）。
+    Action(Selection, ToolbarAction, CroppedImage),
     /// 取色结果，已按用户选择的格式格式化。
     Color(String),
+}
+
+/// 一次覆盖层会话的完整产出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayOutput {
+    /// 用户的选择；取消为 `None`。
+    pub result: Option<OverlayResult>,
+    /// 本次会话改动了标注样式时的新样式，取消截屏也会带回；没有变化为 `None`。
+    pub annotate: Option<AnnotateConfig>,
 }
 
 /// 取色文本格式。

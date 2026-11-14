@@ -6,6 +6,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
+use crate::annotation::NumberStyle;
 use crate::error::ConfigError;
 use crate::selection::SelectionMode;
 
@@ -21,6 +22,15 @@ pub const LASSO_PADDING_RANGE: RangeInclusive<u32> = 0..=200;
 pub const LASSO_STROKE_WIDTH_RANGE: RangeInclusive<u32> = 1..=50;
 /// 历史选区条数的合法范围，0 表示关闭。
 pub const HISTORY_SIZE_RANGE: RangeInclusive<u32> = 0..=50;
+
+/// 标注线宽（像素）的合法范围：矩形、椭圆、直线、箭头、画笔。
+pub const ANNOTATE_WIDTH_RANGE: RangeInclusive<u32> = 1..=32;
+/// 荧光笔线宽（像素）的合法范围。
+pub const HIGHLIGHTER_WIDTH_RANGE: RangeInclusive<u32> = 4..=48;
+/// 马赛克块边长（像素）的合法范围。
+pub const MOSAIC_BLOCK_RANGE: RangeInclusive<u32> = 4..=64;
+/// 序号圆直径（像素）的合法范围。
+pub const NUMBER_SIZE_RANGE: RangeInclusive<u32> = 16..=96;
 
 /// 搜索引擎模板中图片地址的占位符。
 pub const URL_PLACEHOLDER: &str = "{url}";
@@ -77,6 +87,8 @@ pub struct Config {
     pub selection: SelectionConfig,
     /// 截屏。
     pub screenshot: ScreenshotConfig,
+    /// 原地标注的默认样式。
+    pub annotate: AnnotateConfig,
     /// 隐私。
     pub privacy: PrivacyConfig,
     /// 检查更新。
@@ -435,6 +447,105 @@ impl Default for ScreenshotConfig {
     }
 }
 
+/// `[annotate]`：每个工具各自记住的颜色和粗细。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnnotateConfig {
+    /// 矩形。
+    pub rectangle: StrokeConfig,
+    /// 椭圆。
+    pub ellipse: StrokeConfig,
+    /// 直线。
+    pub line: StrokeConfig,
+    /// 箭头。
+    pub arrow: StrokeConfig,
+    /// 画笔。
+    pub pen: StrokeConfig,
+    /// 荧光笔。
+    pub highlighter: HighlighterConfig,
+    /// 马赛克。
+    pub mosaic: MosaicConfig,
+    /// 序号。
+    pub number: NumberConfig,
+}
+
+/// 默认的标注红色。
+const DEFAULT_RED: &str = "#FF3B30";
+
+/// `[annotate.rectangle]` 等线条类工具的样式。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StrokeConfig {
+    /// `#RRGGBB`。
+    pub color: String,
+    /// 线宽（成图物理像素）。
+    pub width: u32,
+}
+
+impl Default for StrokeConfig {
+    fn default() -> Self {
+        Self {
+            color: DEFAULT_RED.to_string(),
+            width: 3,
+        }
+    }
+}
+
+/// `[annotate.highlighter]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HighlighterConfig {
+    /// `#RRGGBB`。
+    pub color: String,
+    /// 线宽（成图物理像素）。
+    pub width: u32,
+}
+
+impl Default for HighlighterConfig {
+    fn default() -> Self {
+        Self {
+            color: "#FFCC00".to_string(),
+            width: 16,
+        }
+    }
+}
+
+/// `[annotate.mosaic]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MosaicConfig {
+    /// 块边长（成图物理像素）。
+    pub block: u32,
+}
+
+impl Default for MosaicConfig {
+    fn default() -> Self {
+        Self { block: 12 }
+    }
+}
+
+/// `[annotate.number]`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NumberConfig {
+    /// `#RRGGBB`。
+    pub color: String,
+    /// 圆的直径（成图物理像素）。
+    pub size: u32,
+    /// 编号风格。
+    pub style: NumberStyle,
+}
+
+impl Default for NumberConfig {
+    fn default() -> Self {
+        Self {
+            color: DEFAULT_RED.to_string(),
+            size: 28,
+            style: NumberStyle::default(),
+        }
+    }
+}
+
 /// `[privacy]`。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -712,6 +823,10 @@ auto_check = 1
         config.screenshot.window_snap = false;
         config.screenshot.history_size = 3;
         config.screenshot.show_hints = false;
+        config.annotate.rectangle.width = 8;
+        config.annotate.highlighter.color = "#34C759".to_string();
+        config.annotate.mosaic.block = 20;
+        config.annotate.number.style = NumberStyle::Letter;
         config.privacy.acknowledged_host = "litterbox.catbox.moe".to_string();
         config.privacy.lens_acknowledged = true;
         config.search.backend = SearchBackend::ImageHost;
@@ -719,6 +834,110 @@ auto_check = 1
         config.update.include_prerelease = true;
         let text = config.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("反序列化"), config);
+    }
+
+    #[test]
+    fn annotate_defaults_match_plan() {
+        let a = AnnotateConfig::default();
+        for stroke in [&a.rectangle, &a.ellipse, &a.line, &a.arrow, &a.pen] {
+            assert_eq!(stroke.color, "#FF3B30");
+            assert_eq!(stroke.width, 3);
+        }
+        assert_eq!(a.highlighter.color, "#FFCC00");
+        assert_eq!(a.highlighter.width, 16);
+        assert_eq!(a.mosaic.block, 12);
+        assert_eq!(a.number.color, "#FF3B30");
+        assert_eq!(a.number.size, 28);
+        assert_eq!(a.number.style, NumberStyle::Number);
+        assert_eq!(validate(&Config::default()), Ok(()));
+    }
+
+    #[test]
+    fn annotate_partial_text_fills_per_tool_defaults() {
+        let text = "[annotate.highlighter]\ncolor = \"#34C759\"\n\n[annotate.number]\nstyle = \"letter\"\n";
+        let config = Config::from_toml_str(text).expect("解析");
+        assert_eq!(config.annotate.highlighter.color, "#34C759");
+        assert_eq!(config.annotate.highlighter.width, 16);
+        assert_eq!(config.annotate.number.style, NumberStyle::Letter);
+        assert_eq!(config.annotate.number.size, 28);
+        assert_eq!(config.annotate.rectangle, StrokeConfig::default());
+        let back = config.to_toml_string().expect("序列化");
+        assert_eq!(Config::from_toml_str(&back).expect("回读"), config);
+    }
+
+    #[test]
+    fn annotate_rejects_unknown_fields_and_bad_types() {
+        assert!(Config::from_toml_str("[annotate.rectangle]\nsize = 3\n").is_err());
+        assert!(Config::from_toml_str("[annotate.circle]\nwidth = 3\n").is_err());
+        assert!(Config::from_toml_str("[annotate.rectangle]\nwidth = \"3\"\n").is_err());
+        assert!(Config::from_toml_str("[annotate.number]\nstyle = \"roman\"\n").is_err());
+        assert!(Config::from_toml_str("[annotate.mosaic]\nblock = -1\n").is_err());
+    }
+
+    #[test]
+    fn annotate_ranges_are_enforced_per_field() {
+        let cases = [
+            (
+                "[annotate.rectangle]\nwidth = 0\n",
+                "annotate.rectangle.width",
+            ),
+            ("[annotate.ellipse]\nwidth = 33\n", "annotate.ellipse.width"),
+            ("[annotate.line]\nwidth = 99\n", "annotate.line.width"),
+            ("[annotate.arrow]\nwidth = 0\n", "annotate.arrow.width"),
+            ("[annotate.pen]\nwidth = 33\n", "annotate.pen.width"),
+            (
+                "[annotate.highlighter]\nwidth = 3\n",
+                "annotate.highlighter.width",
+            ),
+            (
+                "[annotate.highlighter]\nwidth = 49\n",
+                "annotate.highlighter.width",
+            ),
+            ("[annotate.mosaic]\nblock = 3\n", "annotate.mosaic.block"),
+            ("[annotate.mosaic]\nblock = 65\n", "annotate.mosaic.block"),
+            ("[annotate.number]\nsize = 15\n", "annotate.number.size"),
+            ("[annotate.number]\nsize = 97\n", "annotate.number.size"),
+        ];
+        for (text, field) in cases {
+            match Config::from_toml_str(text) {
+                Err(ConfigError::Invalid(issues)) => {
+                    assert_eq!(issues.first().map(|i| i.field), Some(field), "{text}");
+                }
+                other => panic!("期望 {field} 校验失败，实际为 {other:?}"),
+            }
+        }
+        for text in [
+            "[annotate.rectangle]\nwidth = 1\n",
+            "[annotate.rectangle]\nwidth = 32\n",
+            "[annotate.highlighter]\nwidth = 4\n",
+            "[annotate.highlighter]\nwidth = 48\n",
+            "[annotate.mosaic]\nblock = 4\n",
+            "[annotate.mosaic]\nblock = 64\n",
+            "[annotate.number]\nsize = 16\n",
+            "[annotate.number]\nsize = 96\n",
+        ] {
+            assert!(Config::from_toml_str(text).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn annotate_colors_must_be_hex() {
+        for bad in ["red", "#FFF", "FF3B30", "#GGGGGG", "", "#FF3B30 "] {
+            let text = format!("[annotate.pen]\ncolor = \"{bad}\"\n");
+            match Config::from_toml_str(&text) {
+                Err(ConfigError::Invalid(issues)) => {
+                    assert_eq!(issues.first().map(|i| i.field), Some("annotate.pen.color"));
+                }
+                other => panic!("期望颜色校验失败（{bad:?}），实际为 {other:?}"),
+            }
+        }
+        // 不在色板内的合法颜色与小写写法都允许
+        let ok = "[annotate.number]\ncolor = \"#123abc\"\n";
+        assert!(Config::from_toml_str(ok).is_ok());
+        for field in ["highlighter", "number", "rectangle"] {
+            let text = format!("[annotate.{field}]\ncolor = \"nope\"\n");
+            assert!(Config::from_toml_str(&text).is_err(), "{field}");
+        }
     }
 
     #[test]

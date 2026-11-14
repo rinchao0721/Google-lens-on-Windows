@@ -49,7 +49,7 @@ pub fn page_of_field(field: &str) -> Page {
     match section {
         "hotkeys" => Page::Hotkeys,
         "search" | "upload" | "privacy" => Page::SearchUpload,
-        "screenshot" | "selection" => Page::Screenshot,
+        "screenshot" | "selection" | "annotate" => Page::Screenshot,
         _ => Page::General,
     }
 }
@@ -444,6 +444,8 @@ mod tests {
             ("upload.custom.endpoint", Page::SearchUpload),
             ("privacy.acknowledged_host", Page::SearchUpload),
             ("selection.lasso.padding", Page::Screenshot),
+            ("annotate.number.size", Page::Screenshot),
+            ("annotate.rectangle.color", Page::Screenshot),
             ("screenshot.save_dir", Page::Screenshot),
             ("general.notifications", Page::General),
             ("unknown", Page::General),

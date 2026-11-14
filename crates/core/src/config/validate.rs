@@ -3,9 +3,11 @@
 use std::ops::RangeInclusive;
 
 use super::{
-    Config, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, MAX_BYTES_RANGE,
-    ResponseKind, TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
+    ANNOTATE_WIDTH_RANGE, Config, HIGHLIGHTER_WIDTH_RANGE, HISTORY_SIZE_RANGE, LASSO_PADDING_RANGE,
+    LASSO_STROKE_WIDTH_RANGE, MAX_BYTES_RANGE, MOSAIC_BLOCK_RANGE, NUMBER_SIZE_RANGE, ResponseKind,
+    TIMEOUT_SECS_RANGE, URL_PLACEHOLDER, UploadProvider,
 };
+use crate::annotation::Color;
 use crate::hotkey::Hotkey;
 
 /// 一条校验问题，`field` 为点分隔的配置路径，便于界面就地标红。
@@ -50,6 +52,7 @@ pub fn validate(config: &Config) -> Result<(), Vec<ValidationIssue>> {
     check_search(config, &mut issues);
     check_upload(config, &mut issues);
     check_selection(config, &mut issues);
+    check_annotate(config, &mut issues);
     check_misc(config, &mut issues);
     if issues.is_empty() {
         Ok(())
@@ -188,6 +191,55 @@ fn check_selection(config: &Config, issues: &mut Vec<ValidationIssue>) {
         "screenshot.history_size",
         config.screenshot.history_size,
         &HISTORY_SIZE_RANGE,
+        issues,
+    );
+}
+
+fn check_color(field: &'static str, value: &str, issues: &mut Vec<ValidationIssue>) {
+    if Color::from_hex(value).is_none() {
+        issues.push(ValidationIssue::new(field, "必须是 #RRGGBB 格式的颜色"));
+    }
+}
+
+fn check_annotate(config: &Config, issues: &mut Vec<ValidationIssue>) {
+    let a = &config.annotate;
+    let strokes = [
+        (
+            "annotate.rectangle.color",
+            "annotate.rectangle.width",
+            &a.rectangle,
+        ),
+        (
+            "annotate.ellipse.color",
+            "annotate.ellipse.width",
+            &a.ellipse,
+        ),
+        ("annotate.line.color", "annotate.line.width", &a.line),
+        ("annotate.arrow.color", "annotate.arrow.width", &a.arrow),
+        ("annotate.pen.color", "annotate.pen.width", &a.pen),
+    ];
+    for (color_field, width_field, stroke) in strokes {
+        check_color(color_field, &stroke.color, issues);
+        check_range(width_field, stroke.width, &ANNOTATE_WIDTH_RANGE, issues);
+    }
+    check_color("annotate.highlighter.color", &a.highlighter.color, issues);
+    check_range(
+        "annotate.highlighter.width",
+        a.highlighter.width,
+        &HIGHLIGHTER_WIDTH_RANGE,
+        issues,
+    );
+    check_range(
+        "annotate.mosaic.block",
+        a.mosaic.block,
+        &MOSAIC_BLOCK_RANGE,
+        issues,
+    );
+    check_color("annotate.number.color", &a.number.color, issues);
+    check_range(
+        "annotate.number.size",
+        a.number.size,
+        &NUMBER_SIZE_RANGE,
         issues,
     );
 }

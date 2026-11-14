@@ -5,6 +5,8 @@ use eframe::egui::{
     Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
 
+use lenswin_core::annotation::{Color, PALETTE};
+
 use crate::fonts::icon_family;
 use crate::theme::{
     CARD_PAD_X, CARD_PAD_Y, CARD_RADIUS, CONTROL_RADIUS, FONT_CARD_TITLE, FONT_DESC, FONT_ICON,
@@ -222,6 +224,63 @@ pub fn modifier_chip(ui: &mut Ui, look: &Look, on: &mut bool, label: &str) -> Re
         response.mark_changed();
     }
     response
+}
+
+/// 单选小方块：选中时强调色底，由调用方根据点击改变选中项。
+pub fn choice_chip(ui: &mut Ui, look: &Look, selected: bool, label: &str) -> Response {
+    pill(ui, look, label, PillStyle::Chip { selected }, 26.0, 52.0)
+}
+
+/// 色板选择：8 个固定色块，选中的带强调色外圈；点击后把颜色写成 `#RRGGBB`，返回是否改动。
+/// 当前颜色不在色板内时不高亮任何色块。
+pub fn color_swatches(ui: &mut Ui, look: &Look, color: &mut String) -> bool {
+    let p = &look.palette;
+    let current = Color::from_hex(color);
+    ui.spacing_mut().item_spacing.x = 6.0;
+    // right_to_left 布局下逆序添加，视觉顺序仍与色板一致
+    let reversed = ui.layout().main_dir().is_horizontal() && ui.layout().prefer_right_to_left();
+    let order: Vec<usize> = if reversed {
+        (0..PALETTE.len()).rev().collect()
+    } else {
+        (0..PALETTE.len()).collect()
+    };
+    let mut changed = false;
+    for index in order {
+        let Some(swatch) = PALETTE.get(index).copied() else {
+            continue;
+        };
+        let hex = swatch.to_hex();
+        let (rect, response) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &hex));
+        if response.clicked() {
+            *color = hex.clone();
+            changed = true;
+        }
+        if ui.is_rect_visible(rect) {
+            let radius = CornerRadius::same(CONTROL_RADIUS);
+            ui.painter().rect_filled(
+                rect,
+                radius,
+                Color32::from_rgb(swatch.r, swatch.g, swatch.b),
+            );
+            ui.painter().rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0_f32, p.card_border),
+                StrokeKind::Inside,
+            );
+            if current == Some(swatch) {
+                ui.painter().rect_stroke(
+                    rect.expand(2.0),
+                    radius,
+                    Stroke::new(2.0_f32, p.accent),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+    }
+    changed
 }
 
 /// 快捷键录制按钮：录制中为强调色底并提示按键。
