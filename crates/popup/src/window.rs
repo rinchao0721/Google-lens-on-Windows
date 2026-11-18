@@ -4,19 +4,20 @@ use lenswin_core::geometry::Rect;
 use lenswin_core::lens::popup_placement;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+    COLOR_WINDOW, GetMonitorInfoW, HBRUSH, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromRect, MonitorFromWindow,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW,
-    IsWindowVisible, KillTimer, LoadCursorW, RegisterClassExW, SW_HIDE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    UnregisterClassW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE, WM_NCCALCSIZE, WM_NCHITTEST,
-    WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    IsIconic, IsWindowVisible, IsZoomed, KillTimer, LoadCursorW, RegisterClassExW, SW_HIDE,
+    SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer,
+    SetWindowPos, ShowWindow, UnregisterClassW, WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVE,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -113,9 +114,19 @@ fn to_rect(r: &RECT) -> Option<Rect> {
     )
 }
 
-/// 弹窗可见时的外框尺寸；隐藏或读取失败时返回 `None`。
-fn current_size(hwnd: HWND) -> Option<(u32, u32)> {
+/// 弹窗可见、处于普通状态且就在目标显示器上时的外框尺寸；否则返回 `None`，退回默认尺寸。
+fn current_size(hwnd: HWND, monitor: HMONITOR) -> Option<(u32, u32)> {
     if !is_visible() {
+        return None;
+    }
+    // 最小化时是图标化的尺寸，最大化时是整个工作区，都不能沿用
+    // SAFETY: hwnd 由本模块创建且存活。
+    if unsafe { IsIconic(hwnd) }.as_bool() || unsafe { IsZoomed(hwnd) }.as_bool() {
+        return None;
+    }
+    // 跨到 DPI 不同的显示器时，物理尺寸不再对应原来的逻辑尺寸
+    // SAFETY: 同上。
+    if unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) } != monitor {
         return None;
     }
     let mut r = RECT::default();
@@ -156,8 +167,15 @@ pub(crate) fn place(hwnd: HWND, anchor: &Rect) -> Result<(), PopupError> {
     let work =
         to_rect(&info.rcWork).ok_or_else(|| PopupError::Invalid("显示器工作区为空".to_string()))?;
     // 已显示时沿用用户拖出来的尺寸，只换位置
-    let (width, height) =
-        current_size(hwnd).unwrap_or((scale(LOGICAL_WIDTH, dpi_x), scale(LOGICAL_HEIGHT, dpi_x)));
+    let (width, height) = current_size(hwnd, monitor)
+        .unwrap_or((scale(LOGICAL_WIDTH, dpi_x), scale(LOGICAL_HEIGHT, dpi_x)));
+    // 最小化或最大化状态下直接 SetWindowPos 会留着状态标志，先还原
+    // SAFETY: hwnd 由本模块创建且存活。
+    if unsafe { IsIconic(hwnd) }.as_bool() || unsafe { IsZoomed(hwnd) }.as_bool() {
+        // 返回值只表示之前是否可见
+        // SAFETY: 同上。
+        discard(unsafe { ShowWindow(hwnd, SW_RESTORE) });
+    }
     let target = popup_placement(anchor, &work, width, height, scale(LOGICAL_GAP, dpi_x))
         .ok_or_else(|| PopupError::Invalid("无法计算弹窗位置".to_string()))?;
     with_host(|host| host.placement = Placement::Placing);

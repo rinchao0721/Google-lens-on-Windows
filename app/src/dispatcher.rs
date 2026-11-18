@@ -749,30 +749,33 @@ impl<'a> Dispatcher<'a> {
             selection.monitor_index()
         );
         let image = {
-            let mut live = self.live.borrow_mut();
-            let Some(state) = live.as_mut() else {
+            let live = self.live.borrow();
+            let Some(state) = live.as_ref() else {
                 return;
             };
-            state.last = Some(bounds);
-            let Some(frame) = state.frames.get(selection.monitor_index()) else {
-                log::error!(
+            match state.frames.get(selection.monitor_index()) {
+                Some(frame) => frame.crop(&bounds).map_err(|e| format!("裁剪失败：{e}")),
+                None => Err(format!(
                     "选区所在显示器序号 {} 没有对应截屏",
                     selection.monitor_index()
-                );
-                return;
-            };
-            frame.crop(&bounds)
+                )),
+            }
         };
-        match image {
-            Ok(image) => {
-                if !self.show_and_submit(image, &bounds) {
-                    self.end_live();
-                }
+        let image = match image {
+            Ok(image) => image,
+            Err(message) => {
+                // 弹窗里还是上一次的结果，留着会让人以为新选框已经搜过
+                log::error!("{message}");
+                self.end_live();
+                self.balloon(NotifyLevel::Error, "lenswin", &message);
+                return;
             }
-            Err(e) => {
-                log::error!("裁剪失败：{e}");
-                self.balloon(NotifyLevel::Error, "lenswin", &format!("裁剪失败：{e}"));
-            }
+        };
+        if let Some(state) = self.live.borrow_mut().as_mut() {
+            state.last = Some(bounds);
+        }
+        if !self.show_and_submit(image, &bounds) {
+            self.end_live();
         }
     }
 

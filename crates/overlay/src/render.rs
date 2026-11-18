@@ -985,7 +985,7 @@ impl TargetResources {
         unsafe { self.target.FillEllipse(&ellipse, &brush) };
     }
 
-    /// 常驻选框外侧的四色光晕：一圈圈向外扩、逐层变淡，不压进选区。
+    /// 常驻选框外侧的四色柔光，不压进选区。
     fn draw_box_glow(&self, r: &D2D_RECT_F, phase: f32) {
         // 柔光只是装饰，模糊失败时不画，选框照常可用
         if self.soft_glow(r, phase).is_err() {
@@ -995,7 +995,7 @@ impl TargetResources {
         self.bitmap_into(r, r, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
 
-    /// 在离屏位图上画出四色描边，高斯模糊后贴回选框周围。
+    /// 四色描边经高斯模糊后贴回选框周围。
     fn soft_glow(&self, r: &D2D_RECT_F, phase: f32) -> windows::core::Result<()> {
         let band = self.px(BOX_GLOW_WIDTH);
         // 模糊半径约三倍标准差，四周留足边距，光晕不会被位图边缘截断
@@ -1004,6 +1004,42 @@ impl TargetResources {
         if rw <= 0.0 || rh <= 0.0 {
             return Ok(());
         }
+        let bitmap = self.glow_source(rw, rh, pad, band, phase)?;
+        let context: ID2D1DeviceContext = self.target.cast()?;
+        // SAFETY: 系统内置的高斯模糊效果，CLSID 为静态常量。
+        let blur = unsafe { context.CreateEffect(&CLSID_D2D1GaussianBlur) }?;
+        let sigma = band / 3.0;
+        let property = u32::try_from(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0).unwrap_or(0);
+        // SAFETY: 输入位图由同一设备创建；属性索引与类型匹配，数据为 f32 的原始字节。
+        unsafe {
+            blur.SetInput(0, &bitmap, true);
+            blur.SetValue(property, D2D1_PROPERTY_TYPE_FLOAT, &sigma.to_ne_bytes())?;
+        }
+        // SAFETY: 效果已配置完成。
+        let output = unsafe { blur.GetOutput() }?;
+        let offset = float_point(r.left - pad, r.top - pad).point;
+        // SAFETY: 在本目标的 BeginDraw 与 EndDraw 之间调用，图像由同一设备创建。
+        unsafe {
+            context.DrawImage(
+                &output,
+                Some(&offset),
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+        }
+        Ok(())
+    }
+
+    /// 在四周留出 `pad` 的离屏位图上画出未模糊的四色描边，选区为 `rw`×`rh`。
+    fn glow_source(
+        &self,
+        rw: f32,
+        rh: f32,
+        pad: f32,
+        band: f32,
+        phase: f32,
+    ) -> windows::core::Result<ID2D1Bitmap> {
         let size = D2D_SIZE_F {
             width: rw + pad * 2.0,
             height: rh + pad * 2.0,
@@ -1040,31 +1076,7 @@ impl TargetResources {
         // SAFETY: 与上面的 BeginDraw 配对。
         unsafe { layer.EndDraw(None, None) }?;
         // SAFETY: layer 已结束绘制，位图内容有效。
-        let bitmap = unsafe { layer.GetBitmap() }?;
-        let context: ID2D1DeviceContext = self.target.cast()?;
-        // SAFETY: 系统内置的高斯模糊效果，CLSID 为静态常量。
-        let blur = unsafe { context.CreateEffect(&CLSID_D2D1GaussianBlur) }?;
-        let sigma = band / 3.0;
-        let property = u32::try_from(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0).unwrap_or(0);
-        // SAFETY: 输入位图由同一设备创建；属性索引与类型匹配，数据为 f32 的原始字节。
-        unsafe {
-            blur.SetInput(0, &bitmap, true);
-            blur.SetValue(property, D2D1_PROPERTY_TYPE_FLOAT, &sigma.to_ne_bytes())?;
-        }
-        // SAFETY: 效果已配置完成。
-        let output = unsafe { blur.GetOutput() }?;
-        let offset = float_point(r.left - pad, r.top - pad).point;
-        // SAFETY: 在本目标的 BeginDraw 与 EndDraw 之间调用，图像由同一设备创建。
-        unsafe {
-            context.DrawImage(
-                &output,
-                Some(&offset),
-                None,
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                D2D1_COMPOSITE_MODE_SOURCE_OVER,
-            );
-        }
-        Ok(())
+        unsafe { layer.GetBitmap() }
     }
 
     /// 常驻选框的四角圆角折线，描在选框外侧，不压住选区内容。
@@ -1079,7 +1091,6 @@ impl TargetResources {
         let (l, t, rt, b) = (r.left - half, r.top - half, r.right + half, r.bottom + half);
         let arm = to_f32(i64::from(arm)) + half;
         let radius = to_f32(i64::from(radius)) + half;
-        // 每个角：角点、第一段方向、第二段方向
         let corners = [
             ((l, t), (0.0, 1.0), (1.0, 0.0)),
             ((rt, t), (-1.0, 0.0), (0.0, 1.0)),

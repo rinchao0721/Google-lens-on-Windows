@@ -32,13 +32,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL,
-    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG,
-    PostQuitMessage, RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetCursorPos,
-    SetForegroundWindow, SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW, WINDOWPOS,
-    WM_CHAR, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsWindow, KillTimer, LoadCursorW,
+    MA_NOACTIVATE, MSG, PostQuitMessage, RegisterClassExW, SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor,
+    SetCursorPos, SetForegroundWindow, SetTimer, SetWindowPos, TranslateMessage, UnregisterClassW,
+    WINDOWPOS, WM_CHAR, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WM_TIMER, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -923,12 +924,30 @@ pub(crate) fn open_live(input: SessionInput, sink: LiveSink) -> Result<LiveWindo
     Ok(LiveWindows { _owner: owner })
 }
 
+/// 是否已有会话在用；窗口都已销毁的残留会话（析构时会话正被借用、没能取走）就地清掉。
+fn session_in_use() -> bool {
+    SESSION
+        .try_with(|cell| {
+            let Ok(mut guard) = cell.try_borrow_mut() else {
+                return true;
+            };
+            let stale = guard.as_ref().is_some_and(|s| {
+                s.windows
+                    .iter()
+                    // SAFETY: IsWindow 只查询句柄是否有效，对已销毁的句柄也安全。
+                    .all(|slot| !unsafe { IsWindow(Some(slot.hwnd)) }.as_bool())
+            });
+            if stale {
+                discard(guard.take());
+            }
+            guard.is_some()
+        })
+        .unwrap_or(true)
+}
+
 /// 创建并显示每个显示器的覆盖层窗口，建立会话。
 fn open(input: SessionInput, mode: SessionMode) -> Result<Windows, OverlayError> {
-    let in_use = SESSION
-        .try_with(|cell| cell.try_borrow().map_or(true, |g| g.is_some()))
-        .unwrap_or(true);
-    if in_use {
+    if session_in_use() {
         return Err(OverlayError::InvalidInput("已有覆盖层正在显示".to_string()));
     }
     let SessionInput {
