@@ -22,8 +22,8 @@ use lenswin_core::text_edit::sanitize_clipboard;
 use lenswin_core::update::is_release_page_url;
 use lenswin_overlay::{LiveSession, SelectRequest};
 use lenswin_platform::autostart::{self, AutostartState};
-use lenswin_platform::capture::ScreenCapturer;
 use lenswin_platform::capture::gdi::GdiCapturer;
+use lenswin_platform::capture::{self, ScreenCapturer};
 use lenswin_platform::dialog;
 use lenswin_platform::message_loop::LoopControl;
 use lenswin_platform::monitor;
@@ -1253,6 +1253,10 @@ impl<'a> Dispatcher<'a> {
 
     /// 枚举显示器并截下所有屏幕，同时拍下窗口快照与历史选区；失败时提示并返回 `None`。
     fn freeze(&self, mode: SelectionMode) -> Option<Frozen> {
+        // 刚销毁的常驻覆盖层或刚收起的弹窗可能还没从屏幕上合成掉
+        if let Err(e) = capture::wait_for_composition() {
+            log::warn!("等待桌面合成失败，照常截屏：{e}");
+        }
         let monitors = match monitor::enumerate() {
             Ok(list) => list,
             Err(e) => {

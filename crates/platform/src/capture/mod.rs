@@ -6,8 +6,9 @@ use lenswin_core::error::FrameError;
 use lenswin_core::frame::Frame;
 use lenswin_core::monitor::MonitorInfo;
 use thiserror::Error;
+use windows::Win32::Graphics::Dwm::DwmFlush;
 
-use crate::error::PlatformError;
+use crate::error::{PlatformError, win32};
 
 /// 捕获错误。
 #[derive(Debug, Error)]
@@ -26,4 +27,13 @@ pub trait ScreenCapturer {
     ///
     /// 列表由调用方枚举一次后传入，保证帧与显示器来自同一份拓扑。
     fn capture_all(&self, monitors: &[MonitorInfo]) -> Result<Vec<Frame>, CaptureError>;
+}
+
+/// 等桌面合成器把最近的窗口变化（如刚销毁的覆盖层、刚隐藏的弹窗）画到屏幕上，再截屏才不会截到旧画面。
+///
+/// 合成器关闭或调用失败时返回错误，调用方可以照常截屏。
+pub fn wait_for_composition() -> Result<(), CaptureError> {
+    // SAFETY: 无参数；在没有合成器的会话里只返回失败，不会阻塞。
+    unsafe { DwmFlush() }.map_err(win32("DwmFlush"))?;
+    Ok(())
 }
