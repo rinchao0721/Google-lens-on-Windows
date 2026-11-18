@@ -171,6 +171,10 @@ pub struct HotkeysConfig {
     pub search: String,
     /// 截屏到剪贴板。
     pub screenshot_copy: String,
+    /// 从剪贴板贴图；为空表示不注册。
+    pub pin_clipboard: String,
+    /// 切换光标下贴图的鼠标穿透；为空表示不注册。
+    pub pin_passthrough: String,
 }
 
 impl Default for HotkeysConfig {
@@ -178,6 +182,8 @@ impl Default for HotkeysConfig {
         Self {
             search: "Win+Shift+A".to_string(),
             screenshot_copy: "Win+Shift+C".to_string(),
+            pin_clipboard: String::new(),
+            pin_passthrough: String::new(),
         }
     }
 }
@@ -839,6 +845,8 @@ auto_check = 1
     fn toml_roundtrip_non_default() {
         let mut config = Config::default();
         config.hotkeys.search = "Ctrl+Alt+S".to_string();
+        config.hotkeys.pin_clipboard = "Ctrl+Alt+P".to_string();
+        config.hotkeys.pin_passthrough = "Ctrl+Alt+T".to_string();
         config.search.selection_mode = SelectionMode::Rect;
         config.search.glow = GlowMode::Always;
         config.search.colorful_stroke = false;
@@ -868,6 +876,13 @@ auto_check = 1
         config.update.include_prerelease = true;
         let text = config.to_toml_string().expect("序列化");
         assert_eq!(Config::from_toml_str(&text).expect("反序列化"), config);
+    }
+
+    #[test]
+    fn pin_hotkeys_default_empty() {
+        let hotkeys = Config::default().hotkeys;
+        assert_eq!(hotkeys.pin_clipboard, "");
+        assert_eq!(hotkeys.pin_passthrough, "");
     }
 
     #[test]

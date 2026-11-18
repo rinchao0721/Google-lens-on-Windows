@@ -196,13 +196,35 @@ fn autostart_item(builder: &mut Builder, state: &AutostartState) -> MenuItem {
     }
 }
 
+/// 托盘菜单展示所需的贴图数量摘要。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PinMenuState {
+    /// 当前存活的贴图数量。
+    pub count: usize,
+    /// 当前处于鼠标穿透状态的贴图数量。
+    pub passthrough_count: usize,
+}
+
 /// 当前版本的托盘菜单。
-pub fn build(config: &Config, autostart: &AutostartState) -> Menu {
+pub fn build(config: &Config, autostart: &AutostartState, pins: PinMenuState) -> Menu {
     let mut b = Builder::default();
     let hotkeys = &config.hotkeys;
     let items = vec![
         b.command(Command::Search, Some(&hotkeys.search)),
         b.command(Command::ScreenshotCopy, Some(&hotkeys.screenshot_copy)),
+        MenuItem::Separator,
+        b.add(
+            MenuAction::Run(Command::CloseAllPins),
+            Command::CloseAllPins.label().to_string(),
+            false,
+            pins.count > 0,
+        ),
+        b.add(
+            MenuAction::Run(Command::ClearPinPassthrough),
+            Command::ClearPinPassthrough.label().to_string(),
+            false,
+            pins.passthrough_count > 0,
+        ),
         MenuItem::Separator,
         selection_mode_menu(&mut b, config),
         backend_menu(&mut b, config),
@@ -264,7 +286,11 @@ mod tests {
 
     #[test]
     fn ids_are_unique_positive_and_all_resolve() {
-        let menu = build(&Config::default(), &AutostartState::Disabled);
+        let menu = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState::default(),
+        );
         let mut ids = Vec::new();
         for item in flat(&menu) {
             if let MenuItem::Entry { id, .. } = item {
@@ -283,7 +309,11 @@ mod tests {
 
     #[test]
     fn default_config_checks_current_choices() {
-        let menu = build(&Config::default(), &AutostartState::Disabled);
+        let menu = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState::default(),
+        );
         let checked = checked_labels(&menu);
         assert!(checked.contains(&"圈选".to_string()));
         assert!(checked.contains(&"Google Lens".to_string()));
@@ -293,7 +323,11 @@ mod tests {
 
     #[test]
     fn menu_contains_hotkey_text() {
-        let menu = build(&Config::default(), &AutostartState::Disabled);
+        let menu = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState::default(),
+        );
         assert!(
             flat(&menu)
                 .iter()
@@ -305,7 +339,11 @@ mod tests {
     fn custom_template_checks_custom_entry_only() {
         let mut config = Config::default();
         config.search.engine_url_template = "https://example.com/?u={url}".to_string();
-        let checked = checked_labels(&build(&config, &AutostartState::Disabled));
+        let checked = checked_labels(&build(
+            &config,
+            &AutostartState::Disabled,
+            PinMenuState::default(),
+        ));
         assert!(checked.iter().any(|l| l.starts_with("自定义")));
         assert!(!checked.contains(&"Google Lens".to_string()));
     }
@@ -324,13 +362,17 @@ mod tests {
 
     #[test]
     fn backend_menu_checks_current_and_gates_image_host_options() {
-        let embedded = build(&Config::default(), &AutostartState::Disabled);
+        let embedded = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState::default(),
+        );
         assert!(checked_labels(&embedded).contains(&SearchBackend::Embedded.label().to_string()));
         let engines = |a| matches!(a, MenuAction::SetSearchEngine(_) | MenuAction::SetExpiry(_));
         assert!(enabled_of(&embedded, engines).iter().all(|e| !e));
         let mut config = Config::default();
         config.search.backend = SearchBackend::ImageHost;
-        let host = build(&config, &AutostartState::Disabled);
+        let host = build(&config, &AutostartState::Disabled, PinMenuState::default());
         assert!(checked_labels(&host).contains(&SearchBackend::ImageHost.label().to_string()));
         assert!(enabled_of(&host, engines).iter().all(|e| *e));
         let backends = enabled_of(&host, |a| matches!(a, MenuAction::SetBackend(_)));
@@ -342,7 +384,7 @@ mod tests {
         let mut config = Config::default();
         config.search.backend = SearchBackend::ImageHost;
         config.upload.provider = UploadProvider::Custom;
-        let menu = build(&config, &AutostartState::Disabled);
+        let menu = build(&config, &AutostartState::Disabled, PinMenuState::default());
         for item in flat(&menu) {
             if let MenuItem::Entry { id, enabled, .. } = item {
                 if matches!(menu.action(*id), Some(MenuAction::SetExpiry(_))) {
@@ -354,11 +396,16 @@ mod tests {
 
     #[test]
     fn autostart_states_render_differently() {
-        let on = build(&Config::default(), &AutostartState::Enabled);
+        let on = build(
+            &Config::default(),
+            &AutostartState::Enabled,
+            PinMenuState::default(),
+        );
         assert!(checked_labels(&on).contains(&"开机自启".to_string()));
         let stale = build(
             &Config::default(),
             &AutostartState::StalePath("x".to_string()),
+            PinMenuState::default(),
         );
         assert!(
             flat(&stale)
@@ -369,6 +416,60 @@ mod tests {
             !checked_labels(&stale)
                 .iter()
                 .any(|l| l.contains("开机自启"))
+        );
+    }
+
+    #[test]
+    fn pin_menu_items_disable_when_empty() {
+        let none = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState {
+                count: 0,
+                passthrough_count: 0,
+            },
+        );
+        assert_eq!(
+            enabled_of(&none, |a| a == MenuAction::Run(Command::CloseAllPins)),
+            vec![false]
+        );
+        assert_eq!(
+            enabled_of(&none, |a| a
+                == MenuAction::Run(Command::ClearPinPassthrough)),
+            vec![false]
+        );
+
+        let active_only = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState {
+                count: 2,
+                passthrough_count: 0,
+            },
+        );
+        assert_eq!(
+            enabled_of(&active_only, |a| a
+                == MenuAction::Run(Command::CloseAllPins)),
+            vec![true]
+        );
+        assert_eq!(
+            enabled_of(&active_only, |a| a
+                == MenuAction::Run(Command::ClearPinPassthrough)),
+            vec![false]
+        );
+
+        let with_pass = build(
+            &Config::default(),
+            &AutostartState::Disabled,
+            PinMenuState {
+                count: 2,
+                passthrough_count: 1,
+            },
+        );
+        assert_eq!(
+            enabled_of(&with_pass, |a| a
+                == MenuAction::Run(Command::ClearPinPassthrough)),
+            vec![true]
         );
     }
 }

@@ -65,6 +65,8 @@ pub enum Key {
     Undo,
     /// 重做被撤销的标注。
     Redo,
+    /// 钉在屏幕上（`Ctrl+T`）。
+    Pin,
 }
 
 /// 需要窗口层调用系统 API 完成的按键效果。
@@ -387,6 +389,7 @@ impl Interaction {
                     self.annotator.redo();
                 }
                 ToolbarButton::Search => self.finish_with_action(adj, ToolbarAction::Search),
+                ToolbarButton::Pin => self.finish_with_action(adj, ToolbarAction::Pin),
                 ToolbarButton::Save => self.finish_with_action(adj, ToolbarAction::Save),
                 ToolbarButton::Copy => self.finish_with_action(adj, ToolbarAction::Copy),
                 ToolbarButton::Cancel => self.finish(Outcome::Cancelled),
@@ -844,6 +847,13 @@ impl Interaction {
                     (self.phase, self.options.flow)
                 {
                     self.finish_with_action(adj, ToolbarAction::Copy);
+                }
+            }
+            Key::Pin => {
+                if let (Phase::Adjusting(adj), OverlayFlow::Toolbar) =
+                    (self.phase, self.options.flow)
+                {
+                    self.finish_with_action(adj, ToolbarAction::Pin);
                 }
             }
             Key::Tab => {
@@ -1508,6 +1518,7 @@ mod tests {
 
         for (button, expected) in [
             (ToolbarButton::Search, ToolbarAction::Search),
+            (ToolbarButton::Pin, ToolbarAction::Pin),
             (ToolbarButton::Copy, ToolbarAction::Copy),
         ] {
             let mut it = adjusting();
@@ -1517,6 +1528,13 @@ mod tests {
                 Some(Outcome::Action(_, action)) if action == expected
             ));
         }
+
+        let mut it = adjusting();
+        it.key(Key::Pin, NudgeMode::Move, false);
+        assert!(matches!(
+            it.take_outcome(),
+            Some(Outcome::Action(_, ToolbarAction::Pin))
+        ));
     }
 
     #[test]

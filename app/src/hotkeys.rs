@@ -25,6 +25,8 @@ pub struct Failure {
 struct NewRegistered {
     search: bool,
     screenshot_copy: bool,
+    pin_clipboard: bool,
+    pin_passthrough: bool,
 }
 
 /// 单个热键在一次替换中的结局。
@@ -76,6 +78,16 @@ fn resolve(old: &HotkeysConfig, new: &HotkeysConfig, registered: NewRegistered) 
         &new.screenshot_copy,
         registered.screenshot_copy,
     );
+    let (pin_clipboard, pin_clip_reverted) = pick(
+        &old.pin_clipboard,
+        &new.pin_clipboard,
+        registered.pin_clipboard,
+    );
+    let (pin_passthrough, pin_pass_reverted) = pick(
+        &old.pin_passthrough,
+        &new.pin_passthrough,
+        registered.pin_passthrough,
+    );
     let mut reverted = Vec::new();
     if search_reverted {
         reverted.push(Command::Search);
@@ -83,26 +95,42 @@ fn resolve(old: &HotkeysConfig, new: &HotkeysConfig, registered: NewRegistered) 
     if shot_reverted {
         reverted.push(Command::ScreenshotCopy);
     }
+    if pin_clip_reverted {
+        reverted.push(Command::PinClipboard);
+    }
+    if pin_pass_reverted {
+        reverted.push(Command::PinPassthrough);
+    }
     Resolution {
         effective: HotkeysConfig {
             search,
             screenshot_copy,
+            pin_clipboard,
+            pin_passthrough,
         },
         reverted,
     }
 }
 
+fn is_optional(command: Command) -> bool {
+    matches!(command, Command::PinClipboard | Command::PinPassthrough)
+}
+
 fn text_of(config: &HotkeysConfig, command: Command) -> &str {
     match command {
         Command::ScreenshotCopy => &config.screenshot_copy,
+        Command::PinClipboard => &config.pin_clipboard,
+        Command::PinPassthrough => &config.pin_passthrough,
         _ => &config.search,
     }
 }
 
-fn entries(config: &HotkeysConfig) -> [(Command, &str); 2] {
+fn entries(config: &HotkeysConfig) -> [(Command, &str); 4] {
     [
         (Command::Search, config.search.as_str()),
         (Command::ScreenshotCopy, config.screenshot_copy.as_str()),
+        (Command::PinClipboard, config.pin_clipboard.as_str()),
+        (Command::PinPassthrough, config.pin_passthrough.as_str()),
     ]
 }
 
@@ -130,7 +158,10 @@ fn try_register(
     window: WindowHandle,
     command: Command,
     text: &str,
-) -> Result<HotkeyGuard, Failure> {
+) -> Result<Option<HotkeyGuard>, Failure> {
+    if is_optional(command) && text.trim().is_empty() {
+        return Ok(None);
+    }
     let fail = |reason: String| Failure {
         command,
         text: text.to_string(),
@@ -140,7 +171,9 @@ fn try_register(
         .hotkey_id()
         .ok_or_else(|| fail("命令没有热键编号".to_string()))?;
     let parsed = text.parse::<Hotkey>().map_err(|e| fail(e.to_string()))?;
-    hotkey::register(window, id, &parsed).map_err(|e| fail(e.to_string()))
+    hotkey::register(window, id, &parsed)
+        .map(Some)
+        .map_err(|e| fail(e.to_string()))
 }
 
 /// 一次重新加载的热键结果。
@@ -166,10 +199,11 @@ impl HotkeySet {
         let mut failures = Vec::new();
         for (command, text) in entries(config) {
             match try_register(window, command, text) {
-                Ok(guard) => {
+                Ok(Some(guard)) => {
                     log::info!("已注册热键 {text}（{}）", command.label());
                     guards.push(guard);
                 }
+                Ok(None) => {}
                 Err(failure) => {
                     log::warn!(
                         "热键 {text}（{}）注册失败：{}",
@@ -206,11 +240,12 @@ impl HotkeySet {
         let old = self.effective.clone();
         // 同一组合键不能重复注册，先全部注销再逐个尝试
         self.guards.clear();
-        let mut attempts: Vec<(Command, Result<HotkeyGuard, Failure>)> = entries(new)
+        let mut attempts: Vec<(Command, Result<Option<HotkeyGuard>, Failure>)> = entries(new)
             .into_iter()
             .map(|(command, text)| (command, try_register(window, command, text)))
             .collect();
-        let registered_of = |attempts: &[(Command, Result<HotkeyGuard, Failure>)], c: Command| {
+        let registered_of = |attempts: &[(Command, Result<Option<HotkeyGuard>, Failure>)],
+                             c: Command| {
             attempts
                 .iter()
                 .any(|(command, result)| *command == c && result.is_ok())
@@ -221,6 +256,8 @@ impl HotkeySet {
             NewRegistered {
                 search: registered_of(&attempts, Command::Search),
                 screenshot_copy: registered_of(&attempts, Command::ScreenshotCopy),
+                pin_clipboard: registered_of(&attempts, Command::PinClipboard),
+                pin_passthrough: registered_of(&attempts, Command::PinPassthrough),
             },
         );
 
@@ -228,7 +265,7 @@ impl HotkeySet {
         for (command, result) in attempts.drain(..) {
             let reverted = resolution.reverted.contains(&command);
             match result {
-                Ok(guard) if !reverted => self.guards.push(guard),
+                Ok(Some(guard)) if !reverted => self.guards.push(guard),
                 Ok(_) => {}
                 Err(failure) if reverted => report.reverted.push(failure),
                 Err(failure) => report.still_failing.push(failure),
@@ -236,7 +273,8 @@ impl HotkeySet {
             if reverted {
                 let kept = text_of(&old, command);
                 match try_register(window, command, kept) {
-                    Ok(guard) => self.guards.push(guard),
+                    Ok(Some(guard)) => self.guards.push(guard),
+                    Ok(None) => {}
                     Err(e) => log::warn!("旧热键 {kept} 重新注册失败：{}", e.reason),
                 }
             }
@@ -272,11 +310,16 @@ pub fn reload_summary(
     }
     let mut lines = vec![format!("配置文件：{}", config_path.display())];
     for failure in &report.reverted {
+        let old_text = text_of(effective, failure.command);
+        let kept_desc = if old_text.trim().is_empty() {
+            "当前仍未设置".to_string()
+        } else {
+            format!("当前仍在使用旧的 {old_text}")
+        };
         lines.push(format!(
-            "文件里的{}快捷键 {} 被占用或无效，当前仍在使用旧的 {}",
+            "文件里的{}快捷键 {} 被占用或无效，{kept_desc}",
             failure.command.label(),
             failure.text,
-            text_of(effective, failure.command)
         ));
     }
     if !report.still_failing.is_empty() {
@@ -299,6 +342,8 @@ mod tests {
         HotkeysConfig {
             search: search.to_string(),
             screenshot_copy: shot.to_string(),
+            pin_clipboard: String::new(),
+            pin_passthrough: String::new(),
         }
     }
 
@@ -306,6 +351,8 @@ mod tests {
         NewRegistered {
             search,
             screenshot_copy,
+            pin_clipboard: true,
+            pin_passthrough: true,
         }
     }
 
@@ -353,6 +400,28 @@ mod tests {
         let r = resolve(&old, &new, registered(false, false));
         assert_eq!(r.effective, old);
         assert_eq!(r.reverted, vec![Command::Search, Command::ScreenshotCopy]);
+    }
+
+    #[test]
+    fn optional_pin_hotkeys_resolve_changes_and_reverts() {
+        let mut old = keys("Ctrl+1", "Ctrl+2");
+        old.pin_clipboard = "Ctrl+Alt+V".to_string();
+        let mut new = old.clone();
+        new.pin_clipboard = String::new();
+        new.pin_passthrough = "Ctrl+Alt+P".to_string();
+        let r = resolve(
+            &old,
+            &new,
+            NewRegistered {
+                search: true,
+                screenshot_copy: true,
+                pin_clipboard: true,
+                pin_passthrough: false,
+            },
+        );
+        assert_eq!(r.effective.pin_clipboard, "");
+        assert_eq!(r.effective.pin_passthrough, "");
+        assert_eq!(r.reverted, vec![Command::PinPassthrough]);
     }
 
     #[test]
@@ -451,7 +520,15 @@ mod tests {
     fn entries_cover_every_hotkey_command() {
         let config = HotkeysConfig::default();
         let commands: Vec<_> = entries(&config).iter().map(|(c, _)| *c).collect();
-        assert_eq!(commands, vec![Command::Search, Command::ScreenshotCopy]);
+        assert_eq!(
+            commands,
+            vec![
+                Command::Search,
+                Command::ScreenshotCopy,
+                Command::PinClipboard,
+                Command::PinPassthrough,
+            ]
+        );
     }
 
     fn hk(text: &str) -> Hotkey {

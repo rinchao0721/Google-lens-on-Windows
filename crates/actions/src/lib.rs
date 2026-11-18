@@ -5,6 +5,7 @@
 mod copy;
 mod encode;
 mod lens;
+mod pin;
 mod save;
 mod search;
 mod update;
@@ -18,6 +19,7 @@ use lenswin_platform::clipboard::{self, ClipboardOwner};
 pub use copy::CopyAction;
 pub use encode::encode_png;
 pub use lens::prepare_lens_request;
+pub use pin::decode_clipboard_image;
 pub use save::{SaveAction, default_file_name, save_to};
 pub use search::SearchAction;
 pub use update::check_update;
@@ -51,6 +53,11 @@ impl ActionRegistry {
     pub fn clipboard_text(&self) -> Result<Option<String>, ActionError> {
         clipboard::get_text(self.clipboard_owner)
             .map_err(|e| ActionError::Failed(format!("读取剪贴板失败：{e}")))
+    }
+
+    /// 剪贴板所有者窗口句柄封装。
+    pub fn clipboard_owner(&self) -> ClipboardOwner {
+        self.clipboard_owner
     }
 
     /// 取出指定种类的动作。

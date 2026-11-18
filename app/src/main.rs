@@ -19,6 +19,7 @@ use std::sync::mpsc::channel;
 use anyhow::Context;
 use lenswin_actions::ActionRegistry;
 use lenswin_core::ipc::{SETTINGS_ARG, TRAY_MUTEX_NAME, TRAY_WINDOW_CLASS};
+use lenswin_pin::PinManager;
 use lenswin_platform::clipboard::ClipboardOwner;
 use lenswin_platform::dialog;
 use lenswin_platform::message_loop;
@@ -30,7 +31,7 @@ use lenswin_platform::window::{MessageWindow, clear_copydata_handler, set_copyda
 use lenswin_popup::PopupHost;
 
 use crate::config_store::ConfigStore;
-use crate::dispatcher::{Dispatcher, PopupLink};
+use crate::dispatcher::{Dispatcher, PinLink, PopupLink};
 use crate::hotkeys::HotkeySet;
 use crate::shared::AppShared;
 
@@ -117,6 +118,27 @@ fn run() -> anyhow::Result<()> {
         host: popup_host.as_ref(),
         events: popup_rx,
     };
+    let (pin_tx, pin_rx) = channel();
+    let pin_notifier = window.task_notifier();
+    let pin_manager = match PinManager::new(move |event| {
+        if pin_tx.send(event).is_err() {
+            // 接收端随分发器销毁，只会发生在退出阶段
+            return;
+        }
+        if let Err(e) = pin_notifier.notify() {
+            log::error!("投递贴图事件失败：{e}");
+        }
+    }) {
+        Ok(manager) => Some(manager),
+        Err(e) => {
+            log::error!("初始化贴图管理器失败：{e}");
+            None
+        }
+    };
+    let pin = PinLink {
+        manager: pin_manager.as_ref(),
+        events: pin_rx,
+    };
     let dispatcher = Dispatcher::new(
         &tray,
         &paths,
@@ -124,6 +146,7 @@ fn run() -> anyhow::Result<()> {
         registry,
         window.task_notifier(),
         popup,
+        pin,
     );
     if let Some(text) = notice {
         log::warn!("{text}");

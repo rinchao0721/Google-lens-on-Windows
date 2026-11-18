@@ -12,6 +12,7 @@ pub mod hotkey;
 pub mod ipc;
 pub mod lens;
 pub mod monitor;
+pub mod pin;
 pub mod selection;
 pub mod snip;
 pub mod text_box;

@@ -10,6 +10,7 @@ members = [
     "crates/actions",
     "crates/settings_ui",
     "crates/popup",
+    "crates/pin",
     "app",
 ]
 
@@ -34,6 +35,7 @@ lenswin-update = { path = "crates/update" }
 lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
 lenswin-popup = { path = "crates/popup" }
+lenswin-pin = { path = "crates/pin" }
 
 # 外部依赖（均在 PLAN 第 8 节批准范围内）
 anyhow = "1.0.104"

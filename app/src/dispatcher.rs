@@ -6,7 +6,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::{
-    ActionRegistry, check_update, default_file_name, prepare_lens_request, save_to,
+    ActionRegistry, check_update, decode_clipboard_image, default_file_name, prepare_lens_request,
+    save_to,
 };
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::AnnotateConfig;
@@ -16,14 +17,17 @@ use lenswin_core::geometry::Rect;
 use lenswin_core::ipc::SETTINGS_ARG;
 use lenswin_core::lens::LensRequest;
 use lenswin_core::monitor::MonitorInfo;
+use lenswin_core::pin::{MAX_PIN_COUNT, PinEvent, fit_work_area};
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
 use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult, ToolbarAction, push_history};
 use lenswin_core::text_edit::sanitize_clipboard;
 use lenswin_core::update::is_release_page_url;
 use lenswin_overlay::{LiveSession, SelectRequest};
+use lenswin_pin::{PinError, PinManager};
 use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::gdi::GdiCapturer;
 use lenswin_platform::capture::{self, ScreenCapturer};
+use lenswin_platform::clipboard;
 use lenswin_platform::dialog;
 use lenswin_platform::message_loop::LoopControl;
 use lenswin_platform::monitor;
@@ -38,7 +42,7 @@ use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
 use crate::shared::AppShared;
-use crate::tray_menu::{self, MenuAction};
+use crate::tray_menu::{self, MenuAction, PinMenuState};
 use crate::update_check::{
     AUTO_CHECK_DELAY, FinishGuard, Prompt, UpdateMessage, UpdateTrigger, admit, prompt_for,
 };
@@ -54,6 +58,14 @@ pub struct PopupLink<'a> {
     pub host: Option<&'a PopupHost>,
     /// 弹窗事件，由弹窗回调发送、主线程取出。
     pub events: Receiver<PopupEvent>,
+}
+
+/// 贴图窗口管理器及其回投的事件；初始化失败时 `manager` 为空。
+pub struct PinLink<'a> {
+    /// 贴图管理器。
+    pub manager: Option<&'a PinManager>,
+    /// 贴图事件，由窗口回调发送、主线程取出。
+    pub events: Receiver<PinEvent>,
 }
 
 /// 托盘左键配置对应的命令；「无操作」返回 `None`。
@@ -72,6 +84,14 @@ pub enum Command {
     Search,
     /// 截屏到剪贴板。
     ScreenshotCopy,
+    /// 剪贴板贴图。
+    PinClipboard,
+    /// 切换鼠标穿透。
+    PinPassthrough,
+    /// 关闭全部贴图。
+    CloseAllPins,
+    /// 取消全部穿透。
+    ClearPinPassthrough,
     /// 检查更新。
     CheckUpdate,
     /// 关于。
@@ -86,15 +106,26 @@ impl Command {
         match self {
             Command::Search => Some(1),
             Command::ScreenshotCopy => Some(2),
-            Command::CheckUpdate | Command::About | Command::Exit => None,
+            Command::PinClipboard => Some(3),
+            Command::PinPassthrough => Some(4),
+            Command::CloseAllPins
+            | Command::ClearPinPassthrough
+            | Command::CheckUpdate
+            | Command::About
+            | Command::Exit => None,
         }
     }
 
     /// 由热键 id 还原。
     pub fn from_hotkey_id(id: i32) -> Option<Self> {
-        [Command::Search, Command::ScreenshotCopy]
-            .into_iter()
-            .find(|c| c.hotkey_id() == Some(id))
+        [
+            Command::Search,
+            Command::ScreenshotCopy,
+            Command::PinClipboard,
+            Command::PinPassthrough,
+        ]
+        .into_iter()
+        .find(|c| c.hotkey_id() == Some(id))
     }
 
     /// 菜单与日志中的名称。
@@ -102,6 +133,10 @@ impl Command {
         match self {
             Command::Search => "圈选搜索",
             Command::ScreenshotCopy => "截屏到剪贴板",
+            Command::PinClipboard => "剪贴板贴图",
+            Command::PinPassthrough => "切换贴图穿透",
+            Command::CloseAllPins => "关闭全部贴图",
+            Command::ClearPinPassthrough => "取消全部穿透",
             Command::CheckUpdate => "检查更新",
             Command::About => "关于 lenswin",
             Command::Exit => "退出",
@@ -149,6 +184,9 @@ pub struct Dispatcher<'a> {
     results_tx: Sender<TaskResult>,
     results_rx: Receiver<TaskResult>,
     popup: PopupLink<'a>,
+    pin: PinLink<'a>,
+    pin_decode_tx: Sender<(Result<CroppedImage, String>, Rect)>,
+    pin_decode_rx: Receiver<(Result<CroppedImage, String>, Rect)>,
     lens_tx: Sender<(u64, LensResult)>,
     lens_rx: Receiver<(u64, LensResult)>,
     /// 最近一次内置弹窗搜索的序号。
@@ -175,8 +213,10 @@ impl<'a> Dispatcher<'a> {
         registry: ActionRegistry,
         notifier: TaskNotifier,
         popup: PopupLink<'a>,
+        pin: PinLink<'a>,
     ) -> Self {
         let (results_tx, results_rx) = channel();
+        let (pin_decode_tx, pin_decode_rx) = channel();
         let (lens_tx, lens_rx) = channel();
         let (update_tx, update_rx) = channel();
         let (live_tx, live_rx) = channel();
@@ -197,6 +237,9 @@ impl<'a> Dispatcher<'a> {
             results_tx,
             results_rx,
             popup,
+            pin,
+            pin_decode_tx,
+            pin_decode_rx,
             lens_tx,
             lens_rx,
             lens_seq: Cell::new(0),
@@ -438,7 +481,14 @@ impl<'a> Dispatcher<'a> {
         let mut config = self.shared.store.snapshot();
         // 菜单显示实际生效的热键，而不是文件里可能被占用的写法
         config.hotkeys = self.shared.hotkeys.borrow().effective().clone();
-        let menu = tray_menu::build(&config, &self.autostart_state());
+        let pins = self
+            .pin
+            .manager
+            .map_or_else(PinMenuState::default, |m| PinMenuState {
+                count: m.count(),
+                passthrough_count: m.passthrough_count(),
+            });
+        let menu = tray_menu::build(&config, &self.autostart_state(), pins);
         match self.tray.show_menu(&menu.items) {
             Ok(Some(id)) => match menu.action(id) {
                 Some(action) => self.perform(action),
@@ -576,6 +626,26 @@ impl<'a> Dispatcher<'a> {
                 self.screenshot_copy();
                 LoopControl::Continue
             }
+            Command::PinClipboard => {
+                self.pin_clipboard();
+                LoopControl::Continue
+            }
+            Command::PinPassthrough => {
+                self.toggle_pin_passthrough();
+                LoopControl::Continue
+            }
+            Command::CloseAllPins => {
+                if let Some(manager) = self.pin.manager {
+                    manager.close_all();
+                }
+                LoopControl::Continue
+            }
+            Command::ClearPinPassthrough => {
+                if let Some(manager) = self.pin.manager {
+                    manager.clear_passthrough();
+                }
+                LoopControl::Continue
+            }
             Command::CheckUpdate => {
                 self.start_update_check(UpdateTrigger::Manual);
                 LoopControl::Continue
@@ -591,6 +661,9 @@ impl<'a> Dispatcher<'a> {
             }
             Command::Exit => {
                 log::info!("用户选择退出");
+                if let Some(manager) = self.pin.manager {
+                    manager.close_all();
+                }
                 LoopControl::Quit
             }
         }
@@ -617,7 +690,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 框选并调整 → 工具栏选择复制、保存或搜索；也可以直接取色。
+    /// 框选并调整 → 工具栏选择复制、保存、搜索或钉住；也可以直接取色。
     fn screenshot_copy(&self) {
         let Some((result, frames)) = self.pick(
             Command::ScreenshotCopy,
@@ -644,6 +717,90 @@ impl<'a> Dispatcher<'a> {
             ToolbarAction::Copy => self.copy_image(image),
             ToolbarAction::Save => self.save_image(image),
             ToolbarAction::Search => self.search_image(image, &selection.bounds()),
+            ToolbarAction::Pin => self.pin_image(image, selection.bounds()),
+        }
+    }
+
+    fn pin_image(&self, image: CroppedImage, at: Rect) {
+        let Some(manager) = self.pin.manager else {
+            log::error!("贴图管理器不可用");
+            self.balloon(NotifyLevel::Error, "lenswin", "贴图功能不可用");
+            return;
+        };
+        match manager.pin(image, at) {
+            Ok(_) => log::info!("已创建贴图：位置 {at:?}"),
+            Err(PinError::TooMany) => {
+                log::warn!("贴图数量已达上限");
+                self.balloon(NotifyLevel::Warning, "lenswin", "贴图已达上限");
+            }
+            Err(e) => {
+                log::error!("创建贴图失败：{e}");
+                self.balloon(NotifyLevel::Error, "lenswin", &format!("创建贴图失败：{e}"));
+            }
+        }
+    }
+
+    fn pin_clipboard(&self) {
+        let Some(manager) = self.pin.manager else {
+            log::error!("贴图管理器不可用");
+            self.balloon(NotifyLevel::Error, "lenswin", "贴图功能不可用");
+            return;
+        };
+        if manager.count() >= MAX_PIN_COUNT {
+            log::warn!("贴图数量已达上限");
+            self.balloon(NotifyLevel::Warning, "lenswin", "贴图已达上限");
+            return;
+        }
+        let raw = match clipboard::get_image_bytes(self.registry.clipboard_owner()) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                self.balloon(NotifyLevel::Warning, "lenswin", "剪贴板里没有可贴的图片");
+                return;
+            }
+            Err(e) => {
+                log::warn!("读取剪贴板图片失败：{e}");
+                self.balloon(NotifyLevel::Warning, "lenswin", "剪贴板里没有可贴的图片");
+                return;
+            }
+        };
+        let work_area = match monitor::work_area_at_cursor() {
+            Ok(area) => area,
+            Err(e) => {
+                log::error!("获取显示器工作区失败：{e}");
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("获取显示器工作区失败：{e}"),
+                );
+                return;
+            }
+        };
+        let tx = self.pin_decode_tx.clone();
+        let notifier = self.notifier;
+        let spawned = std::thread::Builder::new()
+            .name("lenswin-pin-decode".to_string())
+            .spawn(move || {
+                let decoded = decode_clipboard_image(&raw).map_err(|e| e.to_string());
+                if tx.send((decoded, work_area)).is_err() {
+                    return;
+                }
+                if let Err(e) = notifier.notify() {
+                    log::error!("投递剪贴板图片解码结果失败：{e}");
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("创建剪贴板图片解码线程失败：{e}");
+            self.balloon(NotifyLevel::Error, "lenswin", &format!("贴图失败：{e}"));
+        }
+    }
+
+    fn toggle_pin_passthrough(&self) {
+        let Some(manager) = self.pin.manager else {
+            return;
+        };
+        match monitor::cursor_position() {
+            Ok(pos) => manager.toggle_passthrough_at(pos),
+            Err(e) => log::warn!("读取光标位置失败：{e}"),
         }
     }
 
@@ -1125,6 +1282,25 @@ impl<'a> Dispatcher<'a> {
                 }
             }
         }
+        while let Ok((decoded, work_area)) = self.pin_decode_rx.try_recv() {
+            match decoded {
+                Ok(image) => {
+                    let (rect, _) = fit_work_area(image.width(), image.height(), work_area);
+                    self.pin_image(image, rect);
+                }
+                Err(e) => {
+                    log::warn!("解码剪贴板图片失败：{e}");
+                    self.balloon(NotifyLevel::Warning, "lenswin", "剪贴板里没有可贴的图片");
+                }
+            }
+        }
+        while let Ok(event) = self.pin.events.try_recv() {
+            match event {
+                PinEvent::Copy(image) => self.copy_image(image),
+                PinEvent::Save(image) => self.save_image(image),
+                PinEvent::Search(image, anchor) => self.search_image(image, &anchor),
+            }
+        }
         while let Ok(message) = self.live_rx.try_recv() {
             self.on_live_message(message);
         }
@@ -1346,7 +1522,11 @@ mod tests {
     fn hotkey_ids_roundtrip() {
         assert_eq!(Command::from_hotkey_id(1), Some(Command::Search));
         assert_eq!(Command::from_hotkey_id(2), Some(Command::ScreenshotCopy));
-        assert_eq!(Command::from_hotkey_id(3), None);
+        assert_eq!(Command::from_hotkey_id(3), Some(Command::PinClipboard));
+        assert_eq!(Command::from_hotkey_id(4), Some(Command::PinPassthrough));
+        assert_eq!(Command::from_hotkey_id(5), None);
+        assert_eq!(Command::CloseAllPins.hotkey_id(), None);
+        assert_eq!(Command::ClearPinPassthrough.hotkey_id(), None);
         assert_eq!(Command::About.hotkey_id(), None);
         assert_eq!(Command::CheckUpdate.hotkey_id(), None);
     }

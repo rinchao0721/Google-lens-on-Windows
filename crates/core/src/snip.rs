@@ -36,6 +36,8 @@ pub enum ToolbarAction {
     Save,
     /// 以图搜图。
     Search,
+    /// 钉在屏幕上。
+    Pin,
 }
 
 /// 覆盖层的结果。

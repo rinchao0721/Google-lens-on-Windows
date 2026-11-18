@@ -75,13 +75,24 @@ fn check_range<T: PartialOrd + std::fmt::Display>(
     }
 }
 
-/// 配置中所有快捷键的「(字段路径, 字符串)」列表；新增快捷键只需在此登记。
-fn hotkey_entries(config: &Config) -> [(&'static str, &str); 2] {
+/// 配置中所有快捷键的「(字段路径, 字符串, 是否允许为空)」列表；新增快捷键只需在此登记。
+fn hotkey_entries(config: &Config) -> [(&'static str, &str, bool); 4] {
     [
-        ("hotkeys.search", config.hotkeys.search.as_str()),
+        ("hotkeys.search", config.hotkeys.search.as_str(), false),
         (
             "hotkeys.screenshot_copy",
             config.hotkeys.screenshot_copy.as_str(),
+            false,
+        ),
+        (
+            "hotkeys.pin_clipboard",
+            config.hotkeys.pin_clipboard.as_str(),
+            true,
+        ),
+        (
+            "hotkeys.pin_passthrough",
+            config.hotkeys.pin_passthrough.as_str(),
+            true,
         ),
     ]
 }
@@ -90,10 +101,13 @@ fn check_hotkeys(config: &Config, issues: &mut Vec<ValidationIssue>) {
     check_hotkey_entries(&hotkey_entries(config), issues);
 }
 
-/// 逐个解析后两两比较；重复时报告后出现的字段，并指明与哪一项冲突。
-fn check_hotkey_entries(entries: &[(&'static str, &str)], issues: &mut Vec<ValidationIssue>) {
+/// 逐个解析后两两比较；允许为空的可选热键在空白时跳过，重复时报告后出现的字段。
+fn check_hotkey_entries(entries: &[(&'static str, &str, bool)], issues: &mut Vec<ValidationIssue>) {
     let mut seen: Vec<(&'static str, Hotkey)> = Vec::new();
-    for &(field, text) in entries {
+    for &(field, text, allow_empty) in entries {
+        if allow_empty && text.trim().is_empty() {
+            continue;
+        }
         match text.parse::<Hotkey>() {
             Ok(hotkey) => {
                 if let Some((first, _)) = seen.iter().find(|(_, h)| *h == hotkey) {
@@ -414,9 +428,9 @@ mod tests {
     #[test]
     fn duplicate_among_three_reports_later_field_only() {
         let entries = [
-            ("a", "Ctrl+Alt+A"),
-            ("b", "Ctrl+Alt+B"),
-            ("c", "alt + ctrl + a"),
+            ("a", "Ctrl+Alt+A", false),
+            ("b", "Ctrl+Alt+B", false),
+            ("c", "alt + ctrl + a", false),
         ];
         let mut issues = Vec::new();
         check_hotkey_entries(&entries, &mut issues);
@@ -428,16 +442,34 @@ mod tests {
     #[test]
     fn duplicate_pairs_each_report_their_later_field() {
         let entries = [
-            ("a", "Ctrl+A"),
-            ("b", "Ctrl+B"),
-            ("c", "Ctrl+A"),
-            ("d", "Ctrl+B"),
-            ("e", "bad"),
+            ("a", "Ctrl+A", false),
+            ("b", "Ctrl+B", false),
+            ("c", "Ctrl+A", false),
+            ("d", "Ctrl+B", false),
+            ("e", "bad", false),
         ];
         let mut issues = Vec::new();
         check_hotkey_entries(&entries, &mut issues);
         let got: Vec<_> = issues.iter().map(|i| i.field).collect();
         assert_eq!(got, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn optional_pin_hotkeys_allow_empty_and_check_conflicts() {
+        let mut c = Config::default();
+        c.hotkeys.pin_clipboard = "   ".to_string();
+        c.hotkeys.pin_passthrough = String::new();
+        assert!(fields(&c).is_empty());
+
+        c.hotkeys.pin_clipboard = "ctrl + shift + a".to_string();
+        c.hotkeys.pin_passthrough = "Ctrl+Shift+A".to_string();
+        assert_eq!(fields(&c), vec!["hotkeys.pin_passthrough"]);
+
+        c.hotkeys.pin_passthrough = "bad".to_string();
+        assert_eq!(fields(&c), vec!["hotkeys.pin_passthrough"]);
+
+        c.hotkeys.pin_passthrough = "Win+Shift+A".to_string();
+        assert_eq!(fields(&c), vec!["hotkeys.pin_passthrough"]);
     }
 
     #[test]

@@ -141,6 +141,10 @@ pub struct Draft {
     pub search_hotkey: HotkeyChoice,
     /// 截屏热键的编辑状态。
     pub screenshot_hotkey: HotkeyChoice,
+    /// 剪贴板贴图热键的编辑状态（可选）。
+    pub pin_clipboard_hotkey: Option<HotkeyChoice>,
+    /// 切换鼠标穿透热键的编辑状态（可选）。
+    pub pin_passthrough_hotkey: Option<HotkeyChoice>,
     /// 上传大小上限（MiB），仅在用户改动后才覆盖配置里的字节数。
     pub max_mib: u64,
     initial_max_mib: u64,
@@ -163,18 +167,33 @@ fn fallback_choice(default_text: &str) -> HotkeyChoice {
     })
 }
 
+/// 解析可选热键：空白视为未设置；非空但解析失败则退回未设置并标记兜底。
+fn parse_optional_hotkey(text: &str) -> (Option<HotkeyChoice>, bool) {
+    if text.trim().is_empty() {
+        return (None, false);
+    }
+    match HotkeyChoice::parse(text) {
+        Some(choice) => (Some(choice), false),
+        None => (None, true),
+    }
+}
+
 impl Draft {
     /// 由当前配置和自启状态建立草稿。
     pub fn from_config(config: &Config, autostart: bool) -> Self {
         let defaults = Config::default().hotkeys;
         let search = HotkeyChoice::parse(&config.hotkeys.search);
         let shot = HotkeyChoice::parse(&config.hotkeys.screenshot_copy);
-        let hotkey_fallback = search.is_none() || shot.is_none();
+        let (pin_clipboard, pin_clip_fb) = parse_optional_hotkey(&config.hotkeys.pin_clipboard);
+        let (pin_passthrough, pin_pass_fb) = parse_optional_hotkey(&config.hotkeys.pin_passthrough);
+        let hotkey_fallback = search.is_none() || shot.is_none() || pin_clip_fb || pin_pass_fb;
         let max_mib = config.upload.max_bytes.div_ceil(MIB).max(1);
         Self {
             config: config.clone(),
             search_hotkey: search.unwrap_or_else(|| fallback_choice(&defaults.search)),
             screenshot_hotkey: shot.unwrap_or_else(|| fallback_choice(&defaults.screenshot_copy)),
+            pin_clipboard_hotkey: pin_clipboard,
+            pin_passthrough_hotkey: pin_passthrough,
             max_mib,
             initial_max_mib: max_mib,
             engine_custom: lenswin_core::config::preset_index_of(
@@ -197,10 +216,43 @@ impl Draft {
             .screenshot_hotkey
             .to_text()
             .map_err(|_| "截屏的快捷键至少要勾选一个修饰键".to_string())?;
+        config.hotkeys.pin_clipboard = match self.pin_clipboard_hotkey {
+            Some(choice) => choice
+                .to_text()
+                .map_err(|_| "剪贴板贴图的快捷键至少要勾选一个修饰键".to_string())?,
+            None => String::new(),
+        };
+        config.hotkeys.pin_passthrough = match self.pin_passthrough_hotkey {
+            Some(choice) => choice
+                .to_text()
+                .map_err(|_| "切换鼠标穿透的快捷键至少要勾选一个修饰键".to_string())?,
+            None => String::new(),
+        };
         if self.max_mib != self.initial_max_mib {
             config.upload.max_bytes = self.max_mib.saturating_mul(MIB);
         }
         Ok(config)
+    }
+
+    /// 全部已启用快捷键中存在两两重复时返回错误提示。
+    pub fn first_hotkey_clash(&self) -> Option<&'static str> {
+        let mut list = vec![self.search_hotkey, self.screenshot_hotkey];
+        if let Some(c) = self.pin_clipboard_hotkey {
+            list.push(c);
+        }
+        if let Some(c) = self.pin_passthrough_hotkey {
+            list.push(c);
+        }
+        for (idx, a) in list.iter().enumerate() {
+            if let Some(rest) = list.get(idx + 1..) {
+                for b in rest {
+                    if let Some(msg) = hotkey_clash(a, b) {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -210,13 +262,27 @@ pub fn hotkey_clash(a: &HotkeyChoice, b: &HotkeyChoice) -> Option<&'static str> 
     (same_mods && a.key == b.key).then_some("两个功能不能使用同一个快捷键")
 }
 
-/// 两个热键输入框之一。
+/// 热键输入框标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyField {
     /// 圈选搜索。
     Search,
     /// 截屏到剪贴板。
     Screenshot,
+    /// 剪贴板贴图。
+    PinClipboard,
+    /// 切换鼠标穿透。
+    PinPassthrough,
+}
+
+impl HotkeyField {
+    /// 是否允许留空不设置。
+    pub const fn is_optional(self) -> bool {
+        matches!(
+            self,
+            HotkeyField::PinClipboard | HotkeyField::PinPassthrough
+        )
+    }
 }
 
 /// 托盘进程对某个组合的探测结论。
@@ -243,6 +309,8 @@ pub enum HotkeyStatus {
     Available,
     /// 没能检测，附原因。
     Unknown(String),
+    /// 可选热键未设置。
+    Unset,
 }
 
 impl HotkeyStatus {
@@ -254,17 +322,18 @@ impl HotkeyStatus {
             HotkeyStatus::Reserved(usage) => format!("可能被 Windows 占用（{usage}）"),
             HotkeyStatus::Available => "可用".to_string(),
             HotkeyStatus::Unknown(reason) => format!("无法检测占用：{reason}"),
+            HotkeyStatus::Unset => "未设置（不注册全局热键）".to_string(),
         }
     }
 }
 
 /// 汇总一个快捷键卡片的状态：校验问题优先，其次占用，再次系统保留。
 ///
-/// `invalid` 是提交时的校验文字；`other` 是另一个功能的快捷键，用于实时查重；
+/// `invalid` 是提交时的校验文字；`others` 是其它功能的快捷键，用于实时查重；
 /// `applied_conflict` 表示上次提交时托盘报告了该组合冲突。
 pub fn hotkey_status(
-    choice: &HotkeyChoice,
-    other: &HotkeyChoice,
+    choice: Option<&HotkeyChoice>,
+    others: &[Option<HotkeyChoice>],
     invalid: Option<String>,
     applied_conflict: bool,
     probe: Option<&ProbeState>,
@@ -272,12 +341,17 @@ pub fn hotkey_status(
     if let Some(message) = invalid {
         return HotkeyStatus::Invalid(message);
     }
+    let Some(choice) = choice else {
+        return HotkeyStatus::Unset;
+    };
     let hotkey = match Hotkey::new(choice.modifiers(), choice.key) {
         Ok(hotkey) => hotkey,
         Err(_) => return HotkeyStatus::Invalid("至少要选一个修饰键".to_string()),
     };
-    if let Some(message) = hotkey_clash(choice, other) {
-        return HotkeyStatus::Invalid(message.to_string());
+    for other in others.iter().flatten() {
+        if let Some(message) = hotkey_clash(choice, other) {
+            return HotkeyStatus::Invalid(message.to_string());
+        }
     }
     if applied_conflict || probe == Some(&ProbeState::Occupied) {
         return HotkeyStatus::Occupied;
@@ -319,6 +393,16 @@ pub fn changed_hotkeys(old: &Config, new: &Config) -> Vec<(HotkeyField, HotkeyCh
             HotkeyField::Screenshot,
             &old.hotkeys.screenshot_copy,
             &new.hotkeys.screenshot_copy,
+        ),
+        (
+            HotkeyField::PinClipboard,
+            &old.hotkeys.pin_clipboard,
+            &new.hotkeys.pin_clipboard,
+        ),
+        (
+            HotkeyField::PinPassthrough,
+            &old.hotkeys.pin_passthrough,
+            &new.hotkeys.pin_passthrough,
         ),
     ];
     pairs
@@ -516,9 +600,10 @@ mod tests {
     #[test]
     fn status_prefers_invalid_over_everything() {
         let a = choice("Ctrl+Alt+K");
+        let others = [Some(choice("Ctrl+B"))];
         let status = hotkey_status(
-            &a,
-            &choice("Ctrl+B"),
+            Some(&a),
+            &others,
             Some("坏了".to_string()),
             true,
             Some(&ProbeState::Occupied),
@@ -528,29 +613,51 @@ mod tests {
         none.ctrl = false;
         none.alt = false;
         assert!(matches!(
-            hotkey_status(&none, &choice("Ctrl+B"), None, false, None),
+            hotkey_status(Some(&none), &others, None, false, None),
             HotkeyStatus::Invalid(_)
         ));
         assert!(matches!(
-            hotkey_status(&a, &a, None, false, Some(&ProbeState::Available)),
+            hotkey_status(
+                Some(&a),
+                &[Some(a)],
+                None,
+                false,
+                Some(&ProbeState::Available)
+            ),
             HotkeyStatus::Invalid(_)
         ));
+        assert_eq!(
+            hotkey_status(None, &others, None, false, None),
+            HotkeyStatus::Unset
+        );
     }
 
     #[test]
     fn status_occupied_beats_reserved() {
         let win_l = choice("Win+L");
-        let other = choice("Ctrl+B");
+        let others = [Some(choice("Ctrl+B"))];
         assert_eq!(
-            hotkey_status(&win_l, &other, None, false, Some(&ProbeState::Occupied)),
+            hotkey_status(
+                Some(&win_l),
+                &others,
+                None,
+                false,
+                Some(&ProbeState::Occupied)
+            ),
             HotkeyStatus::Occupied
         );
         assert_eq!(
-            hotkey_status(&win_l, &other, None, false, Some(&ProbeState::Available)),
+            hotkey_status(
+                Some(&win_l),
+                &others,
+                None,
+                false,
+                Some(&ProbeState::Available)
+            ),
             HotkeyStatus::Reserved("锁屏")
         );
         assert_eq!(
-            hotkey_status(&choice("Ctrl+K"), &other, None, true, None),
+            hotkey_status(Some(&choice("Ctrl+K")), &others, None, true, None),
             HotkeyStatus::Occupied
         );
     }
@@ -558,14 +665,14 @@ mod tests {
     #[test]
     fn status_reflects_probe_result() {
         let a = choice("Ctrl+Alt+K");
-        let other = choice("Ctrl+B");
+        let others = [Some(choice("Ctrl+B"))];
         assert_eq!(
-            hotkey_status(&a, &other, None, false, Some(&ProbeState::Available)),
+            hotkey_status(Some(&a), &others, None, false, Some(&ProbeState::Available)),
             HotkeyStatus::Available
         );
         let unknown = hotkey_status(
-            &a,
-            &other,
+            Some(&a),
+            &others,
             None,
             false,
             Some(&ProbeState::Unavailable("未运行".to_string())),
@@ -573,7 +680,7 @@ mod tests {
         assert_eq!(unknown, HotkeyStatus::Unknown("未运行".to_string()));
         assert!(unknown.text().contains("未运行"));
         assert!(matches!(
-            hotkey_status(&a, &other, None, false, None),
+            hotkey_status(Some(&a), &others, None, false, None),
             HotkeyStatus::Unknown(_)
         ));
     }
@@ -585,5 +692,31 @@ mod tests {
         let c = HotkeyChoice::parse("Ctrl+B").expect("解析");
         assert!(hotkey_clash(&a, &b).is_some());
         assert!(hotkey_clash(&a, &c).is_none());
+    }
+
+    #[test]
+    fn optional_pin_hotkeys_roundtrip_and_detect_clashes() {
+        let mut config = Config::default();
+        config.hotkeys.pin_clipboard = "Ctrl+Alt+V".to_string();
+        let mut draft = Draft::from_config(&config, false);
+        assert!(!draft.hotkey_fallback);
+        assert!(draft.pin_clipboard_hotkey.is_some());
+        assert!(draft.pin_passthrough_hotkey.is_none());
+        assert!(draft.first_hotkey_clash().is_none());
+
+        let saved = draft.to_config().expect("合成");
+        assert_eq!(saved.hotkeys.pin_clipboard, "Ctrl+Alt+V");
+        assert_eq!(saved.hotkeys.pin_passthrough, "");
+
+        draft.pin_passthrough_hotkey = draft.pin_clipboard_hotkey;
+        assert!(draft.first_hotkey_clash().is_some());
+
+        draft.pin_passthrough_hotkey = None;
+        let cleared = draft.to_config().expect("清除后合成");
+        assert!(cleared.hotkeys.pin_passthrough.is_empty());
+
+        let changes = changed_hotkeys(&Config::default(), &saved);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, HotkeyField::PinClipboard);
     }
 }

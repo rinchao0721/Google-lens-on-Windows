@@ -6,13 +6,15 @@ use lenswin_core::frame::CroppedImage;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    SetClipboardData,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+use windows::core::PCWSTR;
 
 use crate::error::{PlatformError, last_error, win32};
 use crate::handle::{GlobalMem, discard};
+use crate::text::to_wide;
 use crate::window::MessageWindow;
 
 /// 剪贴板被其它进程占用时的重试次数。
@@ -21,8 +23,30 @@ const OPEN_RETRIES: u32 = 10;
 const OPEN_RETRY_DELAY: Duration = Duration::from_millis(15);
 /// 读取剪贴板文本时最多取的 UTF-16 单元数，防止异常大的内容被整块复制。
 const MAX_READ_UNITS: usize = 1 << 18;
+/// 读取剪贴板图像原始字节的大小上限（64 MiB）。
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// BITMAPINFOHEADER 大小。
 const DIB_HEADER_LEN: usize = 40;
+
+/// 剪贴板中读取到的图像原始格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardImageFormat {
+    /// 注册格式 `PNG`。
+    Png,
+    /// `CF_DIBV5`。
+    DibV5,
+    /// `CF_DIB`。
+    Dib,
+}
+
+/// 剪贴板中读取到的图像原始字节（未解码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    /// 图像格式。
+    pub format: ClipboardImageFormat,
+    /// 原始字节数据。
+    pub bytes: Vec<u8>,
+}
 
 /// 剪贴板所有者：消息窗口句柄的数值，可跨线程传递。
 ///
@@ -84,6 +108,63 @@ pub fn set_image(owner: ClipboardOwner, image: &CroppedImage) -> Result<(), Plat
 /// 把文本写入剪贴板，会清空原有内容。
 pub fn set_text(owner: ClipboardOwner, text: &str) -> Result<(), PlatformError> {
     set_data(owner, u32::from(CF_UNICODETEXT.0), &utf16_with_nul(text))
+}
+
+/// 读取剪贴板里的图像原始字节（按 `PNG` → `CF_DIBV5` → `CF_DIB` 优先级）；没有图片格式时返回 `Ok(None)`。
+pub fn get_image_bytes(owner: ClipboardOwner) -> Result<Option<ClipboardImage>, PlatformError> {
+    let png_name = to_wide("PNG");
+    // SAFETY: png_name 以 NUL 结尾，在调用期间有效。
+    let png_format = unsafe { RegisterClipboardFormatW(PCWSTR(png_name.as_ptr())) };
+
+    let _clipboard = ClipboardGuard::open(owner)?;
+    let candidates = [
+        (png_format, ClipboardImageFormat::Png),
+        (u32::from(CF_DIBV5.0), ClipboardImageFormat::DibV5),
+        (u32::from(CF_DIB.0), ClipboardImageFormat::Dib),
+    ];
+    for (format, kind) in candidates {
+        if format == 0 {
+            continue;
+        }
+        // SAFETY: 剪贴板已由当前线程打开。
+        if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
+            continue;
+        }
+        let bytes = read_clipboard_bytes(format)?;
+        return Ok(Some(ClipboardImage {
+            format: kind,
+            bytes,
+        }));
+    }
+    Ok(None)
+}
+
+/// 从已打开的剪贴板读取指定格式的原始字节，限制大小不超过 [`MAX_IMAGE_BYTES`]。
+fn read_clipboard_bytes(format: u32) -> Result<Vec<u8>, PlatformError> {
+    // SAFETY: 剪贴板已打开；返回的句柄归系统所有，不可释放。
+    let handle = unsafe { GetClipboardData(format) }.map_err(win32("GetClipboardData"))?;
+    let global = HGLOBAL(handle.0);
+    // SAFETY: global 来自 GetClipboardData，剪贴板仍处于打开状态。
+    let size = unsafe { GlobalSize(global) };
+    if size == 0 {
+        return Err(PlatformError::Invalid("剪贴板图像数据为空".to_string()));
+    }
+    if size > MAX_IMAGE_BYTES {
+        return Err(PlatformError::Invalid(
+            "剪贴板图像超过 64 MiB 上限".to_string(),
+        ));
+    }
+    // SAFETY: global 来自 GetClipboardData，剪贴板仍处于打开状态。
+    let ptr = unsafe { GlobalLock(global) };
+    if ptr.is_null() {
+        return Err(last_error("GlobalLock"));
+    }
+    // SAFETY: 锁定期间 ptr 指向至少 size 字节的可读内存。
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec();
+    // 数据已复制，解锁结果不影响后续
+    // SAFETY: 与上面的 GlobalLock 配对。
+    discard(unsafe { GlobalUnlock(global) });
+    Ok(bytes)
 }
 
 /// 读取剪贴板里的 Unicode 文本；没有文本格式时返回 `Ok(None)`。

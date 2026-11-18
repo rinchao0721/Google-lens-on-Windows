@@ -1589,6 +1589,7 @@ dependencies = [
  "lenswin-actions",
  "lenswin-core",
  "lenswin-overlay",
+ "lenswin-pin",
  "lenswin-platform",
  "lenswin-popup",
  "lenswin-settings-ui",
@@ -1633,6 +1634,14 @@ version = "0.1.0"
 dependencies = [
  "lenswin-core",
  "thiserror 2.0.21",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "lenswin-pin"
+version = "0.1.0"
+dependencies = [
+ "lenswin-core",
  "windows 0.62.2",
 ]
 

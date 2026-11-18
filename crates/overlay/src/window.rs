@@ -26,8 +26,8 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_A, VK_BACK, VK_C,
     VK_CONTROL, VK_D, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_LEFT, VK_OEM_2,
-    VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_TAB, VK_UP, VK_V, VK_W,
-    VK_Y, VK_Z,
+    VK_OEM_COMMA, VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_T, VK_TAB, VK_UP, VK_V,
+    VK_W, VK_Y, VK_Z,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
@@ -544,7 +544,7 @@ fn nudge_mode() -> NudgeMode {
     }
 }
 
-/// Ctrl+Z 撤销，Ctrl+Y 与 Ctrl+Shift+Z 重做。
+/// Ctrl+Z 撤销，Ctrl+Y 与 Ctrl+Shift+Z 重做，Ctrl+T 贴图。
 fn history_key(vk: VIRTUAL_KEY) -> Option<Key> {
     if !is_down(VK_CONTROL) {
         return None;
@@ -553,6 +553,7 @@ fn history_key(vk: VIRTUAL_KEY) -> Option<Key> {
         VK_Z if is_down(VK_SHIFT) => Some(Key::Redo),
         VK_Z => Some(Key::Undo),
         VK_Y => Some(Key::Redo),
+        VK_T if !is_down(VK_SHIFT) => Some(Key::Pin),
         _ => None,
     }
 }

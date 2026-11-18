@@ -88,6 +88,7 @@ pub fn hints(stage: Stage, features: Features) -> Vec<Hint> {
             out.push(hint("Ctrl + 方向键", "扩大选区"));
             out.push(hint("Shift + 方向键", "缩小选区"));
             out.push(hint("Enter / 双击", "复制"));
+            out.push(hint("Ctrl + T", "贴图"));
             if features.history {
                 out.push(hint(", .", "切换历史选区"));
             }

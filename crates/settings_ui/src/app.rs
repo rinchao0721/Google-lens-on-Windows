@@ -21,8 +21,8 @@ use crate::client;
 use crate::fonts::FontStatus;
 use crate::form::{
     Draft, Feedback, FeedbackKind, HotkeyField, HotkeyStatus, Page, ProbeState, Staleness,
-    changed_hotkeys, config_from_file_text, hotkey_cap_labels, hotkey_clash, hotkey_status,
-    page_of_field, staleness,
+    changed_hotkeys, config_from_file_text, hotkey_cap_labels, hotkey_status, page_of_field,
+    staleness,
 };
 use crate::icons;
 use crate::recorder::{self, Capture};
@@ -229,9 +229,7 @@ impl SettingsApp {
                 return false;
             }
         };
-        if let Some(message) =
-            hotkey_clash(&self.draft.search_hotkey, &self.draft.screenshot_hotkey)
-        {
+        if let Some(message) = self.draft.first_hotkey_clash() {
             self.page = Page::Hotkeys;
             self.set_feedback(FeedbackKind::Error, message);
             return false;
@@ -392,32 +390,48 @@ impl SettingsApp {
             );
         }
         let keys = self.keys.clone();
-        for (field, other_field, id, title, issue_field) in [
+        let fields = [
             (
                 HotkeyField::Search,
-                HotkeyField::Screenshot,
                 "hotkey-search",
                 "圈选搜索",
                 "hotkeys.search",
             ),
             (
                 HotkeyField::Screenshot,
-                HotkeyField::Search,
                 "hotkey-shot",
                 "截屏到剪贴板",
                 "hotkeys.screenshot_copy",
             ),
-        ] {
-            let choice = *self.hotkey_mut(field);
-            let other = *self.hotkey_mut(other_field);
-            let applied_conflict = self
-                .conflicts
+            (
+                HotkeyField::PinClipboard,
+                "hotkey-pin-clipboard",
+                "剪贴板贴图",
+                "hotkeys.pin_clipboard",
+            ),
+            (
+                HotkeyField::PinPassthrough,
+                "hotkey-pin-passthrough",
+                "切换贴图鼠标穿透",
+                "hotkeys.pin_passthrough",
+            ),
+        ];
+        for (field, id, title, issue_field) in fields {
+            let choice = self.hotkey_get(field);
+            let others: Vec<Option<HotkeyChoice>> = fields
                 .iter()
-                .any(|(f, c)| *f == field && *c == choice);
-            let probe = self.probe_cached(&choice);
+                .filter(|(other, ..)| *other != field)
+                .map(|(other, ..)| self.hotkey_get(*other))
+                .collect();
+            let applied_conflict = choice.is_some_and(|c| {
+                self.conflicts
+                    .iter()
+                    .any(|(f, conflict)| *f == field && *conflict == c)
+            });
+            let probe = choice.as_ref().and_then(|c| self.probe_cached(c));
             let status = hotkey_status(
-                &choice,
-                &other,
+                choice.as_ref(),
+                &others,
                 self.issue(issue_field),
                 applied_conflict,
                 probe.as_ref(),
@@ -428,10 +442,18 @@ impl SettingsApp {
                 title,
                 status: &status,
                 recording,
+                optional: field.is_optional(),
             };
-            if hotkey_card(ui, &look, &keys, &card, self.hotkey_mut(field)) {
+            let mut editable = choice;
+            if hotkey_card(ui, &look, &keys, &card, &mut editable) {
                 self.record_clicked = true;
                 self.recording = if recording { None } else { Some(field) };
+            }
+            if editable != choice {
+                self.hotkey_set(field, editable);
+                if editable.is_none() && self.recording == Some(field) {
+                    self.recording = None;
+                }
             }
         }
         ui.add_space(4.0);
@@ -444,10 +466,29 @@ impl SettingsApp {
         );
     }
 
-    fn hotkey_mut(&mut self, field: HotkeyField) -> &mut HotkeyChoice {
+    fn hotkey_get(&self, field: HotkeyField) -> Option<HotkeyChoice> {
         match field {
-            HotkeyField::Search => &mut self.draft.search_hotkey,
-            HotkeyField::Screenshot => &mut self.draft.screenshot_hotkey,
+            HotkeyField::Search => Some(self.draft.search_hotkey),
+            HotkeyField::Screenshot => Some(self.draft.screenshot_hotkey),
+            HotkeyField::PinClipboard => self.draft.pin_clipboard_hotkey,
+            HotkeyField::PinPassthrough => self.draft.pin_passthrough_hotkey,
+        }
+    }
+
+    fn hotkey_set(&mut self, field: HotkeyField, value: Option<HotkeyChoice>) {
+        match field {
+            HotkeyField::Search => {
+                if let Some(v) = value {
+                    self.draft.search_hotkey = v;
+                }
+            }
+            HotkeyField::Screenshot => {
+                if let Some(v) = value {
+                    self.draft.screenshot_hotkey = v;
+                }
+            }
+            HotkeyField::PinClipboard => self.draft.pin_clipboard_hotkey = value,
+            HotkeyField::PinPassthrough => self.draft.pin_passthrough_hotkey = value,
         }
     }
 
@@ -484,7 +525,15 @@ impl SettingsApp {
         }
         match capture {
             Some(Capture::Recorded { key, modifiers }) => {
-                recorder::apply_capture(self.hotkey_mut(field), key, modifiers);
+                let mut current = self.hotkey_get(field).unwrap_or(HotkeyChoice {
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    win: false,
+                    key,
+                });
+                recorder::apply_capture(&mut current, key, modifiers);
+                self.hotkey_set(field, Some(current));
                 self.recording = None;
             }
             Some(Capture::Cancelled) => self.recording = None,
@@ -1244,25 +1293,28 @@ struct HotkeyCard<'a> {
     title: &'a str,
     status: &'a HotkeyStatus,
     recording: bool,
+    optional: bool,
 }
 
-/// 快捷键卡片：右侧是按键小方块预览，下方是修饰键开关、录制按钮、兜底下拉和状态行。
+/// 快捷键卡片：右侧是按键小方块预览，下方是修饰键开关、录制按钮、兜底下拉与可选清除、状态行。
 /// 返回本帧是否点了录制按钮。
 fn hotkey_card(
     ui: &mut egui::Ui,
     look: &Look,
     keys: &[Key],
     card: &HotkeyCard<'_>,
-    choice: &mut HotkeyChoice,
+    choice_opt: &mut Option<HotkeyChoice>,
 ) -> bool {
     let p = look.palette;
-    let labels = hotkey_cap_labels(choice);
     let status_color = match card.status {
         HotkeyStatus::Invalid(_) | HotkeyStatus::Occupied => p.error,
         HotkeyStatus::Reserved(_) => p.warn,
         HotkeyStatus::Available => p.ok,
-        HotkeyStatus::Unknown(_) => p.text_dim,
+        HotkeyStatus::Unknown(_) | HotkeyStatus::Unset => p.text_dim,
     };
+    let labels = choice_opt
+        .as_ref()
+        .map_or_else(|| vec!["未设置".to_string()], hotkey_cap_labels);
     let mut record_clicked = false;
     Card::new(card.title)
         .icon(icons::KEYBOARD)
@@ -1273,22 +1325,46 @@ fn hotkey_card(
             look,
             |ui| key_caps(ui, look, &labels),
             |ui| {
-                ui.horizontal(|ui| {
-                    modifier_chip(ui, look, &mut choice.ctrl, "Ctrl");
-                    modifier_chip(ui, look, &mut choice.alt, "Alt");
-                    modifier_chip(ui, look, &mut choice.shift, "Shift");
-                    modifier_chip(ui, look, &mut choice.win, "Win");
-                    ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(choice) = choice_opt.as_mut() {
+                        modifier_chip(ui, look, &mut choice.ctrl, "Ctrl");
+                        modifier_chip(ui, look, &mut choice.alt, "Alt");
+                        modifier_chip(ui, look, &mut choice.shift, "Shift");
+                        modifier_chip(ui, look, &mut choice.win, "Win");
+                        ui.add_space(8.0);
+                    }
                     record_clicked = record_button(ui, look, card.recording).clicked();
+                    let mut picked_key = choice_opt.map(|c| c.key);
                     egui::ComboBox::from_id_salt(card.id)
                         .width(90.0)
                         .height(320.0)
                         .selected_text("更多按键")
                         .show_ui(ui, |ui| {
                             for key in keys {
-                                ui.selectable_value(&mut choice.key, *key, key.to_string());
+                                let selected = picked_key == Some(*key);
+                                if ui.selectable_label(selected, key.to_string()).clicked() {
+                                    picked_key = Some(*key);
+                                    match choice_opt.as_mut() {
+                                        Some(c) => c.key = *key,
+                                        None => {
+                                            *choice_opt = Some(HotkeyChoice {
+                                                ctrl: true,
+                                                alt: false,
+                                                shift: false,
+                                                win: false,
+                                                key: *key,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         });
+                    if card.optional
+                        && choice_opt.is_some()
+                        && choice_chip(ui, look, false, "清除").clicked()
+                    {
+                        *choice_opt = None;
+                    }
                 });
                 ui.label(
                     egui::RichText::new(card.status.text())
