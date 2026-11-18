@@ -49,7 +49,7 @@ pub fn page_of_field(field: &str) -> Page {
     match section {
         "hotkeys" => Page::Hotkeys,
         "search" | "upload" | "privacy" => Page::SearchUpload,
-        "screenshot" | "selection" | "annotate" => Page::Screenshot,
+        "screenshot" | "selection" | "annotate" | "ocr" => Page::Screenshot,
         _ => Page::General,
     }
 }
@@ -145,6 +145,8 @@ pub struct Draft {
     pub pin_clipboard_hotkey: Option<HotkeyChoice>,
     /// 切换鼠标穿透热键的编辑状态（可选）。
     pub pin_passthrough_hotkey: Option<HotkeyChoice>,
+    /// 识别文字热键的编辑状态（可选）。
+    pub ocr_hotkey: Option<HotkeyChoice>,
     /// 上传大小上限（MiB），仅在用户改动后才覆盖配置里的字节数。
     pub max_mib: u64,
     initial_max_mib: u64,
@@ -186,7 +188,9 @@ impl Draft {
         let shot = HotkeyChoice::parse(&config.hotkeys.screenshot_copy);
         let (pin_clipboard, pin_clip_fb) = parse_optional_hotkey(&config.hotkeys.pin_clipboard);
         let (pin_passthrough, pin_pass_fb) = parse_optional_hotkey(&config.hotkeys.pin_passthrough);
-        let hotkey_fallback = search.is_none() || shot.is_none() || pin_clip_fb || pin_pass_fb;
+        let (ocr, ocr_fb) = parse_optional_hotkey(&config.hotkeys.ocr);
+        let hotkey_fallback =
+            search.is_none() || shot.is_none() || pin_clip_fb || pin_pass_fb || ocr_fb;
         let max_mib = config.upload.max_bytes.div_ceil(MIB).max(1);
         Self {
             config: config.clone(),
@@ -194,6 +198,7 @@ impl Draft {
             screenshot_hotkey: shot.unwrap_or_else(|| fallback_choice(&defaults.screenshot_copy)),
             pin_clipboard_hotkey: pin_clipboard,
             pin_passthrough_hotkey: pin_passthrough,
+            ocr_hotkey: ocr,
             max_mib,
             initial_max_mib: max_mib,
             engine_custom: lenswin_core::config::preset_index_of(
@@ -228,6 +233,12 @@ impl Draft {
                 .map_err(|_| "切换鼠标穿透的快捷键至少要勾选一个修饰键".to_string())?,
             None => String::new(),
         };
+        config.hotkeys.ocr = match self.ocr_hotkey {
+            Some(choice) => choice
+                .to_text()
+                .map_err(|_| "识别文字的快捷键至少要勾选一个修饰键".to_string())?,
+            None => String::new(),
+        };
         if self.max_mib != self.initial_max_mib {
             config.upload.max_bytes = self.max_mib.saturating_mul(MIB);
         }
@@ -241,6 +252,9 @@ impl Draft {
             list.push(c);
         }
         if let Some(c) = self.pin_passthrough_hotkey {
+            list.push(c);
+        }
+        if let Some(c) = self.ocr_hotkey {
             list.push(c);
         }
         for (idx, a) in list.iter().enumerate() {
@@ -273,6 +287,8 @@ pub enum HotkeyField {
     PinClipboard,
     /// 切换鼠标穿透。
     PinPassthrough,
+    /// 识别文字。
+    Ocr,
 }
 
 impl HotkeyField {
@@ -280,7 +296,7 @@ impl HotkeyField {
     pub const fn is_optional(self) -> bool {
         matches!(
             self,
-            HotkeyField::PinClipboard | HotkeyField::PinPassthrough
+            HotkeyField::PinClipboard | HotkeyField::PinPassthrough | HotkeyField::Ocr
         )
     }
 }
@@ -404,6 +420,7 @@ pub fn changed_hotkeys(old: &Config, new: &Config) -> Vec<(HotkeyField, HotkeyCh
             &old.hotkeys.pin_passthrough,
             &new.hotkeys.pin_passthrough,
         ),
+        (HotkeyField::Ocr, &old.hotkeys.ocr, &new.hotkeys.ocr),
     ];
     pairs
         .into_iter()
@@ -531,6 +548,9 @@ mod tests {
             ("annotate.number.size", Page::Screenshot),
             ("annotate.rectangle.color", Page::Screenshot),
             ("screenshot.save_dir", Page::Screenshot),
+            ("ocr.languages", Page::Screenshot),
+            ("ocr.strategy", Page::Screenshot),
+            ("hotkeys.ocr", Page::Hotkeys),
             ("general.notifications", Page::General),
             ("unknown", Page::General),
         ];
@@ -718,5 +738,28 @@ mod tests {
         let changes = changed_hotkeys(&Config::default(), &saved);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].0, HotkeyField::PinClipboard);
+    }
+
+    #[test]
+    fn ocr_hotkey_roundtrip_and_clashes() {
+        let mut config = Config::default();
+        config.hotkeys.ocr = "Ctrl+Alt+O".to_string();
+        let mut draft = Draft::from_config(&config, false);
+        assert!(!draft.hotkey_fallback);
+        assert!(draft.ocr_hotkey.is_some());
+        assert!(draft.first_hotkey_clash().is_none());
+
+        let saved = draft.to_config().expect("合成");
+        assert_eq!(saved.hotkeys.ocr, "Ctrl+Alt+O");
+        assert_eq!(
+            changed_hotkeys(&Config::default(), &saved),
+            vec![(HotkeyField::Ocr, draft.ocr_hotkey.expect("ocr 热键"))]
+        );
+
+        draft.ocr_hotkey = Some(draft.search_hotkey);
+        assert!(draft.first_hotkey_clash().is_some());
+
+        draft.ocr_hotkey = None;
+        assert!(draft.to_config().expect("清除").hotkeys.ocr.is_empty());
     }
 }

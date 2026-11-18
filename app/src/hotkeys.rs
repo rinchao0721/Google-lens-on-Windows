@@ -27,6 +27,7 @@ struct NewRegistered {
     screenshot_copy: bool,
     pin_clipboard: bool,
     pin_passthrough: bool,
+    ocr: bool,
 }
 
 /// 单个热键在一次替换中的结局。
@@ -88,6 +89,7 @@ fn resolve(old: &HotkeysConfig, new: &HotkeysConfig, registered: NewRegistered) 
         &new.pin_passthrough,
         registered.pin_passthrough,
     );
+    let (ocr, ocr_reverted) = pick(&old.ocr, &new.ocr, registered.ocr);
     let mut reverted = Vec::new();
     if search_reverted {
         reverted.push(Command::Search);
@@ -101,19 +103,26 @@ fn resolve(old: &HotkeysConfig, new: &HotkeysConfig, registered: NewRegistered) 
     if pin_pass_reverted {
         reverted.push(Command::PinPassthrough);
     }
+    if ocr_reverted {
+        reverted.push(Command::Ocr);
+    }
     Resolution {
         effective: HotkeysConfig {
             search,
             screenshot_copy,
             pin_clipboard,
             pin_passthrough,
+            ocr,
         },
         reverted,
     }
 }
 
 fn is_optional(command: Command) -> bool {
-    matches!(command, Command::PinClipboard | Command::PinPassthrough)
+    matches!(
+        command,
+        Command::PinClipboard | Command::PinPassthrough | Command::Ocr
+    )
 }
 
 fn text_of(config: &HotkeysConfig, command: Command) -> &str {
@@ -121,16 +130,18 @@ fn text_of(config: &HotkeysConfig, command: Command) -> &str {
         Command::ScreenshotCopy => &config.screenshot_copy,
         Command::PinClipboard => &config.pin_clipboard,
         Command::PinPassthrough => &config.pin_passthrough,
+        Command::Ocr => &config.ocr,
         _ => &config.search,
     }
 }
 
-fn entries(config: &HotkeysConfig) -> [(Command, &str); 4] {
+fn entries(config: &HotkeysConfig) -> [(Command, &str); 5] {
     [
         (Command::Search, config.search.as_str()),
         (Command::ScreenshotCopy, config.screenshot_copy.as_str()),
         (Command::PinClipboard, config.pin_clipboard.as_str()),
         (Command::PinPassthrough, config.pin_passthrough.as_str()),
+        (Command::Ocr, config.ocr.as_str()),
     ]
 }
 
@@ -258,6 +269,7 @@ impl HotkeySet {
                 screenshot_copy: registered_of(&attempts, Command::ScreenshotCopy),
                 pin_clipboard: registered_of(&attempts, Command::PinClipboard),
                 pin_passthrough: registered_of(&attempts, Command::PinPassthrough),
+                ocr: registered_of(&attempts, Command::Ocr),
             },
         );
 
@@ -344,6 +356,7 @@ mod tests {
             screenshot_copy: shot.to_string(),
             pin_clipboard: String::new(),
             pin_passthrough: String::new(),
+            ocr: String::new(),
         }
     }
 
@@ -353,6 +366,7 @@ mod tests {
             screenshot_copy,
             pin_clipboard: true,
             pin_passthrough: true,
+            ocr: true,
         }
     }
 
@@ -403,12 +417,13 @@ mod tests {
     }
 
     #[test]
-    fn optional_pin_hotkeys_resolve_changes_and_reverts() {
+    fn optional_pin_and_ocr_hotkeys_resolve_changes_and_reverts() {
         let mut old = keys("Ctrl+1", "Ctrl+2");
         old.pin_clipboard = "Ctrl+Alt+V".to_string();
         let mut new = old.clone();
         new.pin_clipboard = String::new();
         new.pin_passthrough = "Ctrl+Alt+P".to_string();
+        new.ocr = "Ctrl+Alt+O".to_string();
         let r = resolve(
             &old,
             &new,
@@ -417,11 +432,26 @@ mod tests {
                 screenshot_copy: true,
                 pin_clipboard: true,
                 pin_passthrough: false,
+                ocr: true,
             },
         );
         assert_eq!(r.effective.pin_clipboard, "");
         assert_eq!(r.effective.pin_passthrough, "");
+        assert_eq!(r.effective.ocr, "Ctrl+Alt+O");
         assert_eq!(r.reverted, vec![Command::PinPassthrough]);
+
+        let mut fail_ocr = old.clone();
+        fail_ocr.ocr = "Ctrl+Alt+O".to_string();
+        let r2 = resolve(
+            &old,
+            &fail_ocr,
+            NewRegistered {
+                ocr: false,
+                ..registered(true, true)
+            },
+        );
+        assert_eq!(r2.effective.ocr, "");
+        assert_eq!(r2.reverted, vec![Command::Ocr]);
     }
 
     #[test]
@@ -527,6 +557,7 @@ mod tests {
                 Command::ScreenshotCopy,
                 Command::PinClipboard,
                 Command::PinPassthrough,
+                Command::Ocr,
             ]
         );
     }

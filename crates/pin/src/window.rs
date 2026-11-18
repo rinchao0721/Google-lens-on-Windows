@@ -520,6 +520,11 @@ fn on_right_button_up(hwnd: HWND) {
                 emit(PinEvent::Search(img, rect));
             }
         }
+        MenuAction::Ocr => {
+            if let Some(Ok(img)) = with_slot(hwnd, |s| s.state.export_image()) {
+                emit(PinEvent::Ocr(img));
+            }
+        }
         MenuAction::TogglePassthrough => {
             apply_passthrough(hwnd, !passthrough);
         }

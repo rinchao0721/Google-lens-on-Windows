@@ -84,14 +84,14 @@ fn validate(request: &SelectRequest<'_>) -> Result<(), OverlayError> {
     Ok(())
 }
 
-/// 截屏流程保持原来的单色样式，辉光和炫彩只给搜索流程。
+/// 截屏和识别流程保持原来的单色样式，辉光和炫彩只给搜索流程。
 fn visual_for(flow: OverlayFlow, search: &SearchConfig) -> Visual {
     match flow {
         OverlayFlow::Direct | OverlayFlow::Live => Visual {
             glow: search.glow,
             colorful: search.colorful_stroke,
         },
-        OverlayFlow::Toolbar => Visual {
+        OverlayFlow::Toolbar | OverlayFlow::Ocr => Visual {
             glow: GlowMode::Off,
             colorful: false,
         },
@@ -284,6 +284,13 @@ mod tests {
         };
         assert_eq!(
             visual_for(OverlayFlow::Toolbar, &search),
+            Visual {
+                glow: GlowMode::Off,
+                colorful: false
+            }
+        );
+        assert_eq!(
+            visual_for(OverlayFlow::Ocr, &search),
             Visual {
                 glow: GlowMode::Off,
                 colorful: false

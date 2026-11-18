@@ -14,8 +14,9 @@ use crate::error::{PinError, last_error, win32};
 const CMD_COPY: usize = 1;
 const CMD_SAVE: usize = 2;
 const CMD_SEARCH: usize = 3;
-const CMD_PASSTHROUGH: usize = 4;
-const CMD_CLOSE: usize = 5;
+const CMD_OCR: usize = 4;
+const CMD_PASSTHROUGH: usize = 5;
+const CMD_CLOSE: usize = 6;
 
 /// 用户在贴图右键菜单中选中的项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub(crate) enum MenuAction {
     Copy,
     Save,
     Search,
+    Ocr,
     TogglePassthrough,
     Close,
 }
@@ -69,6 +71,8 @@ pub(crate) fn show_context_menu(
         AppendMenuW(menu.raw(), MF_STRING, CMD_COPY, w!("复制")).map_err(win32("AppendMenuW"))?;
         AppendMenuW(menu.raw(), MF_STRING, CMD_SAVE, w!("保存")).map_err(win32("AppendMenuW"))?;
         AppendMenuW(menu.raw(), MF_STRING, CMD_SEARCH, w!("搜索")).map_err(win32("AppendMenuW"))?;
+        AppendMenuW(menu.raw(), MF_STRING, CMD_OCR, w!("识别文字"))
+            .map_err(win32("AppendMenuW"))?;
         AppendMenuW(menu.raw(), MF_SEPARATOR, 0, None).map_err(win32("AppendMenuW"))?;
         AppendMenuW(menu.raw(), pass_flags, CMD_PASSTHROUGH, w!("鼠标穿透"))
             .map_err(win32("AppendMenuW"))?;
@@ -107,6 +111,7 @@ pub(crate) fn show_context_menu(
         CMD_COPY => Some(MenuAction::Copy),
         CMD_SAVE => Some(MenuAction::Save),
         CMD_SEARCH => Some(MenuAction::Search),
+        CMD_OCR => Some(MenuAction::Ocr),
         CMD_PASSTHROUGH => Some(MenuAction::TogglePassthrough),
         CMD_CLOSE => Some(MenuAction::Close),
         _ => None,

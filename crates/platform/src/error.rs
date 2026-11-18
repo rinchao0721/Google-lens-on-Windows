@@ -29,6 +29,15 @@ pub enum PlatformError {
         #[source]
         source: std::io::Error,
     },
+    /// 当前系统不支持本地文字识别。
+    #[error("当前系统不支持文字识别")]
+    OcrUnsupported,
+    /// 指定的识别语言未安装或不可用。
+    #[error("识别语言 {0} 未安装或不可用")]
+    OcrLanguageUnavailable(String),
+    /// 图像尺寸超出系统 OCR 引擎上限。
+    #[error("图像尺寸超出系统文字识别上限")]
+    OcrImageTooLarge,
 }
 
 /// 为 `map_err` 提供带 API 名称的转换。

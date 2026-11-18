@@ -50,6 +50,8 @@ pub enum PinEvent {
     Save(CroppedImage),
     /// 以图搜图（已应用旋转的图，以及贴图当前屏幕矩形）。
     Search(CroppedImage, Rect),
+    /// 识别文字（已应用旋转，不含缩放与透明度）。
+    Ocr(CroppedImage),
 }
 
 /// 顺时针旋转角度。

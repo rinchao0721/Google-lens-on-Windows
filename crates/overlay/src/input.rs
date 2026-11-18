@@ -390,6 +390,7 @@ impl Interaction {
                 }
                 ToolbarButton::Search => self.finish_with_action(adj, ToolbarAction::Search),
                 ToolbarButton::Pin => self.finish_with_action(adj, ToolbarAction::Pin),
+                ToolbarButton::Ocr => self.finish_with_action(adj, ToolbarAction::Ocr),
                 ToolbarButton::Save => self.finish_with_action(adj, ToolbarAction::Save),
                 ToolbarButton::Copy => self.finish_with_action(adj, ToolbarAction::Copy),
                 ToolbarButton::Cancel => self.finish(Outcome::Cancelled),
@@ -427,11 +428,11 @@ impl Interaction {
         self.phase = Phase::Idle;
     }
 
-    /// 选区成形后：工具栏流程的矩形进入调整，其余直接结束。
+    /// 选区成形后：工具栏和识别流程的矩形进入调整，其余直接结束。
     fn accept(&mut self, selection: Selection) {
         let is_rect = matches!(selection.shape(), SelectionShape::Rect);
         match (self.options.flow, is_rect) {
-            (OverlayFlow::Toolbar, true) => {
+            (OverlayFlow::Toolbar, true) | (OverlayFlow::Ocr, _) => {
                 self.phase = Phase::Adjusting(Adjusting {
                     rect: selection.bounds(),
                     monitor: selection.monitor_index(),
@@ -502,8 +503,8 @@ impl Interaction {
                     && toolbar.covers(p)
                 {
                     let hit = toolbar.hit(p);
-                    // 样式条改的是当前文本框，其它按钮先确认文字再执行
-                    if matches!(hit, Some(Hit::Button(_))) {
+                    // 样式条和识别按钮不触发文本框确认；其余按钮先确认文字再执行
+                    if matches!(hit, Some(Hit::Button(btn)) if btn != ToolbarButton::Ocr) {
                         self.annotator.confirm_text();
                     }
                     self.press_toolbar(adj, hit);
@@ -752,19 +753,30 @@ impl Interaction {
         true
     }
 
-    /// 双击：在调整中的选区内双击等同于复制，其余情况按普通按下处理；有工具时双击只是普通按下。
+    /// 双击：在调整中的选区内双击确认（截屏流程复制，识别流程返回选区），其余情况按普通按下处理；有工具时双击只是普通按下。
     pub fn double_click(&mut self, window: usize, local: (i32, i32)) {
         if self.reedit_text(window, local) {
             return;
         }
         if let (Phase::Adjusting(adj), Some(p)) = (self.phase, self.point(window, local))
-            && self.options.flow == OverlayFlow::Toolbar
-            && self.annotator.tool().is_none()
             && adj.rect.contains(p)
-            && !self.toolbar(&adj).is_some_and(|t| t.covers(p))
         {
-            self.finish_with_action(adj, ToolbarAction::Copy);
-            return;
+            match self.options.flow {
+                OverlayFlow::Toolbar
+                    if self.annotator.tool().is_none()
+                        && !self.toolbar(&adj).is_some_and(|t| t.covers(p)) =>
+                {
+                    self.finish_with_action(adj, ToolbarAction::Copy);
+                    return;
+                }
+                OverlayFlow::Ocr => {
+                    if let Some(selection) = self.adjusted_selection(&adj) {
+                        self.finish(Outcome::Selected(selection));
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
         self.press(window, local);
     }
@@ -842,13 +854,17 @@ impl Interaction {
                     }
                 }
             }
-            Key::Enter => {
-                if let (Phase::Adjusting(adj), OverlayFlow::Toolbar) =
-                    (self.phase, self.options.flow)
-                {
+            Key::Enter => match (self.phase, self.options.flow) {
+                (Phase::Adjusting(adj), OverlayFlow::Toolbar) => {
                     self.finish_with_action(adj, ToolbarAction::Copy);
                 }
-            }
+                (Phase::Adjusting(adj), OverlayFlow::Ocr) => {
+                    if let Some(selection) = self.adjusted_selection(&adj) {
+                        self.finish(Outcome::Selected(selection));
+                    }
+                }
+                _ => {}
+            },
             Key::Pin => {
                 if let (Phase::Adjusting(adj), OverlayFlow::Toolbar) =
                     (self.phase, self.options.flow)
@@ -982,9 +998,11 @@ impl Interaction {
         None
     }
 
-    /// 在历史选区间切换，只在工具栏流程且没有拖拽时生效。
+    /// 在历史选区间切换，只在工具栏和识别流程且没有拖拽时生效。
     fn step_history(&mut self, older: bool) {
-        if self.options.flow != OverlayFlow::Toolbar || self.options.history.is_empty() {
+        if !matches!(self.options.flow, OverlayFlow::Toolbar | OverlayFlow::Ocr)
+            || self.options.history.is_empty()
+        {
             return;
         }
         let busy = match self.phase {
@@ -1120,6 +1138,7 @@ impl Interaction {
             Phase::Idle => Stage::Idle,
             Phase::Drawing { .. } => Stage::Drawing,
             Phase::Adjusting(_) if self.is_live() => Stage::LiveAdjusting,
+            Phase::Adjusting(_) if self.options.flow == OverlayFlow::Ocr => Stage::OcrAdjusting,
             Phase::Adjusting(_) if self.annotator.is_editing() => Stage::Editing,
             Phase::Adjusting(_) if self.annotating() => Stage::Annotating,
             Phase::Adjusting(_) => Stage::Adjusting,
@@ -1127,7 +1146,8 @@ impl Interaction {
         let features = Features {
             magnifier: self.options.magnifier,
             snap: self.options.snap != SnapState::Unavailable,
-            history: self.options.flow == OverlayFlow::Toolbar && !self.options.history.is_empty(),
+            history: matches!(self.options.flow, OverlayFlow::Toolbar | OverlayFlow::Ocr)
+                && !self.options.history.is_empty(),
         };
         hint::hints(stage, features)
     }
@@ -2911,5 +2931,67 @@ mod tests {
         let mut it = live();
         it.key(Key::Escape, NudgeMode::Move, false);
         assert_eq!(it.take_outcome(), Some(Outcome::Cancelled));
+    }
+
+    #[test]
+    fn toolbar_ocr_button_returns_ocr_action() {
+        let mut it = adjusting();
+        let bar = it.view(1).toolbar.expect("截屏调整期有工具栏").layout;
+        let ocr = bar.button_rect(ToolbarButton::Ocr).expect("有识别文字按钮");
+        it.press(1, (ocr.x + 2, ocr.y + 2));
+        it.release(1, (ocr.x + 2, ocr.y + 2));
+        match it.take_outcome() {
+            Some(Outcome::Action(sel, ToolbarAction::Ocr)) => {
+                assert_eq!(sel.bounds(), Rect::new(100, 100, 400, 300));
+            }
+            other => panic!("期望得到 Ocr 动作，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ocr_flow_adjusts_without_toolbar_and_confirms_with_enter_or_double_click() {
+        let mut opts = options(OverlayFlow::Ocr);
+        opts.history = vec![Rect::new(20, 20, 80, 60)];
+        let mut it = Interaction::new(Box::new(RectTool::new()), monitors(), opts);
+        it.press(1, (100, 100));
+        it.mouse_move(1, (300, 300));
+        it.release(1, (500, 400));
+        assert!(!it.is_finished());
+
+        let view = it.view(1);
+        assert_eq!(view.frame, FrameStyle::Handles);
+        assert_eq!(view.toolbar, None);
+        assert!(
+            view.hints
+                .iter()
+                .any(|h| h.keys == "Enter / 双击" && h.desc == "识别")
+        );
+        assert!(!view.hints.iter().any(|h| h.keys == "Ctrl + T"));
+        assert!(view.hints.iter().any(|h| h.keys == ", ."));
+
+        // Ctrl+T 在 OCR 流程下不触发钉屏
+        it.key(Key::Pin, NudgeMode::Move, false);
+        assert!(!it.is_finished());
+
+        // Enter 确认返回选区
+        it.key(Key::Enter, NudgeMode::Move, false);
+        match it.take_outcome() {
+            Some(Outcome::Selected(sel)) => {
+                assert_eq!(sel.bounds(), Rect::new(100, 100, 400, 300));
+            }
+            other => panic!("期望 Enter 确认返回选区，实际为 {other:?}"),
+        }
+
+        // 双击选区内同样确认返回选区
+        let mut it = rect(OverlayFlow::Ocr);
+        it.press(1, (100, 100));
+        it.release(1, (500, 400));
+        it.double_click(1, (200, 200));
+        match it.take_outcome() {
+            Some(Outcome::Selected(sel)) => {
+                assert_eq!(sel.bounds(), Rect::new(100, 100, 400, 300));
+            }
+            other => panic!("期望双击确认返回选区，实际为 {other:?}"),
+        }
     }
 }

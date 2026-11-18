@@ -5,6 +5,7 @@
 mod copy;
 mod encode;
 mod lens;
+mod ocr;
 mod pin;
 mod save;
 mod search;
@@ -19,6 +20,7 @@ use lenswin_platform::clipboard::{self, ClipboardOwner};
 pub use copy::CopyAction;
 pub use encode::encode_png;
 pub use lens::prepare_lens_request;
+pub use ocr::{OcrError, recognize_image};
 pub use pin::decode_clipboard_image;
 pub use save::{SaveAction, default_file_name, save_to};
 pub use search::SearchAction;

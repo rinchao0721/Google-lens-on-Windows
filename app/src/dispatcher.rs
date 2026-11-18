@@ -6,8 +6,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::{
-    ActionRegistry, check_update, decode_clipboard_image, default_file_name, prepare_lens_request,
-    save_to,
+    ActionRegistry, OcrError, check_update, decode_clipboard_image, default_file_name,
+    prepare_lens_request, recognize_image, save_to,
 };
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::AnnotateConfig;
@@ -28,6 +28,7 @@ use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::gdi::GdiCapturer;
 use lenswin_platform::capture::{self, ScreenCapturer};
 use lenswin_platform::clipboard;
+use lenswin_platform::com::MtaScope;
 use lenswin_platform::dialog;
 use lenswin_platform::message_loop::LoopControl;
 use lenswin_platform::monitor;
@@ -88,6 +89,8 @@ pub enum Command {
     PinClipboard,
     /// 切换鼠标穿透。
     PinPassthrough,
+    /// 识别文字。
+    Ocr,
     /// 关闭全部贴图。
     CloseAllPins,
     /// 取消全部穿透。
@@ -108,6 +111,7 @@ impl Command {
             Command::ScreenshotCopy => Some(2),
             Command::PinClipboard => Some(3),
             Command::PinPassthrough => Some(4),
+            Command::Ocr => Some(5),
             Command::CloseAllPins
             | Command::ClearPinPassthrough
             | Command::CheckUpdate
@@ -123,6 +127,7 @@ impl Command {
             Command::ScreenshotCopy,
             Command::PinClipboard,
             Command::PinPassthrough,
+            Command::Ocr,
         ]
         .into_iter()
         .find(|c| c.hotkey_id() == Some(id))
@@ -135,6 +140,7 @@ impl Command {
             Command::ScreenshotCopy => "截屏到剪贴板",
             Command::PinClipboard => "剪贴板贴图",
             Command::PinPassthrough => "切换贴图穿透",
+            Command::Ocr => "识别文字",
             Command::CloseAllPins => "关闭全部贴图",
             Command::ClearPinPassthrough => "取消全部穿透",
             Command::CheckUpdate => "检查更新",
@@ -187,6 +193,10 @@ pub struct Dispatcher<'a> {
     pin: PinLink<'a>,
     pin_decode_tx: Sender<(Result<CroppedImage, String>, Rect)>,
     pin_decode_rx: Receiver<(Result<CroppedImage, String>, Rect)>,
+    ocr_tx: Sender<Result<Option<String>, OcrError>>,
+    ocr_rx: Receiver<Result<Option<String>, OcrError>>,
+    /// 是否已有 OCR 识别在工作线程中运行；同一时间只跑一个。
+    ocr_running: Cell<bool>,
     lens_tx: Sender<(u64, LensResult)>,
     lens_rx: Receiver<(u64, LensResult)>,
     /// 最近一次内置弹窗搜索的序号。
@@ -217,6 +227,7 @@ impl<'a> Dispatcher<'a> {
     ) -> Self {
         let (results_tx, results_rx) = channel();
         let (pin_decode_tx, pin_decode_rx) = channel();
+        let (ocr_tx, ocr_rx) = channel();
         let (lens_tx, lens_rx) = channel();
         let (update_tx, update_rx) = channel();
         let (live_tx, live_rx) = channel();
@@ -240,6 +251,9 @@ impl<'a> Dispatcher<'a> {
             pin,
             pin_decode_tx,
             pin_decode_rx,
+            ocr_tx,
+            ocr_rx,
+            ocr_running: Cell::new(false),
             lens_tx,
             lens_rx,
             lens_seq: Cell::new(0),
@@ -634,6 +648,10 @@ impl<'a> Dispatcher<'a> {
                 self.toggle_pin_passthrough();
                 LoopControl::Continue
             }
+            Command::Ocr => {
+                self.ocr();
+                LoopControl::Continue
+            }
             Command::CloseAllPins => {
                 if let Some(manager) = self.pin.manager {
                     manager.close_all();
@@ -690,7 +708,23 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 框选并调整 → 工具栏选择复制、保存、搜索或钉住；也可以直接取色。
+    /// 框选并微调 → 识别文字并复制到剪贴板。
+    fn ocr(&self) {
+        let Some((result, frames)) = self.pick(Command::Ocr, SelectionMode::Rect, OverlayFlow::Ocr)
+        else {
+            return;
+        };
+        match result {
+            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _, _) => {
+                if let Some(image) = self.crop(&selection, &frames) {
+                    self.start_ocr(image);
+                }
+            }
+            OverlayResult::Color(text) => self.copy_color(&text),
+        }
+    }
+
+    /// 框选并调整 → 工具栏选择复制、保存、搜索、钉住或识别文字；也可以直接取色。
     fn screenshot_copy(&self) {
         let Some((result, frames)) = self.pick(
             Command::ScreenshotCopy,
@@ -699,7 +733,7 @@ impl<'a> Dispatcher<'a> {
         ) else {
             return;
         };
-        // 工具栏流程的成图由覆盖层合成，已含标注
+        // 工具栏流程的成图由覆盖层合成，已含标注；识别文字忽略标注直接裁原图
         let (selection, action, image) = match result {
             OverlayResult::Action(selection, action, image) => (selection, action, image),
             OverlayResult::Selected(selection) => {
@@ -718,6 +752,11 @@ impl<'a> Dispatcher<'a> {
             ToolbarAction::Save => self.save_image(image),
             ToolbarAction::Search => self.search_image(image, &selection.bounds()),
             ToolbarAction::Pin => self.pin_image(image, selection.bounds()),
+            ToolbarAction::Ocr => {
+                if let Some(raw) = self.crop(&selection, &frames) {
+                    self.start_ocr(raw);
+                }
+            }
         }
     }
 
@@ -1299,6 +1338,37 @@ impl<'a> Dispatcher<'a> {
                 PinEvent::Copy(image) => self.copy_image(image),
                 PinEvent::Save(image) => self.save_image(image),
                 PinEvent::Search(image, anchor) => self.search_image(image, &anchor),
+                PinEvent::Ocr(image) => self.start_ocr(image),
+            }
+        }
+        while let Ok(res) = self.ocr_rx.try_recv() {
+            self.ocr_running.set(false);
+            match res {
+                Ok(Some(text)) => {
+                    let count = text.chars().count();
+                    match self.registry.copy_text(&text) {
+                        Ok(()) => {
+                            log::info!("文字识别完成，已复制 {count} 个字符");
+                            self.balloon(
+                                NotifyLevel::Info,
+                                "lenswin",
+                                &format!("已复制 {count} 个字符"),
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("复制识别文字失败：{e}");
+                            self.balloon(NotifyLevel::Error, "lenswin", &format!("复制失败：{e}"));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log::info!("文字识别完成：未识别到文字");
+                    self.balloon(NotifyLevel::Info, "lenswin", "没有识别到文字");
+                }
+                Err(e) => {
+                    log::error!("文字识别失败：{e}");
+                    self.balloon(NotifyLevel::Error, "lenswin", &e.to_string());
+                }
             }
         }
         while let Ok(message) = self.live_rx.try_recv() {
@@ -1322,6 +1392,38 @@ impl<'a> Dispatcher<'a> {
                 }
                 None => log::info!("{}完成", result.label),
             }
+        }
+    }
+
+    /// 在工作线程运行一次 OCR 识别；已有任务运行时拒绝新任务。
+    fn start_ocr(&self, image: CroppedImage) {
+        if self.ocr_running.get() {
+            log::info!("已有文字识别任务运行中，忽略本次请求");
+            self.balloon(NotifyLevel::Info, "lenswin", "正在识别，请稍候");
+            return;
+        }
+        self.ocr_running.set(true);
+        let config = self.shared.store.snapshot().ocr;
+        let tx = self.ocr_tx.clone();
+        let notifier = self.notifier;
+        let spawned = std::thread::Builder::new()
+            .name("lenswin-ocr".to_string())
+            .spawn(move || {
+                let result = match MtaScope::enter() {
+                    Ok(_mta) => recognize_image(&config, image),
+                    Err(e) => Err(OcrError::Failed(e.to_string())),
+                };
+                if tx.send(result).is_err() {
+                    return;
+                }
+                if let Err(e) = notifier.notify() {
+                    log::error!("投递文字识别结果失败：{e}");
+                }
+            });
+        if let Err(e) = spawned {
+            self.ocr_running.set(false);
+            log::error!("创建文字识别线程失败：{e}");
+            self.balloon(NotifyLevel::Error, "lenswin", &format!("文字识别失败：{e}"));
         }
     }
 
@@ -1524,7 +1626,8 @@ mod tests {
         assert_eq!(Command::from_hotkey_id(2), Some(Command::ScreenshotCopy));
         assert_eq!(Command::from_hotkey_id(3), Some(Command::PinClipboard));
         assert_eq!(Command::from_hotkey_id(4), Some(Command::PinPassthrough));
-        assert_eq!(Command::from_hotkey_id(5), None);
+        assert_eq!(Command::from_hotkey_id(5), Some(Command::Ocr));
+        assert_eq!(Command::from_hotkey_id(6), None);
         assert_eq!(Command::CloseAllPins.hotkey_id(), None);
         assert_eq!(Command::ClearPinPassthrough.hotkey_id(), None);
         assert_eq!(Command::About.hotkey_id(), None);

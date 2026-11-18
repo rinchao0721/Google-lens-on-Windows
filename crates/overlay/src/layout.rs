@@ -64,6 +64,8 @@ pub enum ToolbarButton {
     Search,
     /// 钉在屏幕上。
     Pin,
+    /// 识别文字。
+    Ocr,
     /// 保存。
     Save,
     /// 取消。
@@ -97,9 +99,10 @@ impl ToolbarButton {
     /// 撤销重做组。
     pub const HISTORY: [ToolbarButton; 2] = [ToolbarButton::Undo, ToolbarButton::Redo];
     /// 动作组。
-    pub const ACTIONS: [ToolbarButton; 5] = [
+    pub const ACTIONS: [ToolbarButton; 6] = [
         ToolbarButton::Search,
         ToolbarButton::Pin,
+        ToolbarButton::Ocr,
         ToolbarButton::Save,
         ToolbarButton::Cancel,
         ToolbarButton::Copy,
@@ -121,6 +124,7 @@ impl ToolbarButton {
             ToolbarButton::Redo => Glyph::Icon('\u{E7A6}'),
             ToolbarButton::Search => Glyph::Icon('\u{E721}'),
             ToolbarButton::Pin => Glyph::Icon('\u{E718}'),
+            ToolbarButton::Ocr => Glyph::Icon('\u{E8E9}'),
             ToolbarButton::Save => Glyph::Icon('\u{E74E}'),
             ToolbarButton::Cancel => Glyph::Icon('\u{E711}'),
             ToolbarButton::Copy => Glyph::Icon('\u{E8C8}'),
@@ -143,6 +147,7 @@ impl ToolbarButton {
             ToolbarButton::Redo => "重",
             ToolbarButton::Search => "搜索",
             ToolbarButton::Pin => "钉",
+            ToolbarButton::Ocr => "识",
             ToolbarButton::Save => "保存",
             ToolbarButton::Cancel => "取消",
             ToolbarButton::Copy => "复制",
@@ -742,18 +747,18 @@ mod tests {
     fn toolbar_single_row_below_right_aligned() {
         let sel = Rect::new(800, 100, 600, 300);
         let layout = bar_of(&sel, &MONITOR);
-        // 16 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
-        assert_eq!(layout.bar, Rect::new(798, 406, 602, 40));
-        assert_eq!(layout.buttons.len(), 16);
+        // 17 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
+        assert_eq!(layout.bar, Rect::new(762, 406, 638, 40));
+        assert_eq!(layout.buttons.len(), 17);
         assert_eq!(layout.separators.len(), 2);
         assert_eq!(layout.strip, None);
         assert_eq!(
             layout.button_rect(ToolbarButton::Tool(Tool::Rectangle)),
-            Some(Rect::new(802, 410, 36, 32))
+            Some(Rect::new(766, 410, 36, 32))
         );
         assert_eq!(
             layout.button_rect(ToolbarButton::Undo),
-            Some(Rect::new(802 + 9 * 36 + 9, 410, 36, 32))
+            Some(Rect::new(766 + 9 * 36 + 9, 410, 36, 32))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
         assert_eq!(copy.right(), 1400 - 4);
@@ -794,7 +799,7 @@ mod tests {
         let full = Rect::new(0, 0, 1920, 1080);
         let bar = bar_of(&full, &MONITOR).bar;
         assert_eq!(bar.y, 1080 - 6 - 40);
-        assert_eq!(bar.x, 1920 - 602);
+        assert_eq!(bar.x, 1920 - 638);
     }
 
     #[test]
@@ -813,7 +818,7 @@ mod tests {
         // 第一行 11 个按钮 + 1 条分隔 + 内边距
         assert_eq!(layout.bar, Rect::new(0, 306, 413, 72));
         assert_eq!(layout.separators.len(), 1);
-        assert_eq!(layout.buttons.len(), 16);
+        assert_eq!(layout.buttons.len(), 17);
         assert_eq!(
             layout.button_rect(ToolbarButton::Search),
             Some(Rect::new(4, 306 + 4 + 32, 36, 32))
@@ -841,7 +846,7 @@ mod tests {
     fn hit_finds_buttons_and_ignores_gaps() {
         let layout = bar_of(&Rect::new(800, 100, 600, 300), &MONITOR);
         assert_eq!(
-            layout.hit(Point::new(806, 420)),
+            layout.hit(Point::new(770, 420)),
             Some(Hit::Button(ToolbarButton::Tool(Tool::Rectangle)))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
@@ -850,10 +855,10 @@ mod tests {
             Some(Hit::Button(ToolbarButton::Copy))
         );
         // 内边距和分隔线不属于任何按钮，但仍在工具栏内
-        assert_eq!(layout.hit(Point::new(799, 407)), None);
-        assert!(layout.covers(Point::new(799, 407)));
-        assert!(!layout.covers(Point::new(797, 407)));
-        assert!(!layout.covers(Point::new(799, 446)));
+        assert_eq!(layout.hit(Point::new(763, 407)), None);
+        assert!(layout.covers(Point::new(763, 407)));
+        assert!(!layout.covers(Point::new(761, 407)));
+        assert!(!layout.covers(Point::new(763, 446)));
     }
 
     #[test]

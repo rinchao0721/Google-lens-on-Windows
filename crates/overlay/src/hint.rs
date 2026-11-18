@@ -41,6 +41,8 @@ pub enum Stage {
     Drawing,
     /// 矩形选区确定后的调整阶段。
     Adjusting,
+    /// OCR 选区确定后的调整阶段。
+    OcrAdjusting,
     /// 常驻选框搜索的调整阶段，松手即重新搜索。
     LiveAdjusting,
     /// 已选中标注工具。
@@ -89,6 +91,17 @@ pub fn hints(stage: Stage, features: Features) -> Vec<Hint> {
             out.push(hint("Shift + 方向键", "缩小选区"));
             out.push(hint("Enter / 双击", "复制"));
             out.push(hint("Ctrl + T", "贴图"));
+            if features.history {
+                out.push(hint(", .", "切换历史选区"));
+            }
+            out.push(hint("右键", "重新框选"));
+            out.push(hint("Esc", "退出"));
+        }
+        Stage::OcrAdjusting => {
+            out.push(hint("方向键", "移动选区"));
+            out.push(hint("Ctrl + 方向键", "扩大选区"));
+            out.push(hint("Shift + 方向键", "缩小选区"));
+            out.push(hint("Enter / 双击", "识别"));
             if features.history {
                 out.push(hint(", .", "切换历史选区"));
             }
@@ -159,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn ocr_adjusting_shows_recognize_without_pin_or_toolbar_keys() {
+        let list = hints(Stage::OcrAdjusting, ALL);
+        assert!(list.contains(&hint("Enter / 双击", "识别")));
+        assert!(list.contains(&hint(", .", "切换历史选区")));
+        assert!(!keys(&list).contains(&"Ctrl + T"));
+        assert!(!keys(&list).contains(&"Ctrl + Z"));
+        assert!(!keys(&list).contains(&"Ctrl + Y"));
+
+        let no_history = hints(Stage::OcrAdjusting, NONE);
+        assert!(!keys(&no_history).contains(&", ."));
+    }
+
+    #[test]
     fn live_adjusting_has_no_nudge_or_copy() {
         let list = keys(&hints(Stage::LiveAdjusting, ALL));
         assert!(!list.contains(&"方向键") && !list.contains(&"Enter / 双击"));
@@ -194,6 +220,7 @@ mod tests {
             Stage::Idle,
             Stage::Drawing,
             Stage::Adjusting,
+            Stage::OcrAdjusting,
             Stage::LiveAdjusting,
             Stage::Annotating,
         ] {
