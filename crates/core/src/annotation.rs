@@ -11,10 +11,15 @@ use crate::config::{
     TEXT_SIZE_RANGE,
 };
 use crate::geometry::{Point, Rect};
-use crate::text_box::TextBox;
+use crate::text_box::{
+    BoxCorner, BoxEdge, PointF, RotatedBox, TextBox, TextHandle, rotation_from_pointer,
+    round_to_i32, snap_rotation,
+};
 
 /// 起止点距离小于该像素数时不生成拖拽类图元。
 pub const MIN_DRAG_DISTANCE: i64 = 2;
+/// 缩放矩形类图元时允许的最小边长（像素）。
+pub const MIN_SHAPE_SIZE: u32 = 2;
 /// 荧光笔颜色的不透明度。
 pub const HIGHLIGHTER_ALPHA: f32 = 0.4;
 /// 箭头头部的最小长度（像素）。
@@ -282,6 +287,8 @@ pub enum Shape {
         color: Color,
         /// 线宽。
         width: u32,
+        /// 顺时针旋转角度（整数度，`0..360`）。
+        rotation: i32,
     },
     /// 椭圆描边，外接矩形的对角点。
     Ellipse {
@@ -293,6 +300,8 @@ pub enum Shape {
         color: Color,
         /// 线宽。
         width: u32,
+        /// 顺时针旋转角度（整数度，`0..360`）。
+        rotation: i32,
     },
     /// 直线。
     Line {
@@ -574,6 +583,15 @@ impl Document {
             })
     }
 
+    /// 命中点的任意图元序号：描边类按描边距离判断，马赛克与序号认整个区域，后添加的优先。
+    pub fn shape_at(&self, p: Point, tolerance: f64) -> Option<usize> {
+        self.shapes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, shape)| shape_hits(shape, p, tolerance).then_some(i))
+    }
+
     fn record(&mut self, step: UndoStep) {
         self.undo.push(step);
         self.redo.clear();
@@ -751,6 +769,488 @@ pub fn mosaic_grid(
         rows,
         colors,
     })
+}
+
+/// 直线或箭头的端点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    /// 起点。
+    From,
+    /// 终点（箭头尖）。
+    To,
+}
+
+/// 已选中图元上可操作的部位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeHandle {
+    /// 图元本体。
+    Body,
+    /// 选中框边缘一带。
+    Border,
+    /// 四角缩放手柄。
+    Corner(BoxCorner),
+    /// 四边中点缩放手柄。
+    Edge(BoxEdge),
+    /// 旋转手柄。
+    Rotate,
+    /// 直线或箭头端点手柄。
+    Endpoint(Endpoint),
+}
+
+impl From<TextHandle> for ShapeHandle {
+    fn from(handle: TextHandle) -> Self {
+        match handle {
+            TextHandle::Body => ShapeHandle::Body,
+            TextHandle::Border => ShapeHandle::Border,
+            TextHandle::Corner(c) => ShapeHandle::Corner(c),
+            TextHandle::Edge(e) => ShapeHandle::Edge(e),
+            TextHandle::Rotate => ShapeHandle::Rotate,
+        }
+    }
+}
+
+fn point_f(p: Point) -> PointF {
+    (f64::from(p.x), f64::from(p.y))
+}
+
+fn rect_end(rect: &Rect) -> (Point, Point) {
+    let right = i32::try_from(rect.right()).unwrap_or(i32::MAX);
+    let bottom = i32::try_from(rect.bottom()).unwrap_or(i32::MAX);
+    (Point::new(rect.x, rect.y), Point::new(right, bottom))
+}
+
+/// 图元在自身本地坐标系下的外接矩形；轨迹点为空时返回 `None`。
+pub fn shape_bounds(shape: &Shape) -> Option<Rect> {
+    match shape {
+        Shape::Rectangle { from, to, .. }
+        | Shape::Ellipse { from, to, .. }
+        | Shape::Line { from, to, .. }
+        | Shape::Arrow { from, to, .. }
+        | Shape::Mosaic { from, to, .. } => Rect::bounding(&[*from, *to]),
+        Shape::Pen { points, .. } | Shape::Highlighter { points, .. } => Rect::bounding(points),
+        Shape::Number { center, size, .. } => {
+            let radius = i64::from(*size) / 2;
+            let left = i64::from(center.x) - radius;
+            let top = i64::from(center.y) - radius;
+            Rect::from_edges(left, top, left + i64::from(*size), top + i64::from(*size))
+        }
+        Shape::Text { bounds, .. } => Some(*bounds),
+    }
+}
+
+/// 图元的旋转框：直线与箭头使用两端点手柄，不显示外接框，返回 `None`。
+pub fn shape_box(shape: &Shape) -> Option<RotatedBox> {
+    let rotation = match shape {
+        Shape::Rectangle { rotation, .. }
+        | Shape::Ellipse { rotation, .. }
+        | Shape::Text { rotation, .. } => *rotation,
+        Shape::Line { .. } | Shape::Arrow { .. } => return None,
+        Shape::Pen { .. }
+        | Shape::Highlighter { .. }
+        | Shape::Mosaic { .. }
+        | Shape::Number { .. } => 0,
+    };
+    Some(RotatedBox::new(shape_bounds(shape)?, rotation))
+}
+
+fn point_to_segment(p: PointF, a: PointF, b: PointF) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    if len_sq <= 0.0 {
+        return (p.0 - a.0).hypot(p.1 - a.1);
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+fn point_in_triangle(p: PointF, a: PointF, b: PointF, c: PointF) -> bool {
+    let cross =
+        |u: PointF, v: PointF, q: PointF| (v.0 - u.0) * (q.1 - u.1) - (v.1 - u.1) * (q.0 - u.0);
+    let (c1, c2, c3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+    let has_neg = c1 < 0.0 || c2 < 0.0 || c3 < 0.0;
+    let has_pos = c1 > 0.0 || c2 > 0.0 || c3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+fn ellipse_border_distance(rbox: &RotatedBox, p: PointF) -> f64 {
+    let local = rbox.to_local(p);
+    let (px, py) = (local.0.abs(), local.1.abs());
+    let (rx, ry) = rbox.half();
+    if rx <= 0.0 || ry <= 0.0 {
+        return (px - rx).max(0.0).hypot((py - ry).max(0.0));
+    }
+    let dist_sq = |angle: f64| {
+        let (s, c) = angle.sin_cos();
+        let dx = rx * c - px;
+        let dy = ry * s - py;
+        dx * dx + dy * dy
+    };
+    let samples = 24usize;
+    let step = std::f64::consts::FRAC_PI_2 / 24.0;
+    let mut best_i = 0usize;
+    let mut best_d = f64::INFINITY;
+    for i in 0..=samples {
+        let idx = i32::try_from(i).unwrap_or(0);
+        let d = dist_sq(f64::from(idx) * step);
+        if d < best_d {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    let lo_idx = i32::try_from(best_i.saturating_sub(1)).unwrap_or(0);
+    let hi_idx = i32::try_from((best_i + 1).min(samples)).unwrap_or(24);
+    let (mut lo, mut hi) = (f64::from(lo_idx) * step, f64::from(hi_idx) * step);
+    for _ in 0..32 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if dist_sq(m1) <= dist_sq(m2) {
+            hi = m2;
+        } else {
+            lo = m1;
+        }
+    }
+    dist_sq((lo + hi) / 2.0).sqrt()
+}
+
+fn trail_distance(points: &[Point], p: PointF) -> f64 {
+    match points {
+        [] => f64::INFINITY,
+        [only] => (p.0 - f64::from(only.x)).hypot(p.1 - f64::from(only.y)),
+        _ => points
+            .windows(2)
+            .filter_map(|pair| {
+                Some(point_to_segment(
+                    p,
+                    point_f(*pair.first()?),
+                    point_f(*pair.get(1)?),
+                ))
+            })
+            .fold(f64::INFINITY, f64::min),
+    }
+}
+
+/// 点 `p` 是否命中图元：描边类只认描边附近（半线宽 + `tolerance`），马赛克与序号认整个区域。
+pub fn shape_hits(shape: &Shape, p: Point, tolerance: f64) -> bool {
+    let pf = point_f(p);
+    let margin = |width: u32| f64::from(width) / 2.0 + tolerance;
+    match shape {
+        Shape::Rectangle { .. } => shape_box(shape)
+            .zip(match shape {
+                Shape::Rectangle { width, .. } => Some(*width),
+                _ => None,
+            })
+            .is_some_and(|(rbox, width)| rbox.border_distance(pf) <= margin(width)),
+        Shape::Ellipse { width, .. } => shape_box(shape)
+            .is_some_and(|rbox| ellipse_border_distance(&rbox, pf) <= margin(*width)),
+        Shape::Line {
+            from, to, width, ..
+        } => point_to_segment(pf, point_f(*from), point_f(*to)) <= margin(*width),
+        Shape::Arrow {
+            from, to, width, ..
+        } => {
+            if point_to_segment(pf, point_f(*from), point_f(*to)) <= margin(*width) {
+                return true;
+            }
+            let Some(head) = arrow_head(*from, *to, *width) else {
+                return false;
+            };
+            let tip = point_f(*to);
+            let left = (
+                tip.0 + f64::from(head.left.0),
+                tip.1 + f64::from(head.left.1),
+            );
+            let right = (
+                tip.0 + f64::from(head.right.0),
+                tip.1 + f64::from(head.right.1),
+            );
+            point_in_triangle(pf, tip, left, right)
+                || point_to_segment(pf, tip, left) <= tolerance
+                || point_to_segment(pf, left, right) <= tolerance
+                || point_to_segment(pf, right, tip) <= tolerance
+        }
+        Shape::Pen { points, width, .. } | Shape::Highlighter { points, width, .. } => {
+            trail_distance(points, pf) <= margin(*width)
+        }
+        Shape::Mosaic { from, to, .. } => {
+            Rect::bounding(&[*from, *to]).is_some_and(|r| r.contains(p))
+        }
+        Shape::Number { center, size, .. } => {
+            (pf.0 - f64::from(center.x)).hypot(pf.1 - f64::from(center.y)) <= f64::from(*size) / 2.0
+        }
+        Shape::Text {
+            bounds,
+            rotation,
+            vertical,
+            ..
+        } => TextBox {
+            bounds: *bounds,
+            rotation: *rotation,
+            vertical: *vertical,
+        }
+        .contains(pf),
+    }
+}
+
+/// 命中已选中图元的哪个部位；手柄优先于本体，本体按外接框（旋转后）命中。
+pub fn hit_selected_shape(
+    shape: &Shape,
+    p: Point,
+    tolerance: f64,
+    rotate_distance: f64,
+) -> Option<ShapeHandle> {
+    let pf = point_f(p);
+    match shape {
+        Shape::Rectangle { .. } | Shape::Ellipse { .. } => shape_box(shape)?
+            .hit_handles(pf, tolerance, Some(rotate_distance), &BoxEdge::ALL, false)
+            .map(ShapeHandle::from),
+        Shape::Pen { .. } | Shape::Highlighter { .. } | Shape::Mosaic { .. } => shape_box(shape)?
+            .hit_handles(pf, tolerance, None, &BoxEdge::ALL, false)
+            .map(ShapeHandle::from),
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            let d_from = (pf.0 - f64::from(from.x)).hypot(pf.1 - f64::from(from.y));
+            let d_to = (pf.0 - f64::from(to.x)).hypot(pf.1 - f64::from(to.y));
+            if d_from <= tolerance || d_to <= tolerance {
+                let endpoint = if d_to <= d_from {
+                    Endpoint::To
+                } else {
+                    Endpoint::From
+                };
+                return Some(ShapeHandle::Endpoint(endpoint));
+            }
+            shape_hits(shape, p, tolerance).then_some(ShapeHandle::Body)
+        }
+        Shape::Number { .. } => shape_hits(shape, p, tolerance).then_some(ShapeHandle::Body),
+        Shape::Text {
+            bounds,
+            rotation,
+            vertical,
+            ..
+        } => TextBox {
+            bounds: *bounds,
+            rotation: *rotation,
+            vertical: *vertical,
+        }
+        .hit(pf, tolerance, rotate_distance)
+        .map(ShapeHandle::from),
+    }
+}
+
+fn shift_point(p: Point, dx: i32, dy: i32) -> Point {
+    Point::new(p.x.saturating_add(dx), p.y.saturating_add(dy))
+}
+
+/// 平移图元 `(dx, dy)` 像素（饱和加法，不溢出）。
+pub fn translate_shape(shape: &Shape, dx: i32, dy: i32) -> Shape {
+    let mut moved = shape.clone();
+    match &mut moved {
+        Shape::Rectangle { from, to, .. }
+        | Shape::Ellipse { from, to, .. }
+        | Shape::Line { from, to, .. }
+        | Shape::Arrow { from, to, .. }
+        | Shape::Mosaic { from, to, .. } => {
+            *from = shift_point(*from, dx, dy);
+            *to = shift_point(*to, dx, dy);
+        }
+        Shape::Pen { points, .. } | Shape::Highlighter { points, .. } => {
+            for pt in points {
+                *pt = shift_point(*pt, dx, dy);
+            }
+        }
+        Shape::Number { center, .. } => *center = shift_point(*center, dx, dy),
+        Shape::Text { origin, bounds, .. } => {
+            *origin = shift_point(*origin, dx, dy);
+            bounds.x = bounds.x.saturating_add(dx);
+            bounds.y = bounds.y.saturating_add(dy);
+        }
+    }
+    moved
+}
+
+/// 按外接框从 `from` 到 `to` 缩放全部轨迹点，`flip_x` / `flip_y` 为真时沿对应轴翻转。
+pub fn scale_points(
+    points: &[Point],
+    from: &Rect,
+    to: &Rect,
+    flip_x: bool,
+    flip_y: bool,
+) -> Vec<Point> {
+    points
+        .iter()
+        .map(|p| {
+            let x = if from.width == 0 {
+                f64::from(to.x) + f64::from(to.width) / 2.0
+            } else {
+                let ratio = (f64::from(p.x) - f64::from(from.x)) / f64::from(from.width);
+                let t = if flip_x { 1.0 - ratio } else { ratio };
+                f64::from(to.x) + t * f64::from(to.width)
+            };
+            let y = if from.height == 0 {
+                f64::from(to.y) + f64::from(to.height) / 2.0
+            } else {
+                let ratio = (f64::from(p.y) - f64::from(from.y)) / f64::from(from.height);
+                let t = if flip_y { 1.0 - ratio } else { ratio };
+                f64::from(to.y) + t * f64::from(to.height)
+            };
+            Point::new(round_to_i32(x), round_to_i32(y))
+        })
+        .collect()
+}
+
+fn clamp_endpoint(fixed: Point, target: Point, fallback: Point) -> Point {
+    if drag_is_valid(fixed, target) {
+        return target;
+    }
+    let dx = f64::from(target.x) - f64::from(fixed.x);
+    let dy = f64::from(target.y) - f64::from(fixed.y);
+    let len = dx.hypot(dy);
+    if len <= 0.0 {
+        return fallback;
+    }
+    let pushed = Point::new(
+        fixed.x.saturating_add(round_to_i32(dx * 2.5 / len)),
+        fixed.y.saturating_add(round_to_i32(dy * 2.5 / len)),
+    );
+    if drag_is_valid(fixed, pushed) {
+        pushed
+    } else {
+        fallback
+    }
+}
+
+fn resize_box(
+    bounds: Rect,
+    rotation: i32,
+    handle: ShapeHandle,
+    pointer: Point,
+    shift: bool,
+    min_size: (u32, u32),
+) -> (Rect, i32, bool, bool) {
+    let rbox = RotatedBox::new(bounds, rotation);
+    let pf = point_f(pointer);
+    match handle {
+        ShapeHandle::Corner(corner) => {
+            let (next, fx, fy) = rbox.resize_corner(corner, pf, shift, min_size);
+            (next, rbox.rotation, fx, fy)
+        }
+        ShapeHandle::Edge(edge) => {
+            let (next, fx, fy) = rbox.resize_edge(edge, pf, min_size);
+            (next, rbox.rotation, fx, fy)
+        }
+        ShapeHandle::Rotate => {
+            let next_rot = match rotation_from_pointer(rbox.center(), pf, false) {
+                Some(raw) if shift => snap_rotation(raw),
+                Some(raw) => raw,
+                None => rbox.rotation,
+            };
+            (bounds, next_rot, false, false)
+        }
+        _ => (bounds, rbox.rotation, false, false),
+    }
+}
+
+fn resize_rect_endpoints(
+    from: Point,
+    to: Point,
+    rotation: i32,
+    handle: ShapeHandle,
+    pointer: Point,
+    shift: bool,
+) -> Option<(Point, Point, i32)> {
+    let bounds = Rect::bounding(&[from, to])?;
+    let (next, next_rot, _, _) = resize_box(
+        bounds,
+        rotation,
+        handle,
+        pointer,
+        shift,
+        (MIN_SHAPE_SIZE, MIN_SHAPE_SIZE),
+    );
+    let (nf, nt) = rect_end(&next);
+    Some((nf, nt, next_rot))
+}
+
+fn resize_segment_endpoints(
+    from: Point,
+    to: Point,
+    handle: ShapeHandle,
+    pointer: Point,
+    shift: bool,
+) -> (Point, Point) {
+    let ShapeHandle::Endpoint(endpoint) = handle else {
+        return (from, to);
+    };
+    let (fixed, old_moving) = match endpoint {
+        Endpoint::From => (to, from),
+        Endpoint::To => (from, to),
+    };
+    let raw = if shift {
+        snap_angle(fixed, pointer)
+    } else {
+        pointer
+    };
+    let moved = clamp_endpoint(fixed, raw, old_moving);
+    match endpoint {
+        Endpoint::From => (moved, fixed),
+        Endpoint::To => (fixed, moved),
+    }
+}
+
+fn resize_trail_points(
+    points: &[Point],
+    handle: ShapeHandle,
+    pointer: Point,
+    shift: bool,
+) -> Option<Vec<Point>> {
+    if matches!(handle, ShapeHandle::Rotate) {
+        return None;
+    }
+    let bounds = Rect::bounding(points)?;
+    let min_w = if bounds.width == 0 { 0 } else { MIN_SHAPE_SIZE };
+    let min_h = if bounds.height == 0 {
+        0
+    } else {
+        MIN_SHAPE_SIZE
+    };
+    let (next, _, fx, fy) = resize_box(bounds, 0, handle, pointer, shift, (min_w, min_h));
+    Some(scale_points(points, &bounds, &next, fx, fy))
+}
+
+/// 按选中的手柄拖动到 `pointer` 后得到的新图元；`shift` 控制等比、15° 旋转或 45° 线角吸附。
+pub fn resize_shape(shape: &Shape, handle: ShapeHandle, pointer: Point, shift: bool) -> Shape {
+    let mut updated = shape.clone();
+    match &mut updated {
+        Shape::Rectangle {
+            from, to, rotation, ..
+        }
+        | Shape::Ellipse {
+            from, to, rotation, ..
+        } => {
+            if let Some((nf, nt, next_rot)) =
+                resize_rect_endpoints(*from, *to, *rotation, handle, pointer, shift)
+            {
+                *from = nf;
+                *to = nt;
+                *rotation = next_rot;
+            }
+        }
+        Shape::Mosaic { from, to, .. } if !matches!(handle, ShapeHandle::Rotate) => {
+            if let Some((nf, nt, _)) = resize_rect_endpoints(*from, *to, 0, handle, pointer, shift)
+            {
+                *from = nf;
+                *to = nt;
+            }
+        }
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            (*from, *to) = resize_segment_endpoints(*from, *to, handle, pointer, shift);
+        }
+        Shape::Pen { points, .. } | Shape::Highlighter { points, .. } => {
+            if let Some(scaled) = resize_trail_points(points, handle, pointer, shift) {
+                *points = scaled;
+            }
+        }
+        Shape::Mosaic { .. } | Shape::Number { .. } | Shape::Text { .. } => {}
+    }
+    updated
 }
 
 #[cfg(test)]
@@ -1217,5 +1717,284 @@ mod tests {
         assert_eq!((grid.cols, grid.rows), (1, 1));
         // x∈{2,3,4} 平均 3，y∈{2,3} 平均 2.5 → 3
         assert_eq!(grid.colors, vec![Color::rgb(3, 3, 7)]);
+    }
+
+    fn rect_shape(from: Point, to: Point, width: u32, rotation: i32) -> Shape {
+        Shape::Rectangle {
+            from,
+            to,
+            color: PALETTE[0],
+            width,
+            rotation,
+        }
+    }
+
+    fn ellipse_shape(from: Point, to: Point, width: u32, rotation: i32) -> Shape {
+        Shape::Ellipse {
+            from,
+            to,
+            color: PALETTE[1],
+            width,
+            rotation,
+        }
+    }
+
+    #[test]
+    fn shape_bounds_and_box_handle_all_shapes_and_edges() {
+        let r = rect_shape(p(200, 150), p(100, 100), 4, 359);
+        assert_eq!(shape_bounds(&r), Some(Rect::new(100, 100, 100, 50)));
+        assert_eq!(
+            shape_box(&r),
+            Some(RotatedBox::new(Rect::new(100, 100, 100, 50), 359))
+        );
+        let l = Shape::Line {
+            from: p(10, 20),
+            to: p(50, 60),
+            color: PALETTE[0],
+            width: 3,
+        };
+        assert_eq!(shape_bounds(&l), Some(Rect::new(10, 20, 40, 40)));
+        assert_eq!(shape_box(&l), None);
+        let a = Shape::Arrow {
+            from: p(-50, -20),
+            to: p(-10, -40),
+            color: PALETTE[0],
+            width: 3,
+        };
+        assert_eq!(shape_bounds(&a), Some(Rect::new(-50, -40, 40, 20)));
+        assert_eq!(shape_box(&a), None);
+        let empty_pen = Shape::Pen {
+            points: Vec::new(),
+            color: PALETTE[0],
+            width: 2,
+        };
+        assert_eq!(shape_bounds(&empty_pen), None);
+        let num = Shape::Number {
+            center: p(100, 100),
+            value: 1,
+            style: NumberStyle::Number,
+            color: PALETTE[0],
+            size: 20,
+        };
+        assert_eq!(shape_bounds(&num), Some(Rect::new(90, 90, 20, 20)));
+        assert_eq!(
+            shape_box(&num),
+            Some(RotatedBox::new(Rect::new(90, 90, 20, 20), 0))
+        );
+    }
+
+    #[test]
+    fn shape_hits_strokes_only_near_border_and_fills_mosaic_number() {
+        let rect = rect_shape(p(100, 100), p(200, 180), 4, 0);
+        // 空心内部不命中，边线附近命中
+        assert!(!shape_hits(&rect, p(150, 140), 6.0));
+        assert!(shape_hits(&rect, p(100, 140), 6.0));
+        assert!(shape_hits(&rect, p(93, 140), 6.0));
+        assert!(!shape_hits(&rect, p(90, 140), 6.0));
+
+        // 旋转 90° 的矩形（中心 150, 140，原 100x80 旋转后上下边在 y = 140 ± 50）
+        let rot_rect = rect_shape(p(100, 100), p(200, 180), 2, 90);
+        assert!(shape_hits(&rot_rect, p(150, 90), 6.0));
+        assert!(!shape_hits(&rot_rect, p(150, 140), 6.0));
+
+        let ell = ellipse_shape(p(100, 100), p(220, 160), 4, 0);
+        assert!(!shape_hits(&ell, p(160, 130), 6.0));
+        assert!(shape_hits(&ell, p(160, 100), 6.0));
+        assert!(shape_hits(&ell, p(220, 130), 6.0));
+        // 旋转 90° 后椭圆顶端点落在 (160, 70) 与 (160, 190)
+        let rot_ell = ellipse_shape(p(100, 100), p(220, 160), 4, 90);
+        assert!(shape_hits(&rot_ell, p(160, 70), 6.0));
+        assert!(!shape_hits(&rot_ell, p(220, 130), 6.0));
+
+        let arrow = Shape::Arrow {
+            from: p(0, 0),
+            to: p(100, 0),
+            color: PALETTE[0],
+            width: 2,
+        };
+        assert!(shape_hits(&arrow, p(50, 5), 6.0));
+        assert!(shape_hits(&arrow, p(92, 4), 2.0));
+        assert!(!shape_hits(&arrow, p(50, 20), 6.0));
+
+        let pen = Shape::Pen {
+            points: vec![p(0, 0), p(50, 0), p(50, 50)],
+            color: PALETTE[0],
+            width: 4,
+        };
+        assert!(shape_hits(&pen, p(50, 25), 6.0));
+        assert!(!shape_hits(&pen, p(10, 40), 6.0));
+
+        let mosaic = Shape::Mosaic {
+            from: p(-40, -40),
+            to: p(-10, -10),
+            block: 8,
+        };
+        assert!(shape_hits(&mosaic, p(-25, -25), 6.0));
+        assert!(!shape_hits(&mosaic, p(-10, -10), 6.0));
+
+        let num = Shape::Number {
+            center: p(50, 50),
+            value: 1,
+            style: NumberStyle::Number,
+            color: PALETTE[0],
+            size: 20,
+        };
+        assert!(shape_hits(&num, p(50, 50), 6.0));
+        assert!(shape_hits(&num, p(60, 50), 6.0));
+        assert!(!shape_hits(&num, p(61, 50), 6.0));
+    }
+
+    #[test]
+    fn document_shape_at_picks_topmost_shape() {
+        let mut doc = Document::new();
+        doc.push(rect_shape(p(0, 0), p(100, 100), 4, 0));
+        doc.push(Shape::Line {
+            from: p(0, 50),
+            to: p(100, 50),
+            color: PALETTE[1],
+            width: 4,
+        });
+        assert_eq!(doc.shape_at(p(0, 50), 6.0), Some(1));
+        assert_eq!(doc.shape_at(p(50, 0), 6.0), Some(0));
+        // 矩形空心处不命中
+        assert_eq!(doc.shape_at(p(50, 20), 6.0), None);
+    }
+
+    #[test]
+    fn hit_selected_shape_prioritizes_handles_and_allows_interior_body_drag() {
+        let rect = rect_shape(p(100, 100), p(200, 160), 4, 0);
+        // 选中图元本体按外接框命中，空心内部也可以直接拖动
+        assert_eq!(
+            hit_selected_shape(&rect, p(150, 130), 6.0, 24.0),
+            Some(ShapeHandle::Body)
+        );
+        assert_eq!(
+            hit_selected_shape(&rect, p(100, 100), 6.0, 24.0),
+            Some(ShapeHandle::Corner(BoxCorner::TopLeft))
+        );
+        assert_eq!(
+            hit_selected_shape(&rect, p(200, 130), 6.0, 24.0),
+            Some(ShapeHandle::Edge(BoxEdge::Right))
+        );
+        assert_eq!(
+            hit_selected_shape(&rect, p(150, 76), 6.0, 24.0),
+            Some(ShapeHandle::Rotate)
+        );
+        // 马赛克没有旋转手柄
+        let mosaic = Shape::Mosaic {
+            from: p(100, 100),
+            to: p(200, 160),
+            block: 8,
+        };
+        assert_eq!(hit_selected_shape(&mosaic, p(150, 76), 6.0, 24.0), None);
+        // 直线/箭头只命中两端点或本体
+        let arrow = Shape::Arrow {
+            from: p(10, 10),
+            to: p(100, 10),
+            color: PALETTE[0],
+            width: 4,
+        };
+        assert_eq!(
+            hit_selected_shape(&arrow, p(10, 10), 6.0, 24.0),
+            Some(ShapeHandle::Endpoint(Endpoint::From))
+        );
+        assert_eq!(
+            hit_selected_shape(&arrow, p(100, 10), 6.0, 24.0),
+            Some(ShapeHandle::Endpoint(Endpoint::To))
+        );
+        assert_eq!(
+            hit_selected_shape(&arrow, p(50, 10), 6.0, 24.0),
+            Some(ShapeHandle::Body)
+        );
+    }
+
+    #[test]
+    fn translate_and_scale_points_cover_negative_zero_and_flips() {
+        let moved = translate_shape(&rect_shape(p(10, 20), p(50, 60), 2, 45), -30, -40);
+        assert_eq!(moved, rect_shape(p(-20, -20), p(20, 20), 2, 45));
+
+        let moved_text = translate_shape(&text("hi", 10), -5, 15);
+        assert_eq!(shape_bounds(&moved_text), Some(Rect::new(5, 15, 20, 20)));
+
+        let pts = vec![p(100, 100), p(120, 140), p(200, 180)];
+        let from = Rect::new(100, 100, 100, 80);
+        let to = Rect::new(0, 0, 200, 160);
+        assert_eq!(
+            scale_points(&pts, &from, &to, false, false),
+            vec![p(0, 0), p(40, 80), p(200, 160)]
+        );
+        // 水平翻转
+        assert_eq!(
+            scale_points(&pts, &from, &to, true, false),
+            vec![p(200, 0), p(160, 80), p(0, 160)]
+        );
+        // 零宽度轨迹缩放不出现 NaN
+        let flat = vec![p(50, 10), p(50, 50)];
+        let flat_bounds = Rect::new(50, 10, 0, 40);
+        assert_eq!(
+            scale_points(&flat, &flat_bounds, &Rect::new(80, 20, 0, 80), false, true),
+            vec![p(80, 100), p(80, 20)]
+        );
+    }
+
+    #[test]
+    fn resize_shape_handles_rotation_flip_shift_and_min_size() {
+        let r = rect_shape(p(100, 100), p(200, 150), 4, 0);
+        let rotated = resize_shape(&r, ShapeHandle::Rotate, p(250, 125), false);
+        assert!(matches!(rotated, Shape::Rectangle { rotation: 90, .. }));
+        let snapped = resize_shape(&r, ShapeHandle::Rotate, p(250, 95), true);
+        assert!(matches!(snapped, Shape::Rectangle { rotation: 75, .. }));
+
+        // Shift 拖角保持宽高比 (100x50 = 2:1)
+        let kept = resize_shape(
+            &r,
+            ShapeHandle::Corner(BoxCorner::BottomRight),
+            p(300, 160),
+            true,
+        );
+        assert_eq!(shape_bounds(&kept), Some(Rect::new(100, 100, 200, 100)));
+
+        // 拖过对边翻转且夹紧最小尺寸 2x2
+        let flipped = resize_shape(
+            &r,
+            ShapeHandle::Corner(BoxCorner::BottomRight),
+            p(60, 70),
+            false,
+        );
+        assert_eq!(shape_bounds(&flipped), Some(Rect::new(60, 70, 40, 30)));
+        let min_clamped = resize_shape(
+            &r,
+            ShapeHandle::Corner(BoxCorner::BottomRight),
+            p(100, 100),
+            false,
+        );
+        assert_eq!(shape_bounds(&min_clamped), Some(Rect::new(100, 100, 2, 2)));
+
+        // 直线端点拖拽支持 Shift 45° 吸附且不会缩成零长度
+        let l = Shape::Line {
+            from: p(100, 100),
+            to: p(200, 100),
+            color: PALETTE[0],
+            width: 3,
+        };
+        let snapped_line = resize_shape(&l, ShapeHandle::Endpoint(Endpoint::To), p(200, 110), true);
+        assert!(matches!(
+            snapped_line,
+            Shape::Line { from, to, .. } if from == p(100, 100) && to == p(200, 100)
+        ));
+        let collapsed = resize_shape(&l, ShapeHandle::Endpoint(Endpoint::To), p(100, 100), false);
+        assert!(matches!(collapsed, Shape::Line { from, to, .. } if drag_is_valid(from, to)));
+
+        // 画笔按外接框缩放与翻转
+        let pen = Shape::Pen {
+            points: vec![p(100, 100), p(120, 140), p(180, 140)],
+            color: PALETTE[0],
+            width: 4,
+        };
+        let flipped_pen = resize_shape(&pen, ShapeHandle::Edge(BoxEdge::Right), p(20, 120), false);
+        assert!(matches!(
+            flipped_pen,
+            Shape::Pen { points, .. } if points == vec![p(100, 100), p(80, 140), p(20, 140)]
+        ));
     }
 }

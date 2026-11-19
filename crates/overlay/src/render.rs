@@ -48,7 +48,9 @@ use windows::Win32::System::Com::{
 use windows::core::{BOOL, Interface, PCWSTR, w};
 
 use crate::adjust;
-use crate::annotate::{StyleView, TextBoxView, TextLayout, TextMeasure, text_padding};
+use crate::annotate::{
+    BoxAxis, BoxKind, SelectionBox, StyleView, TextLayout, TextMeasure, text_padding,
+};
 use crate::error::{OverlayError, win32};
 use crate::glow::{self, Edge, GlowFrame, Rgb};
 use crate::hint::Hint;
@@ -57,7 +59,7 @@ use crate::layout::{self, Glyph, Hit, MagnifierLayout, ToolbarButton};
 use crate::modes::Preview;
 use crate::paint::{self, DWriteMeasure, FrameRef, Painter, TextBlock};
 use crate::stroke::{self, PointF};
-use lenswin_core::text_box::round_to_i32;
+use lenswin_core::text_box::{BoxEdge, RotatedBox, round_to_i32};
 
 /// 选框描边宽度（像素，96 DPI 下）。
 const OUTLINE_WIDTH: u32 = 2;
@@ -733,8 +735,8 @@ impl TargetResources {
         if let Some(editor) = &view.editor {
             self.draw_editor(editor, surface);
         }
-        if let Some(text_box) = &view.text_box {
-            self.draw_text_box(text_box, surface);
+        if let Some(selection) = &view.selection_box {
+            self.draw_selection_box(selection, surface);
         }
         if let Some(r) = view.label {
             self.draw_label(&r, surface);
@@ -1486,89 +1488,138 @@ impl TargetResources {
         }
     }
 
-    /// 选中或编辑中的文字文本框：随文字旋转的虚线框和手柄；只画在屏幕上，不进入成图。
-    fn draw_text_box(&self, view: &TextBoxView, surface: &Surface<'_>) {
-        let geometry = &view.geometry;
-        let origin = surface.origin;
-        let at = |p: (f64, f64)| {
-            let (x, y) = (round_to_i32(p.0) - origin.x, round_to_i32(p.1) - origin.y);
-            float_point(to_f32(i64::from(x)), to_f32(i64::from(y)))
+    fn box_point(&self, p: (f64, f64), origin: Point) -> D2D1_ELLIPSE {
+        let (x, y) = (round_to_i32(p.0) - origin.x, round_to_i32(p.1) - origin.y);
+        float_point(to_f32(i64::from(x)), to_f32(i64::from(y)))
+    }
+
+    fn draw_handle_circle(&self, center: (f64, f64), radius: f32, origin: Point) {
+        let mut circle = self.box_point(center, origin);
+        circle.radiusX = radius;
+        circle.radiusY = radius;
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，椭圆为局部变量，画刷有效。
+        unsafe {
+            self.target.FillEllipse(&circle, &self.brushes.white);
+            self.target
+                .DrawEllipse(&circle, &self.brushes.accent, 1.5, None);
+        }
+    }
+
+    fn draw_edge_bar(
+        &self,
+        center: (f64, f64),
+        edge: BoxEdge,
+        rotation: i32,
+        origin: Point,
+        painter: &Painter<'_>,
+    ) {
+        let (along, across) = (self.px(14), self.px(4));
+        let (half_w, half_h) = match edge {
+            BoxEdge::Left | BoxEdge::Right => (across / 2.0, along / 2.0),
+            BoxEdge::Top | BoxEdge::Bottom => (along / 2.0, across / 2.0),
         };
+        let point = self.box_point(center, origin).point;
+        let bar = D2D_RECT_F {
+            left: point.X - half_w,
+            top: point.Y - half_h,
+            right: point.X + half_w,
+            bottom: point.Y + half_h,
+        };
+        painter.set_rotation((point.X, point.Y), rotation);
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+        unsafe {
+            self.target.FillRectangle(&bar, &self.brushes.white);
+            self.target
+                .DrawRectangle(&bar, &self.brushes.accent, 1.5, None);
+        }
+        painter.reset_transform();
+    }
+
+    fn draw_box_outline(&self, geometry: &RotatedBox, origin: Point) {
         let corners = geometry.corners();
         // 先画一圈半透明深色，再画白色虚线，任何底色上都看得见
+        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+        unsafe { self.brushes.swatch.SetColor(&color(0.0, 0.0, 0.0, 0.45)) };
         for (width, brush, stroke) in [
             (3.0, &self.brushes.swatch, &self.round_stroke),
             (1.0, &self.brushes.white, &self.dash_stroke),
         ] {
-            if width > 1.5 {
-                // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
-                unsafe { self.brushes.swatch.SetColor(&color(0.0, 0.0, 0.0, 0.45)) };
-            }
             for (a, b) in corners.iter().zip(corners.iter().cycle().skip(1)) {
                 // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
                 unsafe {
-                    self.target
-                        .DrawLine(at(*a).point, at(*b).point, brush, width, stroke);
+                    self.target.DrawLine(
+                        self.box_point(*a, origin).point,
+                        self.box_point(*b, origin).point,
+                        brush,
+                        width,
+                        stroke,
+                    );
                 }
             }
         }
-        let dpi_scale = |v: u32| self.px(v);
-        let dot = dpi_scale(5);
-        let rotate_distance = f64::from(layout::text_rotate_distance(self.dpi));
-        let stem_from = geometry.to_screen(if geometry.vertical {
-            (f64::from(geometry.bounds.width) / 2.0, 0.0)
-        } else {
-            (0.0, -f64::from(geometry.bounds.height) / 2.0)
-        });
-        let rotate_at = geometry.rotate_handle(rotate_distance);
-        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷与线型有效。
-        unsafe {
-            self.target.DrawLine(
-                at(stem_from).point,
-                at(rotate_at).point,
-                &self.brushes.white,
-                1.0,
-                None,
-            );
+    }
+
+    fn draw_box_handles(&self, geometry: &RotatedBox, kind: BoxKind, origin: Point) {
+        if kind == BoxKind::Plain {
+            return;
         }
-        let mut marks: Vec<(f32, (f64, f64))> =
-            geometry.corners().into_iter().map(|p| (dot, p)).collect();
-        marks.push((dpi_scale(6), rotate_at));
-        for (radius, point) in marks {
-            let mut circle = at(point);
-            circle.radiusX = radius;
-            circle.radiusY = radius;
-            // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，椭圆为局部变量，画刷有效。
-            unsafe {
-                self.target.FillEllipse(&circle, &self.brushes.white);
-                self.target
-                    .DrawEllipse(&circle, &self.brushes.accent, 1.5, None);
-            }
-        }
-        // 换行边手柄是沿边方向的短条，随框旋转
-        let painter = self.plain_painter(&[]);
-        let (along, across) = (dpi_scale(14), dpi_scale(4));
-        for (_, point) in geometry.edge_handles() {
-            let center = at(point).point;
-            let (half_w, half_h) = if geometry.vertical {
-                (along / 2.0, across / 2.0)
-            } else {
-                (across / 2.0, along / 2.0)
-            };
-            let bar = D2D_RECT_F {
-                left: center.X - half_w,
-                top: center.Y - half_h,
-                right: center.X + half_w,
-                bottom: center.Y + half_h,
-            };
-            painter.set_rotation((center.X, center.Y), geometry.rotation);
+        let rotate_side = match kind {
+            BoxKind::Rotatable => Some(false),
+            BoxKind::Text(axis) => Some(axis == BoxAxis::Vertical),
+            BoxKind::Scalable | BoxKind::Plain => None,
+        };
+        if let Some(right_side) = rotate_side {
+            let distance = f64::from(layout::text_rotate_distance(self.dpi));
+            let (hw, hh) = geometry.half();
+            let stem_from = geometry.to_screen(if right_side { (hw, 0.0) } else { (0.0, -hh) });
+            let rotate_at = geometry.rotate_handle(distance, right_side);
             // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
             unsafe {
-                self.target.FillRectangle(&bar, &self.brushes.white);
-                self.target
-                    .DrawRectangle(&bar, &self.brushes.accent, 1.5, None);
+                self.target.DrawLine(
+                    self.box_point(stem_from, origin).point,
+                    self.box_point(rotate_at, origin).point,
+                    &self.brushes.white,
+                    1.0,
+                    None,
+                );
             }
-            painter.reset_transform();
+            self.draw_handle_circle(rotate_at, self.px(6), origin);
+        }
+        let dot = self.px(5);
+        for corner in geometry.corners() {
+            self.draw_handle_circle(corner, dot, origin);
+        }
+        let edges: &[BoxEdge] = match kind {
+            BoxKind::Rotatable | BoxKind::Scalable => &BoxEdge::ALL,
+            BoxKind::Text(BoxAxis::Horizontal) => &[BoxEdge::Left, BoxEdge::Right],
+            BoxKind::Text(BoxAxis::Vertical) => &[BoxEdge::Top, BoxEdge::Bottom],
+            BoxKind::Plain => &[],
+        };
+        let painter = self.plain_painter(&[]);
+        for &edge in edges {
+            self.draw_edge_bar(
+                geometry.edge_center(edge),
+                edge,
+                geometry.rotation,
+                origin,
+                &painter,
+            );
+        }
+    }
+
+    /// 选中或编辑中的图元选框和手柄；只画在屏幕上，不进入成图。
+    fn draw_selection_box(&self, selection: &SelectionBox, surface: &Surface<'_>) {
+        match selection {
+            SelectionBox::Endpoints { from, to } => {
+                let dot = self.px(5);
+                for p in [from, to] {
+                    self.draw_handle_circle((f64::from(p.x), f64::from(p.y)), dot, surface.origin);
+                }
+            }
+            SelectionBox::Box { geometry, kind } => {
+                self.draw_box_outline(geometry, surface.origin);
+                self.draw_box_handles(geometry, *kind, surface.origin);
+            }
         }
     }
 
@@ -2287,6 +2338,7 @@ mod tests {
             to: Point::new(125, 75),
             color: RED,
             width: 2,
+            rotation: 0,
         };
         let image = compose(&grey_frame(), &FRAME, &[rect]);
         // 线宽 2 以边为中心，恰好盖住 x=4、5 两列
@@ -2304,6 +2356,7 @@ mod tests {
             to: Point::new(125, 75),
             color: RED,
             width: 2,
+            rotation: 0,
         };
         // 选区只取右下角，与矩形没有重叠
         let image = compose(&grey_frame(), &Rect::new(128, 78, 10, 2), &[rect]);
@@ -2321,6 +2374,7 @@ mod tests {
                 to: Point::new(125, 75),
                 color: RED,
                 width: 2,
+                rotation: 0,
             }],
         );
         assert_eq!(pixel(&image, 2, 5), (0xFF, 0x3B, 0x30, 255));
@@ -2416,6 +2470,7 @@ mod tests {
             to: Point::new(140, 80),
             color: RED,
             width: 30,
+            rotation: 0,
         };
         let mosaic = Shape::Mosaic {
             from: Point::new(110, 60),
@@ -2466,12 +2521,14 @@ mod tests {
             to: Point::new(125, 75),
             color: RED,
             width: 6,
+            rotation: 0,
         };
         let blue = Shape::Rectangle {
             from: Point::new(105, 55),
             to: Point::new(125, 75),
             color: Color::rgb(0, 0, 255),
             width: 6,
+            rotation: 0,
         };
         let a = compose(&grey_frame(), &FRAME, &[red.clone(), blue.clone()]);
         let b = compose(&grey_frame(), &FRAME, &[blue, red]);
@@ -2955,5 +3012,37 @@ mod tests {
             .expect("上一列");
         assert!(back <= 1, "{back}");
         assert_eq!(m.step_block("中文\n中文", 24, COLUMNS, 0, false), None);
+    }
+
+    #[test]
+    fn rotated_rectangle_draws_turned_sides() {
+        let rect = Shape::Rectangle {
+            from: Point::new(70, 40),
+            to: Point::new(170, 80),
+            color: RED,
+            width: 4,
+            rotation: 90,
+        };
+        let image = compose_big(&[rect]);
+        // 围绕中心 (120, 60) 旋转 90° 后，左右长边转为上下短边，落在 y=10 和 y=110 处
+        assert!(is_reddish(pixel(&image, 120, 10)));
+        assert!(is_reddish(pixel(&image, 120, 110)));
+        // 原未旋转时左边中点 (70, 60) 不再有描边
+        assert_eq!(pixel(&image, 70, 60), (200, 200, 200, 255));
+    }
+
+    #[test]
+    fn rotated_ellipse_draws_turned_axes() {
+        let ellipse = Shape::Ellipse {
+            from: Point::new(70, 40),
+            to: Point::new(170, 80),
+            color: RED,
+            width: 4,
+            rotation: 90,
+        };
+        let image = compose_big(&[ellipse]);
+        assert!(is_reddish(pixel(&image, 120, 10)));
+        assert!(is_reddish(pixel(&image, 120, 110)));
+        assert_eq!(pixel(&image, 70, 60), (200, 200, 200, 255));
     }
 }

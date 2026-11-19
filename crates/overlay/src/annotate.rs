@@ -5,22 +5,64 @@
 use std::rc::Rc;
 
 use lenswin_core::annotation::{
-    Color, Document, NumberStyle, PALETTE, Shape, Tool, constrain_square, drag_is_valid,
-    palette_index, snap_angle, step_size,
+    Color, Document, NumberStyle, PALETTE, Shape, ShapeHandle, Tool, constrain_square,
+    drag_is_valid, hit_selected_shape, palette_index, resize_shape, shape_box, snap_angle,
+    step_size, translate_shape,
 };
 use lenswin_core::config::TEXT_SIZE_RANGE;
 use lenswin_core::config::{
     AnnotateConfig, HighlighterConfig, MosaicConfig, NumberConfig, StrokeConfig, TextConfig,
 };
 use lenswin_core::geometry::{Point, Rect};
-use lenswin_core::text_box::max_text_size;
+use lenswin_core::text_box::{RotatedBox, max_text_size};
 
 mod text;
 
-pub use text::{
-    ApproxMeasure, EditKey, EditView, TextBoxView, TextLayout, TextMeasure, text_padding,
-};
-use text::{Editing, TextAdjust};
+#[cfg(test)]
+pub use text::TextBoxView;
+pub use text::{ApproxMeasure, EditKey, EditView, TextLayout, TextMeasure, text_padding};
+use text::{EditAdjust, Editing, to_f64};
+
+/// 文字排版方向：决定换行边手柄和旋转手柄的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxAxis {
+    /// 横排：左右边调换行，旋转手柄在上方。
+    Horizontal,
+    /// 竖排：上下边调换行，旋转手柄在右侧。
+    Vertical,
+}
+
+/// 矩形选中框的类型，决定绘制与可交互的手柄。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxKind {
+    /// 矩形、椭圆：8 个缩放手柄 + 旋转手柄。
+    Rotatable,
+    /// 画笔、荧光笔、马赛克：8 个缩放手柄，无旋转手柄。
+    Scalable,
+    /// 序号：只有虚线框，无手柄。
+    Plain,
+    /// 文字：四角缩放 + 两方向换行边手柄 + 旋转手柄。
+    Text(BoxAxis),
+}
+
+/// 当前选中或编辑中图元的选框与手柄几何。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionBox {
+    /// 框形图元（含旋转）。
+    Box {
+        /// 外接旋转框。
+        geometry: RotatedBox,
+        /// 框与手柄类型。
+        kind: BoxKind,
+    },
+    /// 直线与箭头：只画两端圆点，不画虚线框。
+    Endpoints {
+        /// 起点。
+        from: Point,
+        /// 终点。
+        to: Point,
+    },
+}
 
 /// 文字样式：颜色、字号、是否带底色、是否竖排。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +258,35 @@ enum Drawing {
     Trail(Vec<Point>),
 }
 
+/// 正在拖动调整的已选中图元。
+#[derive(Debug, Clone, PartialEq)]
+struct ShapeAdjust {
+    handle: ShapeHandle,
+    press: Point,
+    base: Shape,
+    preview: Option<Shape>,
+    moved: bool,
+}
+
+/// 标注状态机的互斥状态。
+#[derive(Debug, Clone, PartialEq)]
+enum State {
+    /// 空闲。
+    Idle,
+    /// 正在绘制新图元。
+    Drawing(Drawing),
+    /// 已选中一个图元，可选正在拖动调整。
+    Selected {
+        index: usize,
+        adjust: Option<ShapeAdjust>,
+    },
+    /// 正在编辑文字，可选正在拖动编辑框手柄。
+    Editing {
+        edit: Editing,
+        adjust: Option<EditAdjust>,
+    },
+}
+
 /// 样式条上当前应显示的内容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StyleView {
@@ -241,11 +312,7 @@ pub struct Annotator {
     styles: Styles,
     initial: Styles,
     tool: Option<Tool>,
-    drawing: Option<Drawing>,
-    editing: Option<Editing>,
-    /// 选中的文字图元序号。
-    selected: Option<usize>,
-    text_adjust: Option<TextAdjust>,
+    state: State,
     /// 文字字号的运行时上限，随选区所在显示器高度变化。
     text_max: u32,
     shift: bool,
@@ -321,10 +388,7 @@ impl Annotator {
             initial: styles.clone(),
             styles,
             tool: None,
-            drawing: None,
-            editing: None,
-            selected: None,
-            text_adjust: None,
+            state: State::Idle,
             text_max: *TEXT_SIZE_RANGE.end(),
             shift: false,
             measure: Rc::new(ApproxMeasure),
@@ -343,10 +407,7 @@ impl Annotator {
 
     /// 点工具按钮：选中该工具，已选中同一个则退出工具。
     pub fn toggle_tool(&mut self, tool: Tool) {
-        self.drawing = None;
-        self.editing = None;
-        self.selected = None;
-        self.text_adjust = None;
+        self.state = State::Idle;
         self.tool = if self.tool == Some(tool) {
             None
         } else {
@@ -356,21 +417,20 @@ impl Annotator {
 
     /// 退出工具；原本有工具返回 `true`。
     pub fn exit_tool(&mut self) -> bool {
-        self.drawing = None;
-        self.editing = None;
-        self.selected = None;
-        self.text_adjust = None;
+        self.state = State::Idle;
         self.tool.take().is_some()
     }
 
     /// 正在拖拽绘制。
     pub fn is_drawing(&self) -> bool {
-        self.drawing.is_some()
+        matches!(self.state, State::Drawing(_))
     }
 
     /// 放弃正在画的图元。
     pub fn cancel_drawing(&mut self) {
-        self.drawing = None;
+        if self.is_drawing() {
+            self.state = State::Idle;
+        }
     }
 
     /// 记录 Shift 是否按下，下一次移动或松开时生效。
@@ -378,7 +438,7 @@ impl Annotator {
         self.shift = down;
     }
 
-    /// 在显示器 `bounds` 内按下：序号立即放置，其它工具开始拖拽。没有工具时无效果。
+    /// 在显示器 `bounds` 内按下：序号立即放置并选中，画笔/荧光笔等进入拖拽，文字不走此接口。
     pub fn press(&mut self, p: Point, bounds: &Rect) {
         let Some(tool) = self.tool else {
             return;
@@ -395,17 +455,26 @@ impl Annotator {
                     color: self.styles.number_color,
                     size: self.styles.number_size,
                 });
+                let index = self.document.shapes().len().saturating_sub(1);
+                self.state = State::Selected {
+                    index,
+                    adjust: None,
+                };
             }
-            Tool::Pen | Tool::Highlighter => self.drawing = Some(Drawing::Trail(vec![p])),
+            Tool::Pen | Tool::Highlighter => {
+                self.state = State::Drawing(Drawing::Trail(vec![p]));
+            }
             // 文字由 begin_text 开始编辑，不走拖拽
             Tool::Text => {}
-            _ => self.drawing = Some(Drawing::Drag { from: p, to: p }),
+            _ => {
+                self.state = State::Drawing(Drawing::Drag { from: p, to: p });
+            }
         }
     }
 
     /// 拖动。
     pub fn drag(&mut self, p: Point, bounds: &Rect) {
-        let (Some(tool), Some(drawing)) = (self.tool, self.drawing.as_mut()) else {
+        let (Some(tool), State::Drawing(drawing)) = (self.tool, &mut self.state) else {
             return;
         };
         match drawing {
@@ -421,30 +490,42 @@ impl Annotator {
         }
     }
 
-    /// 松开：图元有效就加入文档；返回是否新增了图元。
+    /// 松开：图元有效就加入文档（画笔、荧光笔之外自动选中）；返回是否新增了图元。
     pub fn release(&mut self, p: Point, bounds: &Rect) -> bool {
         self.drag(p, bounds);
         let Some(tool) = self.tool else {
-            self.drawing = None;
+            self.cancel_drawing();
             return false;
         };
-        let shape = self
-            .drawing
-            .take()
-            .and_then(|d| build_shape(tool, &self.styles, &d));
-        match shape {
-            Some(shape) => {
-                self.document.push(shape);
-                true
+        let drawing = match std::mem::replace(&mut self.state, State::Idle) {
+            State::Drawing(drawing) => drawing,
+            other => {
+                self.state = other;
+                return false;
             }
-            None => false,
+        };
+        let Some(shape) = build_shape(tool, &self.styles, &drawing) else {
+            return false;
+        };
+        self.document.push(shape);
+        // 画笔与荧光笔连续书写不自动选中，避免下一笔误拖动上一笔
+        if !matches!(tool, Tool::Pen | Tool::Highlighter) {
+            let index = self.document.shapes().len().saturating_sub(1);
+            self.state = State::Selected {
+                index,
+                adjust: None,
+            };
         }
+        true
     }
 
     /// 正在画的图元，用于实时预览。
     pub fn preview(&self) -> Option<Shape> {
         let tool = self.tool?;
-        build_shape(tool, &self.styles, self.drawing.as_ref()?)
+        let State::Drawing(drawing) = &self.state else {
+            return None;
+        };
+        build_shape(tool, &self.styles, drawing)
     }
 
     /// 滚轮调当前工具的粗细，`notches` 为正表示增大；没有工具时无效果。
@@ -488,23 +569,18 @@ impl Annotator {
     /// 设置序号的编号风格。
     pub fn set_number_style(&mut self, style: NumberStyle) {
         self.styles.number_style = style;
+        self.restyle_selected();
     }
 
     /// 撤销；有图元被撤销返回 `true`。
     pub fn undo(&mut self) -> bool {
-        self.drawing = None;
-        self.editing = None;
-        self.selected = None;
-        self.text_adjust = None;
+        self.state = State::Idle;
         self.document.undo()
     }
 
     /// 重做；有图元被恢复返回 `true`。
     pub fn redo(&mut self) -> bool {
-        self.drawing = None;
-        self.editing = None;
-        self.selected = None;
-        self.text_adjust = None;
+        self.state = State::Idle;
         self.document.redo()
     }
 
@@ -560,13 +636,426 @@ impl Annotator {
     pub fn changed_config(&self) -> Option<AnnotateConfig> {
         (self.styles != self.initial).then(|| self.styles.to_config())
     }
+
+    /// 选中的图元序号。
+    pub fn selected_shape(&self) -> Option<usize> {
+        match self.state {
+            State::Selected { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+
+    /// 选中第 `index` 个图元：切换工具并载入样式（旋转与换行除外）；越界返回 `false`。
+    pub fn select_shape(&mut self, index: usize) -> bool {
+        let Some(shape) = self.document.shapes().get(index).cloned() else {
+            return false;
+        };
+        self.load_shape_style(&shape);
+        self.tool = Some(shape.tool());
+        self.state = State::Selected {
+            index,
+            adjust: None,
+        };
+        true
+    }
+
+    /// 取消选中；原本有选中返回 `true`。
+    pub fn deselect(&mut self) -> bool {
+        if matches!(self.state, State::Selected { .. }) {
+            self.state = State::Idle;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 删除选中的图元，算一步撤销。
+    pub fn delete_selected(&mut self) -> bool {
+        let State::Selected { index, .. } = self.state else {
+            return false;
+        };
+        self.state = State::Idle;
+        self.document.remove(index)
+    }
+
+    /// 把选中的图元移动 `(dx, dy)` 像素，算一步撤销。
+    pub fn nudge_selected(&mut self, dx: i32, dy: i32) -> bool {
+        let State::Selected { index, .. } = self.state else {
+            return false;
+        };
+        let Some(shape) = self.document.shapes().get(index) else {
+            return false;
+        };
+        self.document.replace(index, translate_shape(shape, dx, dy))
+    }
+
+    /// 正在拖动调整图元或编辑框。
+    pub fn is_adjusting(&self) -> bool {
+        matches!(
+            self.state,
+            State::Selected {
+                adjust: Some(_),
+                ..
+            } | State::Editing {
+                adjust: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// 正在拖动的手柄。
+    pub fn adjusting_handle(&self) -> Option<ShapeHandle> {
+        match &self.state {
+            State::Selected {
+                adjust: Some(a), ..
+            } => Some(a.handle),
+            State::Editing {
+                adjust: Some(a), ..
+            } => Some(ShapeHandle::from(a.handle)),
+            _ => None,
+        }
+    }
+
+    /// 当前应显示的选中框与手柄几何。
+    pub fn selection_box(&self) -> Option<SelectionBox> {
+        match &self.state {
+            State::Editing { edit, .. } => {
+                if self.tool != Some(Tool::Text) {
+                    return None;
+                }
+                let data = self.editing_data(edit);
+                Some(SelectionBox::Box {
+                    geometry: data.text_box().rotated(),
+                    kind: BoxKind::Text(axis_of(data.vertical)),
+                })
+            }
+            State::Selected { index, adjust } => {
+                let preview = adjust.as_ref().and_then(|a| a.preview.as_ref());
+                let shape = preview.or_else(|| self.document.shapes().get(*index))?;
+                selection_box_of(shape)
+            }
+            _ => None,
+        }
+    }
+
+    /// 屏幕点命中当前选中框或编辑框的哪个部位。
+    pub fn shape_handle_at(
+        &self,
+        p: Point,
+        tolerance: f64,
+        rotate_distance: f64,
+    ) -> Option<ShapeHandle> {
+        match &self.state {
+            State::Editing { edit, .. } => {
+                if self.tool != Some(Tool::Text) {
+                    return None;
+                }
+                self.editing_data(edit)
+                    .text_box()
+                    .hit(to_f64(p), tolerance, rotate_distance)
+                    .map(ShapeHandle::from)
+            }
+            State::Selected { index, adjust } => {
+                let preview = adjust.as_ref().and_then(|a| a.preview.as_ref());
+                let shape = preview.or_else(|| self.document.shapes().get(*index))?;
+                hit_selected_shape(shape, p, tolerance, rotate_distance)
+            }
+            _ => None,
+        }
+    }
+
+    /// 在 `handle` 上按下开始调整；没有可调整的图元或编辑框返回 `false`。
+    pub fn begin_adjust(&mut self, handle: ShapeHandle, p: Point) -> bool {
+        match &self.state {
+            State::Editing { .. } => self.begin_edit_adjust(handle, p),
+            State::Selected { index, .. } => {
+                let index = *index;
+                let Some(base) = self.document.shapes().get(index).cloned() else {
+                    return false;
+                };
+                self.state = State::Selected {
+                    index,
+                    adjust: Some(ShapeAdjust {
+                        handle,
+                        press: p,
+                        base,
+                        preview: None,
+                        moved: false,
+                    }),
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 拖动选中图元或编辑框的手柄：Shift 时保持宽高比或角度吸附。
+    pub fn update_adjust(&mut self, p: Point) {
+        if matches!(self.state, State::Editing { .. }) {
+            self.update_edit_adjust(p);
+            return;
+        }
+        let State::Selected {
+            adjust: Some(adjust),
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        if !adjust.moved && p == adjust.press {
+            return;
+        }
+        let handle = adjust.handle;
+        let press = adjust.press;
+        let base = adjust.base.clone();
+        let next = match handle {
+            ShapeHandle::Body | ShapeHandle::Border => translate_shape(
+                &base,
+                p.x.saturating_sub(press.x),
+                p.y.saturating_sub(press.y),
+            ),
+            _ if matches!(base, Shape::Text { .. }) => self.resize_selected_text(&base, handle, p),
+            _ => resize_shape(&base, handle, p, self.shift),
+        };
+        if let State::Selected {
+            adjust: Some(live), ..
+        } = &mut self.state
+        {
+            live.moved = true;
+            live.preview = Some(next);
+        }
+    }
+
+    /// 松开调整：选中图元的变化记为一步撤销；返回文档是否有变化。
+    pub fn finish_adjust(&mut self) -> bool {
+        if let State::Editing { adjust, .. } = &mut self.state {
+            *adjust = None;
+            return false;
+        }
+        let State::Selected { index, adjust } = &mut self.state else {
+            return false;
+        };
+        let index = *index;
+        let Some(adjust) = adjust.take() else {
+            return false;
+        };
+        if !adjust.moved {
+            return false;
+        }
+        let Some(preview) = adjust.preview else {
+            return false;
+        };
+        if preview == adjust.base {
+            return false;
+        }
+        if let (Shape::Text { size, .. }, Shape::Text { size: old_size, .. }) =
+            (&preview, &adjust.base)
+            && size != old_size
+        {
+            self.styles.text.size = *size;
+        }
+        self.document.replace(index, preview)
+    }
+
+    /// 拖动中的预览图元；没有拖动选中图元时为 `None`。
+    pub fn adjust_preview(&self) -> Option<Shape> {
+        match &self.state {
+            State::Selected {
+                adjust: Some(a), ..
+            } => a.preview.clone(),
+            _ => None,
+        }
+    }
+
+    /// 需要隐藏的图元序号：重新编辑的原文字，或正在拖动预览的选中图元。
+    pub fn hidden_shape(&self) -> Option<usize> {
+        match &self.state {
+            State::Editing { edit, .. } => edit.replacing,
+            State::Selected {
+                index,
+                adjust: Some(a),
+            } if a.preview.is_some() => Some(*index),
+            _ => None,
+        }
+    }
+
+    fn load_shape_style(&mut self, shape: &Shape) {
+        match shape {
+            Shape::Rectangle { color, width, .. } => {
+                self.styles.rectangle = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Ellipse { color, width, .. } => {
+                self.styles.ellipse = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Line { color, width, .. } => {
+                self.styles.line = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Arrow { color, width, .. } => {
+                self.styles.arrow = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Pen { color, width, .. } => {
+                self.styles.pen = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Highlighter { color, width, .. } => {
+                self.styles.highlighter = Stroke {
+                    color: *color,
+                    width: *width,
+                };
+            }
+            Shape::Mosaic { block, .. } => {
+                self.styles.mosaic_block = *block;
+            }
+            Shape::Number {
+                style, color, size, ..
+            } => {
+                self.styles.number_style = *style;
+                self.styles.number_color = *color;
+                self.styles.number_size = *size;
+            }
+            Shape::Text {
+                color,
+                size,
+                background,
+                vertical,
+                ..
+            } => {
+                self.styles.text = TextStyle {
+                    color: *color,
+                    size: *size,
+                    background: *background,
+                    vertical: *vertical,
+                };
+            }
+        }
+    }
+
+    fn apply_style_to_shape(&self, shape: &Shape) -> Shape {
+        let mut updated = shape.clone();
+        match &mut updated {
+            Shape::Rectangle { color, width, .. } => {
+                *color = self.styles.rectangle.color;
+                *width = self.styles.rectangle.width;
+            }
+            Shape::Ellipse { color, width, .. } => {
+                *color = self.styles.ellipse.color;
+                *width = self.styles.ellipse.width;
+            }
+            Shape::Line { color, width, .. } => {
+                *color = self.styles.line.color;
+                *width = self.styles.line.width;
+            }
+            Shape::Arrow { color, width, .. } => {
+                *color = self.styles.arrow.color;
+                *width = self.styles.arrow.width;
+            }
+            Shape::Pen { color, width, .. } => {
+                *color = self.styles.pen.color;
+                *width = self.styles.pen.width;
+            }
+            Shape::Highlighter { color, width, .. } => {
+                *color = self.styles.highlighter.color;
+                *width = self.styles.highlighter.width;
+            }
+            Shape::Mosaic { block, .. } => {
+                *block = self.styles.mosaic_block;
+            }
+            Shape::Number {
+                style, color, size, ..
+            } => {
+                *style = self.styles.number_style;
+                *color = self.styles.number_color;
+                *size = self.styles.number_size;
+            }
+            Shape::Text { .. } => {}
+        }
+        updated
+    }
+
+    /// 选中图元应用当前样式并记为一步撤销。
+    pub(super) fn restyle_selected(&mut self) {
+        let State::Selected {
+            index,
+            adjust: None,
+        } = self.state
+        else {
+            return;
+        };
+        let Some(old) = self.document.shapes().get(index).cloned() else {
+            return;
+        };
+        if self.tool != Some(old.tool()) {
+            return;
+        }
+        let next = match &old {
+            Shape::Text { .. } => self.restyled_text(&old),
+            _ => Some(self.apply_style_to_shape(&old)),
+        };
+        if let Some(next) = next
+            && next != old
+        {
+            self.document.replace(index, next);
+        }
+    }
+}
+
+fn axis_of(vertical: bool) -> BoxAxis {
+    if vertical {
+        BoxAxis::Vertical
+    } else {
+        BoxAxis::Horizontal
+    }
+}
+
+fn selection_box_of(shape: &Shape) -> Option<SelectionBox> {
+    match shape {
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            Some(SelectionBox::Endpoints {
+                from: *from,
+                to: *to,
+            })
+        }
+        Shape::Rectangle { .. } | Shape::Ellipse { .. } => Some(SelectionBox::Box {
+            geometry: shape_box(shape)?,
+            kind: BoxKind::Rotatable,
+        }),
+        Shape::Pen { .. } | Shape::Highlighter { .. } | Shape::Mosaic { .. } => {
+            Some(SelectionBox::Box {
+                geometry: shape_box(shape)?,
+                kind: BoxKind::Scalable,
+            })
+        }
+        Shape::Number { .. } => Some(SelectionBox::Box {
+            geometry: shape_box(shape)?,
+            kind: BoxKind::Plain,
+        }),
+        Shape::Text { vertical, .. } => Some(SelectionBox::Box {
+            geometry: shape_box(shape)?,
+            kind: BoxKind::Text(axis_of(*vertical)),
+        }),
+    }
 }
 
 /// 由正在画的图元和当前样式生成图元；零尺寸或点数不足时返回 `None`。
 fn build_shape(tool: Tool, styles: &Styles, drawing: &Drawing) -> Option<Shape> {
     match (tool, drawing) {
         (Tool::Pen | Tool::Highlighter, Drawing::Trail(points)) => {
-            if points.len() < 2 {
+            let first = points.first()?;
+            if points.len() < 2 || !points.iter().any(|q| drag_is_valid(*first, *q)) {
                 return None;
             }
             let stroke = if tool == Tool::Pen {
@@ -601,12 +1090,14 @@ fn build_shape(tool: Tool, styles: &Styles, drawing: &Drawing) -> Option<Shape> 
                     to,
                     color: styles.rectangle.color,
                     width: styles.rectangle.width,
+                    rotation: 0,
                 }),
                 Tool::Ellipse if has_area => Some(Shape::Ellipse {
                     from,
                     to,
                     color: styles.ellipse.color,
                     width: styles.ellipse.width,
+                    rotation: 0,
                 }),
                 Tool::Mosaic if has_area => Some(Shape::Mosaic {
                     from,
@@ -766,9 +1257,11 @@ mod tests {
         a.release(p(100, 100), &MON);
         a.press(p(200, 100), &MON);
         a.release(p(200, 100), &MON);
+        a.deselect();
         a.set_number_style(NumberStyle::Letter);
         a.press(p(300, 100), &MON);
         a.release(p(300, 100), &MON);
+        a.deselect();
         a.set_number_style(NumberStyle::Number);
         a.press(p(400, 100), &MON);
         let values: Vec<_> = a
@@ -827,7 +1320,8 @@ mod tests {
                 from: p(100, 100),
                 to: p(180, 180),
                 color: PALETTE[0],
-                width: 3
+                width: 3,
+                rotation: 0,
             })
         );
         a.set_shift(false);
@@ -1411,5 +1905,133 @@ mod tests {
             a.document().shapes().first(),
             Some(Shape::Line { to, .. }) if *to == p(-1, 50)
         ));
+    }
+
+    #[test]
+    fn auto_selection_applies_to_shapes_except_pen_and_highlighter() {
+        for tool in [
+            Tool::Rectangle,
+            Tool::Ellipse,
+            Tool::Line,
+            Tool::Arrow,
+            Tool::Mosaic,
+        ] {
+            let mut a = with_tool(tool);
+            assert!(drag(&mut a, p(100, 100), p(200, 160)), "{tool:?}");
+            assert_eq!(a.selected_shape(), Some(0), "{tool:?}");
+            assert!(a.selection_box().is_some(), "{tool:?}");
+        }
+        let mut num = with_tool(Tool::Number);
+        num.press(p(150, 150), &MON);
+        assert_eq!(num.selected_shape(), Some(0));
+        assert!(matches!(
+            num.selection_box(),
+            Some(SelectionBox::Box {
+                kind: BoxKind::Plain,
+                ..
+            })
+        ));
+        for tool in [Tool::Pen, Tool::Highlighter] {
+            let mut a = with_tool(tool);
+            assert!(drag(&mut a, p(100, 100), p(180, 140)), "{tool:?}");
+            assert_eq!(a.selected_shape(), None, "{tool:?}");
+            assert_eq!(a.selection_box(), None, "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn select_shape_switches_tool_loads_style_and_keeps_rotation_out_of_config() {
+        let mut a = with_tool(Tool::Rectangle);
+        a.set_color(PALETTE[4]);
+        a.wheel(2);
+        assert!(drag(&mut a, p(100, 100), p(200, 160)));
+        // 旋转一次，再换工具和样式后重新选中该矩形
+        assert!(a.begin_adjust(ShapeHandle::Rotate, p(150, 76)));
+        a.update_adjust(p(200, 130));
+        assert!(a.finish_adjust());
+        a.toggle_tool(Tool::Line);
+        a.set_color(PALETTE[2]);
+        assert!(a.select_shape(0));
+        assert_eq!(a.tool(), Some(Tool::Rectangle));
+        assert_eq!(a.selected_shape(), Some(0));
+        let style = a.style_view().expect("样式条");
+        assert_eq!(style.swatch, Some(4));
+        assert_eq!(style.size, 5);
+        assert!(!a.select_shape(99));
+    }
+
+    #[test]
+    fn restyling_selected_shape_updates_document_in_one_undo_step() {
+        let mut a = with_tool(Tool::Number);
+        a.press(p(120, 120), &MON);
+        a.set_color(PALETTE[5]);
+        a.set_number_style(NumberStyle::Letter);
+        a.apply_preset(2);
+        assert!(matches!(
+            a.document().shapes().first(),
+            Some(Shape::Number {
+                style: NumberStyle::Letter,
+                color,
+                size: 40,
+                ..
+            }) if *color == PALETTE[5]
+        ));
+        assert_eq!(a.selected_shape(), Some(0));
+        assert!(a.undo());
+        assert_eq!(a.selected_shape(), None);
+        assert!(matches!(
+            a.document().shapes().first(),
+            Some(Shape::Number {
+                style: NumberStyle::Letter,
+                size: 28,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn adjust_preview_hides_original_and_commits_on_finish() {
+        let mut a = with_tool(Tool::Rectangle);
+        assert!(drag(&mut a, p(100, 100), p(200, 160)));
+        assert!(a.begin_adjust(ShapeHandle::Body, p(100, 100)));
+        // 没有移动不记撤销
+        assert!(!a.finish_adjust());
+        assert_eq!(a.hidden_shape(), None);
+
+        assert!(a.begin_adjust(ShapeHandle::Body, p(120, 120)));
+        a.update_adjust(p(150, 140));
+        assert!(a.is_adjusting());
+        assert_eq!(a.hidden_shape(), Some(0));
+        assert!(a.adjust_preview().is_some());
+        assert!(a.finish_adjust());
+        assert!(!a.is_adjusting());
+        assert_eq!(a.hidden_shape(), None);
+        assert_eq!(a.adjust_preview(), None);
+        assert!(matches!(
+            a.document().shapes().first(),
+            Some(Shape::Rectangle { from, to, .. })
+                if *from == p(130, 120) && *to == p(230, 180)
+        ));
+    }
+
+    #[test]
+    fn rotate_and_resize_shape_through_annotator() {
+        let mut a = with_tool(Tool::Ellipse);
+        assert!(drag(&mut a, p(100, 100), p(200, 200)));
+        a.set_shift(true);
+        assert!(a.begin_adjust(ShapeHandle::Rotate, p(150, 76)));
+        assert_eq!(a.adjusting_handle(), Some(ShapeHandle::Rotate));
+        a.update_adjust(p(200, 130));
+        assert!(a.finish_adjust());
+        let rot = match a.document().shapes().first() {
+            Some(Shape::Ellipse { rotation, .. }) => *rotation,
+            other => panic!("期望椭圆，实际为 {other:?}"),
+        };
+        assert_eq!(rot % 15, 0);
+        assert!(a.delete_selected());
+        assert!(a.document().is_empty());
+        assert_eq!(a.selected_shape(), None);
+        assert!(a.undo());
+        assert_eq!(a.document().shapes().len(), 1);
     }
 }

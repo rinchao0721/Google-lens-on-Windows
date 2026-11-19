@@ -1,6 +1,6 @@
 //! 文字标注的状态：编辑、选中与文本框的移动、缩放、换行、旋转。
 
-use lenswin_core::annotation::{Color, Shape, TEXT_PADDING_DIVISOR, Tool};
+use lenswin_core::annotation::{Color, Shape, ShapeHandle, TEXT_PADDING_DIVISOR, Tool};
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::text_box::{
     BoxCorner, PointF, TextBox, TextHandle, anchor_corner, bounds_from_anchor,
@@ -9,7 +9,7 @@ use lenswin_core::text_box::{
 };
 use lenswin_core::text_edit::TextBuffer;
 
-use super::{Annotator, TextStyle, clamp_point};
+use super::{Annotator, State, TextStyle, clamp_point};
 
 /// 文字排版参数：换行长度与排版方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -200,7 +200,7 @@ pub(super) struct Editing {
     buffer: TextBuffer,
     composition: Option<Composition>,
     /// 重新编辑的图元序号。
-    replacing: Option<usize>,
+    pub(super) replacing: Option<usize>,
     rotation: i32,
     wrap: Option<u32>,
 }
@@ -212,7 +212,7 @@ pub(super) struct TextData {
     color: Color,
     size: u32,
     background: bool,
-    vertical: bool,
+    pub(super) vertical: bool,
     rotation: i32,
     wrap: Option<u32>,
     bounds: Rect,
@@ -259,7 +259,7 @@ impl TextData {
         }
     }
 
-    fn text_box(&self) -> TextBox {
+    pub(super) fn text_box(&self) -> TextBox {
         TextBox {
             bounds: self.bounds,
             rotation: self.rotation,
@@ -304,31 +304,19 @@ pub struct EditView {
     pub hidden: Option<usize>,
 }
 
-/// 文本框调整的对象。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AdjustTarget {
-    Editing,
-    Selected(usize),
-}
-
-/// 正在进行的文本框调整（拖动中）。
+/// 正在拖动调整的编辑中文本框。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct TextAdjust {
-    handle: TextHandle,
-    target: AdjustTarget,
+pub(super) struct EditAdjust {
+    pub(super) handle: TextHandle,
     press: PointF,
     start_box: TextBox,
     start_size: u32,
     start_wrap: Option<u32>,
-    /// 选中状态下的原图元数据；编辑状态为 `None`。
-    base: Option<TextData>,
-    /// 选中状态下拖动中的预览数据。
-    preview: Option<TextData>,
-    /// 指针离开过按下的位置；没有移动过的点击不改变文本框。
     moved: bool,
 }
 
-/// 当前显示文本框的几何与状态，供绘制和命中使用。
+/// 测试用文本框视图，保留以兼容既有单测。
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextBoxView {
     /// 旋转后的文本框。
@@ -341,13 +329,38 @@ fn distance(a: PointF, b: PointF) -> f64 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
 
-fn to_f64(p: Point) -> PointF {
+pub(super) fn to_f64(p: Point) -> PointF {
     (f64::from(p.x), f64::from(p.y))
+}
+
+fn text_handle_from(handle: ShapeHandle) -> Option<TextHandle> {
+    match handle {
+        ShapeHandle::Body => Some(TextHandle::Body),
+        ShapeHandle::Border => Some(TextHandle::Border),
+        ShapeHandle::Corner(c) => Some(TextHandle::Corner(c)),
+        ShapeHandle::Edge(e) => Some(TextHandle::Edge(e)),
+        ShapeHandle::Rotate => Some(TextHandle::Rotate),
+        ShapeHandle::Endpoint(_) => None,
+    }
 }
 
 impl Annotator {
     fn layout_of(wrap: Option<u32>, vertical: bool) -> TextLayout {
         TextLayout { wrap, vertical }
+    }
+
+    fn editing(&self) -> Option<&Editing> {
+        match &self.state {
+            State::Editing { edit, .. } => Some(edit),
+            _ => None,
+        }
+    }
+
+    fn editing_mut(&mut self) -> Option<&mut Editing> {
+        match &mut self.state {
+            State::Editing { edit, .. } => Some(edit),
+            _ => None,
+        }
     }
 
     /// 文本框整体大小（含内边距）：设了换行长度时，换行方向的内部长度就是它；
@@ -384,7 +397,7 @@ impl Annotator {
     }
 
     /// 编辑中的文本框数据（文字为含组字串的显示文字）。
-    fn editing_data(&self, edit: &Editing) -> TextData {
+    pub(super) fn editing_data(&self, edit: &Editing) -> TextData {
         let (text, _, _) = Self::display(edit);
         let style = self.style();
         let mut data = TextData {
@@ -413,22 +426,9 @@ impl Annotator {
         self.restyle_selected();
     }
 
-    /// 选中的文字按当前样式重排并记为一步撤销。
-    pub(super) fn restyle_selected(&mut self) {
-        if self.tool != Some(Tool::Text) || self.editing.is_some() || self.text_adjust.is_some() {
-            return;
-        }
-        let Some(index) = self.selected else {
-            return;
-        };
-        let Some(old) = self
-            .document
-            .shapes()
-            .get(index)
-            .and_then(TextData::from_shape)
-        else {
-            return;
-        };
+    /// 按当前文字样式重排选中文字图元，返回更新后的图元。
+    pub(super) fn restyled_text(&self, shape: &Shape) -> Option<Shape> {
+        let old = TextData::from_shape(shape)?;
         let style = self.style();
         let mut new = old.clone();
         new.color = style.color;
@@ -438,29 +438,28 @@ impl Annotator {
         let anchor = old.anchor();
         let corner = anchor_corner(new.vertical);
         self.relayout(&mut new, anchor, corner);
-        if new != old {
-            self.document.replace(index, new.to_shape());
-        }
+        Some(new.to_shape())
     }
 
     /// 正在编辑文字。
     pub fn is_editing(&self) -> bool {
-        self.editing.is_some()
+        matches!(self.state, State::Editing { .. })
     }
 
     /// 在 `p` 处开始新文本框；`bounds` 是所在显示器范围，`monitor` 是其序号。
     pub fn begin_text(&mut self, p: Point, bounds: &Rect, monitor: usize) {
-        self.selected = None;
-        self.text_adjust = None;
-        self.editing = Some(Editing {
-            anchor: to_f64(clamp_point(p, bounds)),
-            monitor,
-            buffer: TextBuffer::new(),
-            composition: None,
-            replacing: None,
-            rotation: 0,
-            wrap: None,
-        });
+        self.state = State::Editing {
+            edit: Editing {
+                anchor: to_f64(clamp_point(p, bounds)),
+                monitor,
+                buffer: TextBuffer::new(),
+                composition: None,
+                replacing: None,
+                rotation: 0,
+                wrap: None,
+            },
+            adjust: None,
+        };
     }
 
     /// 重新编辑第 `index` 个图元（必须是文字）：载入它的内容与样式，样式同时成为当前文字样式。
@@ -474,32 +473,31 @@ impl Annotator {
             return false;
         };
         self.styles.text = data.style();
-        self.selected = None;
-        self.text_adjust = None;
-        self.editing = Some(Editing {
-            anchor: data.anchor(),
-            monitor,
-            buffer: TextBuffer::from_text(&data.text),
-            composition: None,
-            replacing: Some(index),
-            rotation: data.rotation,
-            wrap: data.wrap,
-        });
+        self.state = State::Editing {
+            edit: Editing {
+                anchor: data.anchor(),
+                monitor,
+                buffer: TextBuffer::from_text(&data.text),
+                composition: None,
+                replacing: Some(index),
+                rotation: data.rotation,
+                wrap: data.wrap,
+            },
+            adjust: None,
+        };
         true
     }
 
     /// 编辑中的文本框内容为空白，且不是重新编辑。
     pub fn editing_blank_new(&self) -> bool {
-        self.editing
-            .as_ref()
+        self.editing()
             .is_some_and(|e| e.replacing.is_none() && e.buffer.is_blank())
     }
 
     /// 确认编辑：空白的新文本框不生成图元，空白的重新编辑删除原文字，其余新增或替换；
     /// 未完成的组字串丢弃。文档有变化返回 `true`。
     pub fn confirm_text(&mut self) -> bool {
-        self.text_adjust = None;
-        let Some(edit) = self.editing.take() else {
+        let State::Editing { edit, .. } = std::mem::replace(&mut self.state, State::Idle) else {
             return false;
         };
         let blank = edit.buffer.is_blank();
@@ -534,8 +532,9 @@ impl Annotator {
 
     /// 丢弃本次编辑，文档不变。
     pub fn discard_text(&mut self) {
-        self.text_adjust = None;
-        self.editing = None;
+        if self.is_editing() {
+            self.state = State::Idle;
+        }
     }
 
     /// 编辑中的按键；返回内容是否有变化（用于重置光标闪烁）。
@@ -553,7 +552,7 @@ impl Annotator {
         }
         let style = self.style();
         let measure = self.measure.clone();
-        let Some(edit) = self.editing.as_mut() else {
+        let Some(edit) = self.editing_mut() else {
             return false;
         };
         // 组字期间的按键由输入法处理，不会走到这里；残留的组字串在编辑操作前清掉
@@ -590,21 +589,18 @@ impl Annotator {
 
     /// 插入一个字符（`WM_CHAR`）；控制字符被忽略。
     pub fn insert_char(&mut self, c: char) -> bool {
-        self.editing
-            .as_mut()
-            .is_some_and(|e| e.buffer.insert_char(c))
+        self.editing_mut().is_some_and(|e| e.buffer.insert_char(c))
     }
 
     /// 插入一段文字（粘贴或输入法结果），控制字符（换行除外）被忽略。
     pub fn insert_text(&mut self, text: &str) -> bool {
-        self.editing
-            .as_mut()
+        self.editing_mut()
             .is_some_and(|e| e.buffer.insert_str(text) > 0)
     }
 
     /// 设置组字串；`cursor` 是组字光标在其中的字符序号，空串表示没有组字。
     pub fn set_composition(&mut self, text: &str, cursor: usize) {
-        if let Some(edit) = self.editing.as_mut() {
+        if let Some(edit) = self.editing_mut() {
             edit.composition = (!text.is_empty()).then(|| Composition {
                 text: text.to_string(),
                 cursor: cursor.min(text.chars().count()),
@@ -614,7 +610,7 @@ impl Annotator {
 
     /// 清除组字串。
     pub fn clear_composition(&mut self) {
-        if let Some(edit) = self.editing.as_mut() {
+        if let Some(edit) = self.editing_mut() {
             edit.composition = None;
         }
     }
@@ -640,13 +636,13 @@ impl Annotator {
 
     /// 编辑中文本框的外接范围（未旋转的本地框）。
     pub fn edit_bounds(&self) -> Option<Rect> {
-        let edit = self.editing.as_ref()?;
+        let edit = self.editing()?;
         Some(self.editing_data(edit).bounds)
     }
 
     /// 绘制编辑框所需的信息。
     pub fn edit_view(&self) -> Option<EditView> {
-        let edit = self.editing.as_ref()?;
+        let edit = self.editing()?;
         let data = self.editing_data(edit);
         let (text, composition, caret) = Self::display(edit);
         Some(EditView {
@@ -664,7 +660,7 @@ impl Annotator {
 
     /// 光标所在的一行（虚拟桌面坐标的旋转后外接框）与是否竖排，输入法候选窗据此定位。
     pub fn caret_line(&self) -> Option<(usize, Rect, bool)> {
-        let edit = self.editing.as_ref()?;
+        let edit = self.editing()?;
         let data = self.editing_data(edit);
         let (text, _, caret) = Self::display(edit);
         let layout = Self::layout_of(data.wrap, data.vertical);
@@ -687,330 +683,253 @@ impl Annotator {
         Some((edit.monitor, rect, data.vertical))
     }
 
-    /// 选中的文字图元序号。
-    pub fn selected_text(&self) -> Option<usize> {
-        self.selected
-    }
-
-    /// 选中第 `index` 个文字图元，它的样式成为当前文字样式；不是文字时无效果。
-    pub fn select_text(&mut self, index: usize) -> bool {
-        let Some(data) = self
-            .document
-            .shapes()
-            .get(index)
-            .and_then(TextData::from_shape)
-        else {
-            return false;
-        };
-        self.styles.text = data.style();
-        self.selected = Some(index);
-        self.text_adjust = None;
-        true
-    }
-
-    /// 取消选中；原本有选中返回 `true`。
-    pub fn deselect_text(&mut self) -> bool {
-        self.text_adjust = None;
-        self.selected.take().is_some()
-    }
-
-    /// 删除选中的文字，算一步撤销。
-    pub fn delete_selected(&mut self) -> bool {
-        self.text_adjust = None;
-        match self.selected.take() {
-            Some(index) => self.document.remove(index),
-            None => false,
-        }
-    }
-
-    /// 把选中的文字移动 `(dx, dy)` 像素，算一步撤销。
-    pub fn nudge_selected(&mut self, dx: i32, dy: i32) -> bool {
-        let Some(index) = self.selected else {
-            return false;
-        };
-        let Some(mut data) = self
-            .document
-            .shapes()
-            .get(index)
-            .and_then(TextData::from_shape)
-        else {
-            return false;
-        };
-        data.bounds = translated(&data.bounds, i64::from(dx), i64::from(dy));
-        self.document.replace(index, data.to_shape())
-    }
-
-    /// 选中文字当前的数据：拖动中用预览，否则取文档里的。
-    fn selected_data(&self) -> Option<(usize, TextData)> {
-        let index = self.selected?;
-        if let Some(preview) = self.text_adjust.as_ref().and_then(|a| a.preview.clone()) {
-            return Some((index, preview));
-        }
-        let data = self
-            .document
-            .shapes()
-            .get(index)
-            .and_then(TextData::from_shape)?;
-        Some((index, data))
-    }
-
-    /// 当前显示的文本框：编辑中的，否则选中的；只在文字工具下有。
-    pub fn active_text_box(&self) -> Option<TextBoxView> {
-        if self.tool != Some(Tool::Text) {
-            return None;
-        }
-        if let Some(edit) = self.editing.as_ref() {
-            return Some(TextBoxView {
-                geometry: self.editing_data(edit).text_box(),
-                editing: true,
-            });
-        }
-        self.selected_data().map(|(_, data)| TextBoxView {
-            geometry: data.text_box(),
-            editing: false,
-        })
-    }
-
-    /// 屏幕点命中当前文本框的哪个部位。
-    pub fn text_handle_at(
+    /// 计算角、边、旋转手柄调整后的文字框参数。
+    fn adjust_text_geometry(
         &self,
-        p: Point,
-        tolerance: f64,
-        rotate_distance: f64,
-    ) -> Option<TextHandle> {
-        self.active_text_box()?
-            .geometry
-            .hit(to_f64(p), tolerance, rotate_distance)
-    }
-
-    /// 在 `handle` 上按下开始调整；没有可调整的文本框返回 `false`。
-    pub fn begin_text_adjust(&mut self, handle: TextHandle, p: Point) -> bool {
-        let (target, geometry, size, wrap, base) = if let Some(edit) = self.editing.as_ref() {
-            let data = self.editing_data(edit);
-            (
-                AdjustTarget::Editing,
-                data.text_box(),
-                data.size,
-                data.wrap,
-                None,
-            )
-        } else if let Some((index, data)) = self.selected_data() {
-            (
-                AdjustTarget::Selected(index),
-                data.text_box(),
-                data.size,
-                data.wrap,
-                Some(data),
-            )
-        } else {
-            return false;
-        };
-        self.text_adjust = Some(TextAdjust {
-            handle,
-            target,
-            press: to_f64(p),
-            start_box: geometry,
-            start_size: size,
-            start_wrap: wrap,
-            base,
-            preview: None,
-            moved: false,
-        });
-        true
-    }
-
-    /// 正在拖动文本框。
-    pub fn is_adjusting_text(&self) -> bool {
-        self.text_adjust.is_some()
-    }
-
-    /// 正在拖动的手柄。
-    pub fn adjusting_handle(&self) -> Option<TextHandle> {
-        self.text_adjust.as_ref().map(|a| a.handle)
-    }
-
-    /// 拖动文本框的手柄：Shift 时旋转吸附到 15°。
-    pub fn update_text_adjust(&mut self, p: Point) {
-        let Some(adjust) = self.text_adjust.clone() else {
-            return;
-        };
-        let current = to_f64(p);
-        if !adjust.moved && current == adjust.press {
-            return;
-        }
-        if let Some(live) = self.text_adjust.as_mut() {
-            live.moved = true;
-        }
-        let (text, size, background, vertical, rotation) = match (&adjust.target, &adjust.base) {
-            (AdjustTarget::Selected(_), Some(base)) => (
-                base.text.clone(),
-                base.size,
-                base.background,
-                base.vertical,
-                base.rotation,
-            ),
-            _ => {
-                let Some(edit) = self.editing.as_ref() else {
-                    return;
-                };
-                let data = self.editing_data(edit);
-                (
-                    data.text,
-                    data.size,
-                    data.background,
-                    data.vertical,
-                    data.rotation,
-                )
-            }
-        };
-        let start = adjust.start_box;
-        let mut new_size = size;
-        let mut new_wrap = adjust.start_wrap;
-        let mut new_rotation = rotation;
-        // 固定不动的角：缩放和换行都以它为锚点重新排版
+        data: &TextData,
+        start: &TextBox,
+        start_size: u32,
+        start_wrap: Option<u32>,
+        handle: TextHandle,
+        current: PointF,
+    ) -> (Rect, i32, Option<u32>, u32) {
+        let mut new_size = data.size;
+        let mut new_wrap = start_wrap;
+        let mut new_rotation = data.rotation;
         let mut fixed: Option<(PointF, BoxCorner)> = None;
-        match adjust.handle {
+        match handle {
             TextHandle::Body | TextHandle::Border => {}
             TextHandle::Corner(corner) => {
                 let anchor = start.corner(corner.opposite());
                 let first = distance(anchor, start.corner(corner));
-                new_size = scaled_size(
-                    adjust.start_size,
-                    first,
-                    distance(anchor, current),
-                    self.text_max,
-                );
-                new_wrap = scaled_wrap(adjust.start_wrap, adjust.start_size, new_size);
+                new_size = scaled_size(start_size, first, distance(anchor, current), self.text_max);
+                new_wrap = scaled_wrap(start_wrap, start_size, new_size);
                 fixed = Some((anchor, corner.opposite()));
             }
             TextHandle::Edge(edge) => {
-                let pad = text_padding(size, background);
-                new_wrap = Some(wrap_length_from_pointer(&start, edge, current, pad, size));
+                let pad = text_padding(data.size, data.background);
+                new_wrap = Some(wrap_length_from_pointer(
+                    start, edge, current, pad, data.size,
+                ));
                 let corner = edge.fixed_corner();
                 fixed = Some((start.corner(corner), corner));
             }
             TextHandle::Rotate => {
-                if let Some(raw) = rotation_from_pointer(start.center(), current, vertical) {
+                if let Some(raw) = rotation_from_pointer(start.center(), current, data.vertical) {
                     new_rotation = if self.shift { snap_rotation(raw) } else { raw };
                 }
             }
         }
         let bounds = match fixed {
             Some((anchor, corner)) => {
-                let layout = Self::layout_of(new_wrap, vertical);
-                let box_size = self.box_size(&text, new_size, background, layout);
+                let layout = Self::layout_of(new_wrap, data.vertical);
+                let box_size = self.box_size(&data.text, new_size, data.background, layout);
                 bounds_from_anchor(anchor, corner, box_size, new_rotation)
             }
-            None if adjust.handle == TextHandle::Rotate => start.bounds,
-            None => translated(
-                &start.bounds,
-                i64::from(round_to_i32(current.0 - adjust.press.0)),
-                i64::from(round_to_i32(current.1 - adjust.press.1)),
+            None => start.bounds,
+        };
+        (bounds, new_rotation, new_wrap, new_size)
+    }
+
+    /// 选中状态的文字经角、边或旋转手柄拖动后的预览图元。
+    pub(super) fn resize_selected_text(
+        &self,
+        base: &Shape,
+        handle: ShapeHandle,
+        p: Point,
+    ) -> Shape {
+        let Some(mut data) = TextData::from_shape(base) else {
+            return base.clone();
+        };
+        let Some(text_handle) = text_handle_from(handle) else {
+            return base.clone();
+        };
+        let start = data.text_box();
+        let (bounds, rotation, wrap, size) =
+            self.adjust_text_geometry(&data, &start, data.size, data.wrap, text_handle, to_f64(p));
+        data.bounds = bounds;
+        data.rotation = rotation;
+        data.wrap = wrap;
+        data.size = size;
+        data.to_shape()
+    }
+
+    pub(super) fn begin_edit_adjust(&mut self, handle: ShapeHandle, p: Point) -> bool {
+        let Some(text_handle) = text_handle_from(handle) else {
+            return false;
+        };
+        let Some(edit) = self.editing() else {
+            return false;
+        };
+        let data = self.editing_data(edit);
+        let adjust = EditAdjust {
+            handle: text_handle,
+            press: to_f64(p),
+            start_box: data.text_box(),
+            start_size: data.size,
+            start_wrap: data.wrap,
+            moved: false,
+        };
+        if let State::Editing { adjust: slot, .. } = &mut self.state {
+            *slot = Some(adjust);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn update_edit_adjust(&mut self, p: Point) {
+        let State::Editing {
+            edit,
+            adjust: Some(adjust),
+        } = &self.state
+        else {
+            return;
+        };
+        let current = to_f64(p);
+        if !adjust.moved && current == adjust.press {
+            return;
+        }
+        let adjust = adjust.clone();
+        let data = self.editing_data(edit);
+        let (bounds, rotation, wrap, size) = match adjust.handle {
+            TextHandle::Body | TextHandle::Border => (
+                translated(
+                    &adjust.start_box.bounds,
+                    i64::from(round_to_i32(current.0 - adjust.press.0)),
+                    i64::from(round_to_i32(current.1 - adjust.press.1)),
+                ),
+                data.rotation,
+                adjust.start_wrap,
+                data.size,
+            ),
+            other => self.adjust_text_geometry(
+                &data,
+                &adjust.start_box,
+                adjust.start_size,
+                adjust.start_wrap,
+                other,
+                current,
             ),
         };
-        self.apply_adjust(&adjust, bounds, new_rotation, new_wrap, new_size);
-    }
-
-    /// 把调整结果写回：选中状态存预览，编辑状态直接改编辑框。
-    fn apply_adjust(
-        &mut self,
-        adjust: &TextAdjust,
-        bounds: Rect,
-        rotation: i32,
-        wrap: Option<u32>,
-        size: u32,
-    ) {
-        match (&adjust.target, &adjust.base) {
-            (AdjustTarget::Selected(_), Some(base)) => {
-                let mut preview = base.clone();
-                preview.bounds = bounds;
-                preview.rotation = rotation;
-                preview.wrap = wrap;
-                preview.size = size;
-                if let Some(current) = self.text_adjust.as_mut() {
-                    current.preview = Some(preview);
-                }
+        self.styles.text.size = size;
+        let vertical = self.styles.text.vertical;
+        if let State::Editing {
+            edit,
+            adjust: Some(live),
+        } = &mut self.state
+        {
+            live.moved = true;
+            edit.rotation = rotation;
+            edit.wrap = wrap;
+            edit.anchor = TextBox {
+                bounds,
+                rotation,
+                vertical,
             }
-            _ => {
-                self.styles.text.size = size;
-                let vertical = self.styles.text.vertical;
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.rotation = rotation;
-                    edit.wrap = wrap;
-                    edit.anchor = TextBox {
-                        bounds,
-                        rotation,
-                        vertical,
-                    }
-                    .corner(anchor_corner(vertical));
-                }
-            }
-        }
-    }
-
-    /// 松开：选中状态下的调整记为一步撤销；返回文档是否有变化。
-    pub fn finish_text_adjust(&mut self) -> bool {
-        let Some(adjust) = self.text_adjust.take() else {
-            return false;
-        };
-        if !adjust.moved {
-            return false;
-        }
-        let (AdjustTarget::Selected(index), Some(base), Some(preview)) =
-            (adjust.target, adjust.base, adjust.preview)
-        else {
-            return false;
-        };
-        if preview == base {
-            return false;
-        }
-        if preview.size != base.size {
-            self.styles.text.size = preview.size;
-        }
-        self.document.replace(index, preview.to_shape())
-    }
-
-    /// 拖动中的预览图元；没有拖动选中文字时为 `None`。
-    pub fn text_preview(&self) -> Option<Shape> {
-        self.text_adjust
-            .as_ref()
-            .and_then(|a| a.preview.as_ref())
-            .map(TextData::to_shape)
-    }
-
-    /// 需要隐藏的图元序号：重新编辑的原文字，或正在拖动的选中文字。
-    pub fn hidden_shape(&self) -> Option<usize> {
-        if let Some(edit) = self.editing.as_ref() {
-            return edit.replacing;
-        }
-        match self.text_adjust.as_ref() {
-            Some(TextAdjust {
-                target: AdjustTarget::Selected(index),
-                preview: Some(_),
-                ..
-            }) => Some(*index),
-            _ => None,
+            .corner(anchor_corner(vertical));
         }
     }
 
     /// 取消自动换行（双击边手柄）；有变化返回 `true`。选中状态下算一步撤销。
     pub fn clear_wrap(&mut self) -> bool {
-        self.text_adjust = None;
-        if let Some(edit) = self.editing.as_mut() {
-            return edit.wrap.take().is_some();
+        match &mut self.state {
+            State::Editing { edit, adjust } => {
+                *adjust = None;
+                edit.wrap.take().is_some()
+            }
+            State::Selected { index, adjust } => {
+                *adjust = None;
+                let index = *index;
+                let Some(old) = self
+                    .document
+                    .shapes()
+                    .get(index)
+                    .and_then(TextData::from_shape)
+                else {
+                    return false;
+                };
+                if old.wrap.is_none() {
+                    return false;
+                }
+                let mut new = old.clone();
+                new.wrap = None;
+                let anchor = old.anchor();
+                let corner = anchor_corner(new.vertical);
+                self.relayout(&mut new, anchor, corner);
+                self.document.replace(index, new.to_shape())
+            }
+            _ => false,
         }
-        let Some((index, old)) = self.selected_data() else {
-            return false;
+    }
+}
+
+#[cfg(test)]
+impl Annotator {
+    pub(crate) fn selected_text(&self) -> Option<usize> {
+        self.selected_shape()
+            .filter(|i| matches!(self.document.shapes().get(*i), Some(Shape::Text { .. })))
+    }
+
+    fn select_text(&mut self, index: usize) -> bool {
+        if matches!(self.document.shapes().get(index), Some(Shape::Text { .. })) {
+            self.select_shape(index)
+        } else {
+            false
+        }
+    }
+
+    fn deselect_text(&mut self) -> bool {
+        if self.selected_text().is_some() {
+            self.deselect()
+        } else {
+            false
+        }
+    }
+
+    fn active_text_box(&self) -> Option<TextBoxView> {
+        if self.tool != Some(Tool::Text) {
+            return None;
+        }
+        let crate::annotate::SelectionBox::Box { geometry, .. } = self.selection_box()? else {
+            return None;
         };
-        if old.wrap.is_none() {
-            return false;
+        Some(TextBoxView {
+            geometry: TextBox {
+                bounds: geometry.bounds,
+                rotation: geometry.rotation,
+                vertical: self.styles.text.vertical,
+            },
+            editing: self.is_editing(),
+        })
+    }
+
+    fn text_handle_at(&self, p: Point, tolerance: f64, rotate_distance: f64) -> Option<TextHandle> {
+        if self.tool != Some(Tool::Text) {
+            return None;
         }
-        let mut new = old.clone();
-        new.wrap = None;
-        let anchor = old.anchor();
-        let corner = anchor_corner(new.vertical);
-        self.relayout(&mut new, anchor, corner);
-        self.document.replace(index, new.to_shape())
+        self.shape_handle_at(p, tolerance, rotate_distance)
+            .and_then(text_handle_from)
+    }
+
+    fn begin_text_adjust(&mut self, handle: TextHandle, p: Point) -> bool {
+        self.begin_adjust(ShapeHandle::from(handle), p)
+    }
+
+    fn is_adjusting_text(&self) -> bool {
+        self.is_adjusting()
+    }
+
+    fn update_text_adjust(&mut self, p: Point) {
+        self.update_adjust(p);
+    }
+
+    fn finish_text_adjust(&mut self) -> bool {
+        self.finish_adjust()
+    }
+
+    fn text_preview(&self) -> Option<Shape> {
+        self.adjust_preview()
     }
 }
 

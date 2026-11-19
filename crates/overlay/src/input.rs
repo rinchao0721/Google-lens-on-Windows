@@ -2,21 +2,21 @@
 
 use std::rc::Rc;
 
-use lenswin_core::annotation::{Document, PALETTE, Shape, Tool};
+use lenswin_core::annotation::{Document, Endpoint, PALETTE, Shape, ShapeHandle, Tool};
 use lenswin_core::config::AnnotateConfig;
 use lenswin_core::geometry::{Point, Rect};
 use lenswin_core::monitor::{MonitorInfo, index_at};
 use lenswin_core::selection::{Selection, SelectionShape};
 use lenswin_core::snip::{ColorFormat, OverlayFlow, ToolbarAction, topmost_containing};
-use lenswin_core::text_box::{TextBox, TextHandle, round_to_i32};
+use lenswin_core::text_box::round_to_i32;
 
 use crate::adjust::{self, Direction, Handle, NudgeMode};
-use crate::annotate::{Annotator, EditKey, EditView, StyleView, TextBoxView, TextMeasure};
+use crate::annotate::{Annotator, EditKey, EditView, SelectionBox, StyleView, TextMeasure};
 use crate::hint::{self, Features, Hint, HintState, Stage};
 use crate::layout::{self, Hit, StripSpec, ToolbarButton, ToolbarLayout};
 use crate::modes::{Preview, SelectionTool};
 
-/// 按下和松开相距不超过该像素数时视为单击，用于窗口吸附。
+/// 按下和松开相距不超过该像素数时视为单击，用于窗口吸附与点选图元。
 const CLICK_SLOP: i64 = 2;
 
 /// 一次选区交互的结局。
@@ -59,7 +59,7 @@ pub enum Key {
     Edit(EditKey),
     /// 编辑文字时粘贴剪贴板快照。
     Paste,
-    /// 删除选中的文字。
+    /// 删除选中的图元。
     Delete,
     /// 撤销上一个标注。
     Undo,
@@ -168,9 +168,9 @@ pub struct Annotations<'a> {
     pub shapes: &'a [Shape],
     /// 已完成图元的版本号，变化时绘制缓存失效。
     pub revision: u64,
-    /// 重新编辑时被隐藏的图元序号。
+    /// 重新编辑或拖动预览时被隐藏的图元序号。
     pub hidden: Option<usize>,
-    /// 正在画的图元。
+    /// 正在画或拖动预览中的图元。
     pub draft: Option<Shape>,
 }
 
@@ -198,8 +198,8 @@ pub struct View<'a> {
     pub annotations: Annotations<'a>,
     /// 编辑中的文本框，只在它所在的显示器上有值。
     pub editor: Option<EditorView>,
-    /// 选中或编辑中的文字文本框，画虚线框和手柄。
-    pub text_box: Option<TextBoxView>,
+    /// 选中或编辑中的图元选框与手柄，只画在屏幕上。
+    pub selection_box: Option<SelectionBox>,
     /// 放大镜：光标位置与颜色格式。
     pub magnifier: Option<(Point, ColorFormat)>,
     /// 快捷键提示，为空表示不显示。
@@ -244,6 +244,7 @@ pub struct Interaction {
     /// 尚未取走的常驻选框回投。
     commits: Vec<Selection>,
     annotator: Annotator,
+    drag_press: Option<Point>,
     caret_visible: bool,
     blink_reset: bool,
     focus_request: Option<usize>,
@@ -272,20 +273,41 @@ fn is_click(a: Point, b: Point) -> bool {
         && (i64::from(a.y) - i64::from(b.y)).abs() <= CLICK_SLOP
 }
 
-/// 文字文本框上各部位的光标：缩放按旋转后的方向取最接近的系统缩放光标。
-fn text_cursor(handle: TextHandle, geometry: &TextBox) -> CursorKind {
-    let center = geometry.center();
-    let target = match handle {
-        TextHandle::Body | TextHandle::Border => return CursorKind::Move,
-        TextHandle::Rotate => return CursorKind::Hand,
-        TextHandle::Corner(corner) => geometry.corner(corner),
-        TextHandle::Edge(edge) => geometry
-            .edge_handles()
-            .iter()
-            .find(|(e, _)| *e == edge)
-            .map_or(center, |(_, p)| *p),
-    };
-    resize_cursor(target.0 - center.0, target.1 - center.1)
+/// 选中图元上各部位的光标：缩放按旋转或线段方向取最接近的系统缩放光标。
+fn shape_cursor(handle: ShapeHandle, selection: &SelectionBox) -> CursorKind {
+    match handle {
+        ShapeHandle::Body | ShapeHandle::Border => CursorKind::Move,
+        ShapeHandle::Rotate => CursorKind::Hand,
+        ShapeHandle::Endpoint(endpoint) => {
+            let SelectionBox::Endpoints { from, to } = selection else {
+                return CursorKind::Move;
+            };
+            let center = (
+                (f64::from(from.x) + f64::from(to.x)) / 2.0,
+                (f64::from(from.y) + f64::from(to.y)) / 2.0,
+            );
+            let target = match endpoint {
+                Endpoint::From => *from,
+                Endpoint::To => *to,
+            };
+            resize_cursor(
+                f64::from(target.x) - center.0,
+                f64::from(target.y) - center.1,
+            )
+        }
+        ShapeHandle::Corner(_) | ShapeHandle::Edge(_) => {
+            let SelectionBox::Box { geometry, .. } = selection else {
+                return CursorKind::Move;
+            };
+            let center = geometry.center();
+            let target = match handle {
+                ShapeHandle::Corner(corner) => geometry.corner(corner),
+                ShapeHandle::Edge(edge) => geometry.edge_center(edge),
+                _ => center,
+            };
+            resize_cursor(target.0 - center.0, target.1 - center.1)
+        }
+    }
 }
 
 /// 由中心指向手柄的方向取最接近的缩放光标（屏幕坐标，y 向下）。
@@ -325,6 +347,7 @@ impl Interaction {
             committed: None,
             commits: Vec::new(),
             annotator,
+            drag_press: None,
             caret_visible: true,
             blink_reset: false,
             focus_request: None,
@@ -424,6 +447,7 @@ impl Interaction {
         if self.outcome.is_none() {
             self.outcome = Some(outcome);
         }
+        self.drag_press = None;
         self.tool.reset();
         self.phase = Phase::Idle;
     }
@@ -495,83 +519,13 @@ impl Interaction {
             return;
         };
         self.hover = Some(p);
+        self.drag_press = None;
         self.sync_text_limit();
         match self.phase {
             Phase::Drawing { .. } => return,
-            Phase::Adjusting(mut adj) => {
-                if let Some(toolbar) = self.toolbar(&adj)
-                    && toolbar.covers(p)
-                {
-                    let hit = toolbar.hit(p);
-                    // 样式条和识别按钮不触发文本框确认；其余按钮先确认文字再执行
-                    if matches!(hit, Some(Hit::Button(btn)) if btn != ToolbarButton::Ocr) {
-                        self.annotator.confirm_text();
-                    }
-                    self.press_toolbar(adj, hit);
+            Phase::Adjusting(adj) => {
+                if self.press_adjusting(adj, p) {
                     return;
-                }
-                let text_tool = self.annotator.tool() == Some(Tool::Text) && self.annotating();
-                if text_tool {
-                    // 文字手柄优先于截屏选区手柄
-                    match (
-                        self.text_handle_at(p, adj.monitor),
-                        self.annotator.is_editing(),
-                    ) {
-                        (Some(TextHandle::Body), true) => return,
-                        (Some(handle), _) => {
-                            self.annotator.begin_text_adjust(handle, p);
-                            return;
-                        }
-                        _ => {}
-                    }
-                    if self.annotator.is_editing() {
-                        // 点框外只确认；点到别的文字则顺带选中它
-                        self.annotator.confirm_text();
-                        self.select_text_at(p);
-                        return;
-                    }
-                } else if self.annotator.is_editing() {
-                    self.annotator.confirm_text();
-                    return;
-                }
-                let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
-                match hit {
-                    // 有工具时选区内部用来画图，手柄仍然优先缩放
-                    Some(Handle::Body) if self.annotating() => {
-                        if text_tool {
-                            // 单击已有文字选中它；点空白处时有选中就只取消选中，否则新建文本框
-                            if self.select_text_at(p) || self.annotator.deselect_text() {
-                                return;
-                            }
-                            if let Some(bounds) = self.monitor_bounds(adj.monitor) {
-                                self.annotator.begin_text(p, &bounds, adj.monitor);
-                                self.focus_request = Some(adj.monitor);
-                                self.touch_caret();
-                            }
-                        } else if let Some(bounds) = self.monitor_bounds(adj.monitor) {
-                            self.annotator.press(p, &bounds);
-                        }
-                        return;
-                    }
-                    Some(handle) => {
-                        adj.grab = Some(Grab {
-                            handle,
-                            origin: p,
-                            start: adj.rect,
-                        });
-                        self.phase = Phase::Adjusting(adj);
-                        return;
-                    }
-                    None if self.annotating() => {
-                        if text_tool {
-                            self.annotator.deselect_text();
-                        }
-                        return;
-                    }
-                    None => {
-                        self.phase = Phase::Idle;
-                        self.history_index = None;
-                    }
                 }
             }
             Phase::Idle => {}
@@ -584,20 +538,135 @@ impl Interaction {
         self.phase = Phase::Drawing { window, press: p };
     }
 
-    /// 屏幕点命中当前文字文本框的哪个部位。
-    fn text_handle_at(&self, p: Point, monitor: usize) -> Option<TextHandle> {
+    /// 选区调整阶段的左键按下；已处理返回 `true`，返回 `false` 表示需在空闲态重画选区。
+    fn press_adjusting(&mut self, mut adj: Adjusting, p: Point) -> bool {
+        if let Some(toolbar) = self.toolbar(&adj)
+            && toolbar.covers(p)
+        {
+            let hit = toolbar.hit(p);
+            // 样式条和识别按钮不触发文本框确认；其余按钮先确认文字再执行
+            if matches!(hit, Some(Hit::Button(btn)) if btn != ToolbarButton::Ocr) {
+                self.annotator.confirm_text();
+            }
+            self.press_toolbar(adj, hit);
+            return true;
+        }
+        if self.annotator.is_editing() {
+            self.press_editing(adj.monitor, p);
+            return true;
+        }
+        let selected_hit = self
+            .annotating()
+            .then(|| self.shape_handle_at(p, adj.monitor))
+            .flatten();
+        if let Some(handle) = selected_hit
+            && !matches!(handle, ShapeHandle::Body | ShapeHandle::Border)
+        {
+            self.annotator.begin_adjust(handle, p);
+            return true;
+        }
+        let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
+        if let Some(handle) = hit
+            && handle != Handle::Body
+        {
+            adj.grab = Some(Grab {
+                handle,
+                origin: p,
+                start: adj.rect,
+            });
+            self.phase = Phase::Adjusting(adj);
+            return true;
+        }
+        if let Some(handle) = selected_hit {
+            self.annotator.begin_adjust(handle, p);
+            return true;
+        }
+        match hit {
+            Some(Handle::Body) if self.annotating() => {
+                self.press_annotate(p, adj.monitor);
+                true
+            }
+            Some(handle) => {
+                adj.grab = Some(Grab {
+                    handle,
+                    origin: p,
+                    start: adj.rect,
+                });
+                self.phase = Phase::Adjusting(adj);
+                true
+            }
+            None if self.annotating() => {
+                self.annotator.deselect();
+                true
+            }
+            None => {
+                self.phase = Phase::Idle;
+                self.history_index = None;
+                false
+            }
+        }
+    }
+
+    fn press_editing(&mut self, monitor: usize, p: Point) {
+        match self.shape_handle_at(p, monitor) {
+            Some(ShapeHandle::Body) => {}
+            Some(handle) => {
+                self.annotator.begin_adjust(handle, p);
+            }
+            None => {
+                self.annotator.confirm_text();
+                if self.annotator.tool() == Some(Tool::Text) {
+                    self.select_shape_at(p, monitor);
+                }
+            }
+        }
+    }
+
+    fn press_annotate(&mut self, p: Point, monitor: usize) {
+        let Some(bounds) = self.monitor_bounds(monitor) else {
+            return;
+        };
+        match self.annotator.tool() {
+            Some(Tool::Text) => {
+                if self.select_shape_at(p, monitor) || self.annotator.deselect() {
+                    return;
+                }
+                self.annotator.begin_text(p, &bounds, monitor);
+                self.focus_request = Some(monitor);
+                self.touch_caret();
+            }
+            Some(Tool::Number) => {
+                if self.select_shape_at(p, monitor) {
+                    return;
+                }
+                // 选中时点空白处直接放下一个序号，不用先点一下取消
+                self.annotator.deselect();
+                self.annotator.press(p, &bounds);
+            }
+            Some(_) => {
+                self.annotator.deselect();
+                self.drag_press = Some(p);
+                self.annotator.press(p, &bounds);
+            }
+            None => {}
+        }
+    }
+
+    /// 屏幕点命中当前选中框或编辑框的哪个部位。
+    fn shape_handle_at(&self, p: Point, monitor: usize) -> Option<ShapeHandle> {
         let dpi = self.dpi(monitor);
-        self.annotator.text_handle_at(
+        self.annotator.shape_handle_at(
             p,
             f64::from(layout::grip(dpi)),
             f64::from(layout::text_rotate_distance(dpi)),
         )
     }
 
-    /// 选中 `p` 处最上面的文字；没有文字返回 `false`。
-    fn select_text_at(&mut self, p: Point) -> bool {
-        match self.annotator.document().text_at(p) {
-            Some(index) => self.annotator.select_text(index),
+    /// 选中 `p` 处最上面的任意图元；没有命中返回 `false`。
+    fn select_shape_at(&mut self, p: Point, monitor: usize) -> bool {
+        let tolerance = f64::from(layout::grip(self.dpi(monitor)));
+        match self.annotator.document().shape_at(p, tolerance) {
+            Some(index) => self.annotator.select_shape(index),
             None => false,
         }
     }
@@ -612,8 +681,8 @@ impl Interaction {
         };
         self.hover = Some(p);
         self.sync_text_limit();
-        if self.annotator.is_adjusting_text() {
-            self.annotator.update_text_adjust(p);
+        if self.annotator.is_adjusting() {
+            self.annotator.update_adjust(p);
             return;
         }
         if self.annotator.is_drawing() {
@@ -649,12 +718,12 @@ impl Interaction {
         if self.outcome.is_some() {
             return;
         }
-        if self.annotator.is_adjusting_text() {
+        if self.annotator.is_adjusting() {
             if let Some(p) = self.point(window, local) {
                 self.hover = Some(p);
-                self.annotator.update_text_adjust(p);
+                self.annotator.update_adjust(p);
             }
-            self.annotator.finish_text_adjust();
+            self.annotator.finish_adjust();
             return;
         }
         if self.annotator.is_drawing() {
@@ -700,16 +769,20 @@ impl Interaction {
         }
     }
 
-    /// 标注拖拽结束：图元有效就加入文档。
+    /// 标注拖拽结束：图元有效就加入文档；只是原地单击且未生成图元时尝试选中此处图元。
     fn finish_annotation(&mut self, window: usize, local: (i32, i32)) {
-        let bounds = match self.phase {
-            Phase::Adjusting(adj) => self.monitor_bounds(adj.monitor),
-            _ => None,
+        let press = self.drag_press.take();
+        let (monitor, bounds) = match self.phase {
+            Phase::Adjusting(adj) => (adj.monitor, self.monitor_bounds(adj.monitor)),
+            _ => (0, None),
         };
         match (self.point(window, local), bounds) {
             (Some(p), Some(bounds)) => {
                 self.hover = Some(p);
-                self.annotator.release(p, &bounds);
+                let created = self.annotator.release(p, &bounds);
+                if !created && press.is_some_and(|start| is_click(start, p)) {
+                    self.select_shape_at(p, monitor);
+                }
             }
             _ => self.annotator.cancel_drawing(),
         }
@@ -725,8 +798,8 @@ impl Interaction {
             return false;
         };
         // 双击换行边手柄：取消自动换行
-        if let Some(TextHandle::Edge(_)) = self.text_handle_at(p, adj.monitor) {
-            self.annotator.finish_text_adjust();
+        if let Some(ShapeHandle::Edge(_)) = self.shape_handle_at(p, adj.monitor) {
+            self.annotator.finish_adjust();
             // 没有换行可取消时按普通双击处理，贴边的文字仍然能双击进入编辑
             if self.annotator.clear_wrap() {
                 return true;
@@ -783,6 +856,7 @@ impl Interaction {
 
     /// 右键：放弃正在进行的选区；没有选区时取消整个覆盖层。常驻选框直接退出。
     pub fn right_click(&mut self) {
+        self.drag_press = None;
         if self.is_live() {
             self.cancel();
             return;
@@ -792,7 +866,7 @@ impl Interaction {
             self.annotator.confirm_text();
             return;
         }
-        if self.annotator.deselect_text() {
+        if self.annotator.deselect() {
             return;
         }
         if self.annotator.exit_tool() {
@@ -817,14 +891,14 @@ impl Interaction {
             self.editing_key(key);
             return None;
         }
-        if self.annotator.selected_text().is_some() && self.annotating() {
+        if self.annotator.selected_shape().is_some() && self.annotating() {
             match key {
                 Key::Delete => {
                     self.annotator.delete_selected();
                     return None;
                 }
                 Key::Escape => {
-                    self.annotator.deselect_text();
+                    self.annotator.deselect();
                     return None;
                 }
                 Key::Arrow(direction) => {
@@ -839,6 +913,7 @@ impl Interaction {
         }
         match key {
             Key::Escape => {
+                self.drag_press = None;
                 if self.is_live() || !self.annotator.exit_tool() {
                     self.cancel();
                 }
@@ -847,6 +922,7 @@ impl Interaction {
                 if matches!(self.phase, Phase::Adjusting(_))
                     && self.options.flow == OverlayFlow::Toolbar
                 {
+                    self.drag_press = None;
                     if key == Key::Undo {
                         self.annotator.undo();
                     } else {
@@ -1061,7 +1137,7 @@ impl Interaction {
 
     /// 是否需要捕获鼠标：拖拽框选或拖动手柄期间。
     pub fn is_capturing(&self) -> bool {
-        if self.annotator.is_drawing() || self.annotator.is_adjusting_text() {
+        if self.annotator.is_drawing() || self.annotator.is_adjusting() {
             return true;
         }
         match self.phase {
@@ -1187,9 +1263,9 @@ impl Interaction {
                 draft: self
                     .annotator
                     .preview()
-                    .or_else(|| self.annotator.text_preview()),
+                    .or_else(|| self.annotator.adjust_preview()),
             },
-            text_box: self.annotator.active_text_box(),
+            selection_box: self.annotator.selection_box(),
             editor: self
                 .annotator
                 .edit_view()
@@ -1263,11 +1339,11 @@ impl Interaction {
         if self.annotator.is_drawing() {
             return CursorKind::Cross;
         }
-        if let (Some(handle), Some(view)) = (
+        if let (Some(handle), Some(selection)) = (
             self.annotator.adjusting_handle(),
-            self.annotator.active_text_box(),
+            self.annotator.selection_box(),
         ) {
-            return text_cursor(handle, &view.geometry);
+            return shape_cursor(handle, &selection);
         }
         let Some(p) = self.hover else {
             return CursorKind::Cross;
@@ -1275,13 +1351,24 @@ impl Interaction {
         if self.toolbar(&adj).is_some_and(|t| t.covers(p)) {
             return CursorKind::Arrow;
         }
-        if let (Some(handle), Some(view)) = (
-            self.text_handle_at(p, adj.monitor),
-            self.annotator.active_text_box(),
-        ) {
-            return text_cursor(handle, &view.geometry);
+        let shape_hit = self
+            .annotating()
+            .then(|| self.shape_handle_at(p, adj.monitor))
+            .flatten();
+        if let (Some(handle), Some(selection)) = (shape_hit, self.annotator.selection_box())
+            && !matches!(handle, ShapeHandle::Body | ShapeHandle::Border)
+        {
+            return shape_cursor(handle, &selection);
         }
         let hit = adjust::hit_test(&adj.rect, p, layout::grip(self.dpi(adj.monitor)));
+        if let Some(handle) = hit
+            && handle != Handle::Body
+        {
+            return cursor_for(handle);
+        }
+        if shape_hit.is_some() {
+            return CursorKind::Move;
+        }
         match hit {
             Some(Handle::Body) if self.annotator.tool() == Some(Tool::Text) => CursorKind::Text,
             Some(Handle::Body) if self.annotating() => CursorKind::Cross,
@@ -1315,7 +1402,7 @@ impl Interaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotate::EditKey;
+    use crate::annotate::{BoxKind, EditKey, SelectionBox};
     use crate::modes::{LassoTool, RectTool};
     use lenswin_core::annotation::NumberStyle;
 
@@ -1599,6 +1686,17 @@ mod tests {
     }
 
     #[test]
+    fn number_tool_places_next_number_while_previous_is_selected() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Number));
+        it.press(1, (200, 200));
+        it.release(1, (200, 200));
+        it.press(1, (300, 250));
+        it.release(1, (300, 250));
+        assert_eq!(it.view(1).annotations.shapes.len(), 2);
+    }
+
+    #[test]
     fn handles_win_over_drawing_and_outside_is_ignored() {
         let mut it = adjusting();
         click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
@@ -1620,6 +1718,8 @@ mod tests {
         let mut it = adjusting();
         click_button(&mut it, ToolbarButton::Tool(Tool::Line));
         drag_on_window(&mut it, (150, 150), (250, 250));
+        // 画完自动选中：首次右键取消选中，再右键退出工具
+        it.right_click();
         it.right_click();
         drag_on_window(&mut it, (300, 300), (320, 310));
         assert_eq!(adjusted_rect(&it), Some(Rect::new(120, 110, 400, 300)));
@@ -2249,7 +2349,13 @@ mod tests {
         click(&mut it, (180, 165));
         assert_eq!(it.annotator.selected_text(), Some(0));
         assert!(!it.is_editing());
-        assert!(it.view(1).text_box.is_some_and(|t| !t.editing));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Box {
+                kind: BoxKind::Text(_),
+                ..
+            })
+        ));
         click(&mut it, (350, 300));
         assert_eq!(it.annotator.selected_text(), None);
         assert!(!it.is_editing(), "有选中时点空白只取消选中");
@@ -2487,7 +2593,7 @@ mod tests {
         let mut it = with_text();
         click(&mut it, (180, 165));
         // 选中状态下的虚线框和手柄只在 View 里，文档里没有额外图元
-        assert!(it.view(1).text_box.is_some());
+        assert!(it.view(1).selection_box.is_some());
         assert_eq!(it.document().shapes().len(), 1);
     }
 
@@ -2993,5 +3099,282 @@ mod tests {
             }
             other => panic!("期望双击确认返回选区，实际为 {other:?}"),
         }
+    }
+
+    #[test]
+    fn drawn_shapes_auto_select_except_pen_and_highlighter() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        drag_on_window(&mut it, (130, 130), (200, 180));
+        assert_eq!(it.annotator.selected_shape(), Some(0));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Box {
+                kind: BoxKind::Rotatable,
+                ..
+            })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Ellipse));
+        drag_on_window(&mut it, (220, 130), (290, 180));
+        assert_eq!(it.annotator.selected_shape(), Some(1));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Box {
+                kind: BoxKind::Rotatable,
+                ..
+            })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (130, 220), (220, 220));
+        assert_eq!(it.annotator.selected_shape(), Some(2));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Endpoints { .. })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Arrow));
+        drag_on_window(&mut it, (240, 220), (330, 260));
+        assert_eq!(it.annotator.selected_shape(), Some(3));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Endpoints { .. })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Mosaic));
+        drag_on_window(&mut it, (320, 130), (390, 180));
+        assert_eq!(it.annotator.selected_shape(), Some(4));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Box {
+                kind: BoxKind::Scalable,
+                ..
+            })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Number));
+        click(&mut it, (420, 160));
+        assert_eq!(it.annotator.selected_shape(), Some(5));
+        assert!(matches!(
+            it.view(1).selection_box,
+            Some(SelectionBox::Box {
+                kind: BoxKind::Plain,
+                ..
+            })
+        ));
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        drag_on_window(&mut it, (140, 280), (220, 310));
+        assert_eq!(it.annotator.selected_shape(), None);
+        assert_eq!(it.view(1).selection_box, None);
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Highlighter));
+        drag_on_window(&mut it, (240, 280), (320, 310));
+        assert_eq!(it.annotator.selected_shape(), None);
+        assert_eq!(it.view(1).selection_box, None);
+    }
+
+    #[test]
+    fn click_selects_cross_tool_and_loads_style_while_drag_draws_new() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        let swatch = bar_layout(&it)
+            .strip
+            .and_then(|s| s.swatches.get(3).copied())
+            .expect("色块");
+        click(&mut it, (swatch.x + 2, swatch.y + 2));
+        drag_on_window(&mut it, (150, 150), (350, 320));
+        // 取消选中后，未选中矩形的空心内部与边框起拖都直接画新图元
+        it.right_click();
+        assert_eq!(it.annotator.selected_shape(), None);
+
+        click_button(&mut it, ToolbarButton::Tool(Tool::Arrow));
+        drag_on_window(&mut it, (200, 210), (280, 250));
+        assert_eq!(it.document().shapes().len(), 2);
+        assert!(matches!(
+            it.document().shapes().get(1),
+            Some(Shape::Arrow { .. })
+        ));
+
+        it.right_click();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (150, 200), (230, 200));
+        assert_eq!(it.document().shapes().len(), 3);
+        assert!(matches!(
+            it.document().shapes().get(2),
+            Some(Shape::Line { .. })
+        ));
+
+        // 切到画笔后单击未选中矩形边框：选中矩形、切回矩形工具并载入其颜色
+        it.right_click();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        click(&mut it, (350, 235));
+        assert_eq!(it.annotator.selected_shape(), Some(0));
+        assert_eq!(
+            it.view(1).toolbar.map(|t| t.active),
+            Some(Some(Tool::Rectangle))
+        );
+        assert_eq!(
+            it.view(1)
+                .toolbar
+                .and_then(|t| t.style)
+                .and_then(|s| s.swatch),
+            Some(3)
+        );
+
+        // 选中时点空白处只取消选中，不新建图元
+        click(&mut it, (450, 360));
+        assert_eq!(it.annotator.selected_shape(), None);
+        assert_eq!(it.document().shapes().len(), 3);
+
+        // 选中图元时在空白处直接按下拖动：取消原选中并画出新图元
+        click(&mut it, (350, 235));
+        assert_eq!(it.annotator.selected_shape(), Some(0));
+        drag_on_window(&mut it, (160, 350), (260, 380));
+        assert_eq!(it.document().shapes().len(), 4);
+        assert_eq!(it.annotator.selected_shape(), Some(3));
+    }
+
+    #[test]
+    fn rectangle_and_ellipse_rotate_resize_shift_and_cursor() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        drag_on_window(&mut it, (160, 160), (260, 220));
+        // 上方旋转手柄在 (210, 136)
+        it.mouse_move(1, (210, 136));
+        assert_eq!(it.cursor_kind(), CursorKind::Hand);
+        it.set_shift(true);
+        drag_to(&mut it, (210, 136), (280, 190));
+        it.set_shift(false);
+        assert!(matches!(
+            it.document().shapes().first(),
+            Some(Shape::Rectangle { rotation: 90, .. })
+        ));
+        assert_eq!(it.annotate_change(), None, "旋转角不进入配置");
+
+        // 旋转 90° 后原上边中点落在右侧 (240, 190)，光标应为水平缩放
+        it.mouse_move(1, (240, 190));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeWe);
+        it.mouse_move(1, (210, 190));
+        assert_eq!(it.cursor_kind(), CursorKind::Move);
+        it.mouse_move(1, (450, 360));
+        assert_eq!(it.cursor_kind(), CursorKind::Cross);
+        it.mouse_move(1, (600, 500));
+        assert_eq!(it.cursor_kind(), CursorKind::Arrow);
+
+        // 拖过对边自动翻转且维持有效框；Shift 拖角保持宽高比
+        click_button(&mut it, ToolbarButton::Tool(Tool::Ellipse));
+        drag_on_window(&mut it, (300, 200), (360, 240));
+        it.set_shift(true);
+        drag_to(&mut it, (360, 240), (420, 320));
+        it.set_shift(false);
+        match it.document().shapes().get(1) {
+            Some(Shape::Ellipse { from, to, .. }) => {
+                let w = (to.x - from.x).abs();
+                let h = (to.y - from.y).abs();
+                assert_eq!(w * 2, h * 3, "等比放大 60×40 后比例不变：{w}×{h}");
+            }
+            other => panic!("期望椭圆，实际为 {other:?}"),
+        }
+        // 上边拖过下边翻转
+        drag_to(&mut it, (360, 200), (360, 340));
+        match it.document().shapes().get(1) {
+            Some(Shape::Ellipse { from, to, .. }) => {
+                assert!(from.y < to.y && to.y > 280);
+            }
+            other => panic!("期望翻转后的椭圆，实际为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_pen_mosaic_number_handles_restyle_and_keys() {
+        let mut it = adjusting();
+        // 直线端点拖拽 + Shift 45° 吸附 + 端点光标
+        click_button(&mut it, ToolbarButton::Tool(Tool::Line));
+        drag_on_window(&mut it, (150, 150), (250, 150));
+        it.mouse_move(1, (250, 150));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeWe);
+        it.set_shift(true);
+        drag_to(&mut it, (250, 150), (250, 160));
+        it.set_shift(false);
+        assert!(matches!(
+            it.document().shapes().first(),
+            Some(Shape::Line { to, .. }) if *to == Point::new(250, 150)
+        ));
+
+        // 画笔单击选中 + 四角缩放 + 改色一步撤销
+        click_button(&mut it, ToolbarButton::Tool(Tool::Pen));
+        drag_on_window(&mut it, (150, 200), (210, 240));
+        assert_eq!(it.annotator.selected_shape(), None);
+        click(&mut it, (180, 220));
+        assert_eq!(it.annotator.selected_shape(), Some(1));
+        drag_to(&mut it, (210, 240), (270, 280));
+        assert!(matches!(
+            it.document().shapes().get(1),
+            Some(Shape::Pen { points, .. }) if points.last() == Some(&Point::new(270, 280))
+        ));
+        let swatch = bar_layout(&it)
+            .strip
+            .and_then(|s| s.swatches.get(2).copied())
+            .expect("色块");
+        click(&mut it, (swatch.x + 2, swatch.y + 2));
+        assert!(matches!(
+            it.document().shapes().get(1),
+            Some(Shape::Pen { color, .. }) if *color == PALETTE[2]
+        ));
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(it.annotator.selected_shape(), None);
+        assert!(matches!(
+            it.document().shapes().get(1),
+            Some(Shape::Pen { color, .. }) if *color == PALETTE[0]
+        ));
+
+        // 序号仅移动和样式切换，无缩放手柄
+        click_button(&mut it, ToolbarButton::Tool(Tool::Number));
+        click(&mut it, (350, 200));
+        assert_eq!(it.annotator.selected_shape(), Some(2));
+        let letter = bar_layout(&it)
+            .strip
+            .and_then(|s| s.number_styles.get(1).map(|(_, r)| *r))
+            .expect("1/A 按钮");
+        click(&mut it, (letter.x + 2, letter.y + 2));
+        it.key(Key::Arrow(Direction::Right), NudgeMode::Move, false);
+        it.key(Key::Arrow(Direction::Down), NudgeMode::Shrink, false);
+        assert!(matches!(
+            it.document().shapes().get(2),
+            Some(Shape::Number {
+                center,
+                style: NumberStyle::Letter,
+                ..
+            }) if *center == Point::new(351, 210)
+        ));
+
+        // Delete 删除选中图元，Undo/Redo 后取消选中
+        it.key(Key::Delete, NudgeMode::Move, false);
+        assert_eq!(it.annotator.selected_shape(), None);
+        assert_eq!(it.document().shapes().len(), 2);
+        it.key(Key::Undo, NudgeMode::Move, false);
+        assert_eq!(it.document().shapes().len(), 3);
+        assert_eq!(it.annotator.selected_shape(), None);
+        it.key(Key::Redo, NudgeMode::Move, false);
+        assert_eq!(it.document().shapes().len(), 2);
+        assert_eq!(it.annotator.selected_shape(), None);
+    }
+
+    #[test]
+    fn selected_shape_handle_beats_screenshot_selection_handle() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        drag_on_window(&mut it, (420, 320), (500, 400));
+        assert_eq!(it.annotator.selected_shape(), Some(0));
+        it.mouse_move(1, (500, 400));
+        assert_eq!(it.cursor_kind(), CursorKind::SizeNwse);
+        drag_to(&mut it, (500, 400), (540, 430));
+        assert_eq!(adjusted_rect(&it), Some(Rect::new(100, 100, 400, 300)));
+        assert!(matches!(
+            it.document().shapes().first(),
+            Some(Shape::Rectangle { to, .. }) if *to == Point::new(540, 430)
+        ));
     }
 }

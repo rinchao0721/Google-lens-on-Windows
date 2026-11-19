@@ -115,6 +115,9 @@ pub enum BoxEdge {
 }
 
 impl BoxEdge {
+    /// 全部四条边。
+    pub const ALL: [BoxEdge; 4] = [BoxEdge::Left, BoxEdge::Top, BoxEdge::Right, BoxEdge::Bottom];
+
     /// 拖动该边时固定不动的角：横排拖右边固定左上、拖左边固定右上；
     /// 竖排拖下边固定右上、拖上边固定右下（列从右往左排，右缘是起点）。
     pub const fn fixed_corner(self) -> BoxCorner {
@@ -141,15 +144,13 @@ pub enum TextHandle {
     Rotate,
 }
 
-/// 旋转后的文本框。
+/// 旋转后的矩形框：未旋转的本地框 `bounds` 绕中心顺时针旋转 `rotation` 度（屏幕坐标，y 向下）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextBox {
+pub struct RotatedBox {
     /// 未旋转的本地框。
     pub bounds: Rect,
     /// 顺时针旋转角度（度，`0..360`）。
     pub rotation: i32,
-    /// 竖排：换行边是上下边，旋转手柄在右侧。
-    pub vertical: bool,
 }
 
 fn sin_cos(rotation: i32) -> (f64, f64) {
@@ -158,8 +159,29 @@ fn sin_cos(rotation: i32) -> (f64, f64) {
         .sin_cos()
 }
 
-impl TextBox {
-    fn half(&self) -> (f64, f64) {
+fn round_u32(value: f64) -> u32 {
+    u32::try_from(round_to_i32(value).max(0)).unwrap_or(0)
+}
+
+fn min_f64(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(f64::INFINITY, f64::min)
+}
+
+fn max_f64(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(f64::NEG_INFINITY, f64::max)
+}
+
+impl RotatedBox {
+    /// 构造旋转框，角度自动规范到 `0..360`。
+    pub fn new(bounds: Rect, rotation: i32) -> Self {
+        Self {
+            bounds,
+            rotation: normalize_degrees(rotation),
+        }
+    }
+
+    /// 半宽与半高。
+    pub fn half(&self) -> (f64, f64) {
         (
             f64::from(self.bounds.width) / 2.0,
             f64::from(self.bounds.height) / 2.0,
@@ -202,6 +224,18 @@ impl TextBox {
         BoxCorner::ALL.map(|c| self.corner(c))
     }
 
+    /// 某条边中点的屏幕坐标。
+    pub fn edge_center(&self, edge: BoxEdge) -> PointF {
+        let (hw, hh) = self.half();
+        let local = match edge {
+            BoxEdge::Left => (-hw, 0.0),
+            BoxEdge::Right => (hw, 0.0),
+            BoxEdge::Top => (0.0, -hh),
+            BoxEdge::Bottom => (0.0, hh),
+        };
+        self.to_screen(local)
+    }
+
     /// 屏幕点是否落在旋转后的框内。
     pub fn contains(&self, p: PointF) -> bool {
         let (lx, ly) = self.to_local(p);
@@ -209,43 +243,63 @@ impl TextBox {
         lx.abs() <= hw && ly.abs() <= hh
     }
 
-    /// 旋转手柄的本地位置，距框边 `distance`。
-    fn rotate_local(&self, distance: f64) -> PointF {
+    /// 屏幕点到矩形四条边轮廓的最短距离（内部同样计算到边的距离，不视作实心）。
+    pub fn border_distance(&self, p: PointF) -> f64 {
+        let (lx, ly) = self.to_local(p);
         let (hw, hh) = self.half();
-        if self.vertical {
+        let (ax, ay) = (lx.abs(), ly.abs());
+        if ax <= hw && ay <= hh {
+            (hw - ax).min(hh - ay)
+        } else {
+            (ax - hw).max(0.0).hypot((ay - hh).max(0.0))
+        }
+    }
+
+    /// 旋转手柄的本地位置；`right_side` 为真时在右边，否则在上方。
+    fn rotate_local(&self, distance: f64, right_side: bool) -> PointF {
+        let (hw, hh) = self.half();
+        if right_side {
             (hw + distance, 0.0)
         } else {
             (0.0, -hh - distance)
         }
     }
 
-    /// 旋转手柄的屏幕位置。
-    pub fn rotate_handle(&self, distance: f64) -> PointF {
-        self.to_screen(self.rotate_local(distance))
+    /// 旋转手柄的屏幕位置；`right_side` 为真时在右边，否则在上方。
+    pub fn rotate_handle(&self, distance: f64, right_side: bool) -> PointF {
+        self.to_screen(self.rotate_local(distance, right_side))
     }
 
-    /// 换行边手柄的位置（边中点，屏幕坐标）：横排为左右边，竖排为上下边。
-    pub fn edge_handles(&self) -> [(BoxEdge, PointF); 2] {
-        let (hw, hh) = self.half();
-        if self.vertical {
-            [
-                (BoxEdge::Top, self.to_screen((0.0, -hh))),
-                (BoxEdge::Bottom, self.to_screen((0.0, hh))),
-            ]
-        } else {
-            [
-                (BoxEdge::Left, self.to_screen((-hw, 0.0))),
-                (BoxEdge::Right, self.to_screen((hw, 0.0))),
-            ]
-        }
+    /// 本地矩形经旋转后的屏幕外接框。
+    pub fn screen_bounds_of(&self, local: [PointF; 4]) -> Option<Rect> {
+        let points = local.map(|l| self.to_screen(l));
+        let left = min_f64(points.iter().map(|p| p.0));
+        let right = max_f64(points.iter().map(|p| p.0));
+        let top = min_f64(points.iter().map(|p| p.1));
+        let bottom = max_f64(points.iter().map(|p| p.1));
+        Rect::from_edges(
+            i64::from(round_to_i32(left.floor())),
+            i64::from(round_to_i32(top.floor())),
+            i64::from(round_to_i32(right.ceil())),
+            i64::from(round_to_i32(bottom.ceil())),
+        )
     }
 
-    /// 命中测试：`tolerance` 为手柄与边缘的抓取半径，`rotate_distance` 为旋转手柄到框边的距离。
+    /// 命中测试：`rotate_distance` 为 `None` 时不含旋转手柄，`edges` 指定参与命中的边。
     /// 优先级：旋转手柄 > 角 > 边手柄 > 边缘 > 内部。
-    pub fn hit(&self, p: PointF, tolerance: f64, rotate_distance: f64) -> Option<TextHandle> {
+    pub fn hit_handles(
+        &self,
+        p: PointF,
+        tolerance: f64,
+        rotate_distance: Option<f64>,
+        edges: &[BoxEdge],
+        right_rotate: bool,
+    ) -> Option<TextHandle> {
         let q = self.to_local(p);
         let near = |target: PointF| (q.0 - target.0).hypot(q.1 - target.1) <= tolerance;
-        if near(self.rotate_local(rotate_distance)) {
+        if let Some(distance) = rotate_distance
+            && near(self.rotate_local(distance, right_rotate))
+        {
             return Some(TextHandle::Rotate);
         }
         let (hw, hh) = self.half();
@@ -255,7 +309,26 @@ impl TextBox {
                 return Some(TextHandle::Corner(corner));
             }
         }
-        for (edge, _) in self.edge_handles() {
+        if let Some(edge) = self.hit_edge_list(q, hw, hh, tolerance, edges) {
+            return Some(TextHandle::Edge(edge));
+        }
+        let inside_outer = q.0.abs() <= hw + tolerance && q.1.abs() <= hh + tolerance;
+        let inside_inner = q.0.abs() <= hw - tolerance && q.1.abs() <= hh - tolerance;
+        if inside_outer && !inside_inner {
+            return Some(TextHandle::Border);
+        }
+        (q.0.abs() <= hw && q.1.abs() <= hh).then_some(TextHandle::Body)
+    }
+
+    fn hit_edge_list(
+        &self,
+        q: PointF,
+        hw: f64,
+        hh: f64,
+        tolerance: f64,
+        edges: &[BoxEdge],
+    ) -> Option<BoxEdge> {
+        for &edge in edges {
             let (ex, ey) = match edge {
                 BoxEdge::Left => (-hw, 0.0),
                 BoxEdge::Right => (hw, 0.0),
@@ -268,32 +341,216 @@ impl TextBox {
                 BoxEdge::Top | BoxEdge::Bottom => (tolerance * 2.0, tolerance),
             };
             if (q.0 - ex).abs() <= along_x && (q.1 - ey).abs() <= along_y {
-                return Some(TextHandle::Edge(edge));
+                return Some(edge);
             }
         }
-        let inside_outer = q.0.abs() <= hw + tolerance && q.1.abs() <= hh + tolerance;
-        let inside_inner = q.0.abs() <= hw - tolerance && q.1.abs() <= hh - tolerance;
-        if inside_outer && !inside_inner {
-            return Some(TextHandle::Border);
+        None
+    }
+
+    /// 拖动角缩放：以对角为锚点，支持 `keep_aspect` 等比、拖过对边自动翻转与最小尺寸；
+    /// 返回新框与 `(水平翻转, 垂直翻转)`。
+    pub fn resize_corner(
+        &self,
+        corner: BoxCorner,
+        pointer: PointF,
+        keep_aspect: bool,
+        min_size: (u32, u32),
+    ) -> (Rect, bool, bool) {
+        let (hw, hh) = self.half();
+        let (start_w, start_h) = (f64::from(self.bounds.width), f64::from(self.bounds.height));
+        let (min_w, min_h) = (f64::from(min_size.0), f64::from(min_size.1));
+        let anchor_corner = corner.opposite();
+        let (ax_sign, ay_sign) = anchor_corner.signs();
+        let (ax_local, ay_local) = (ax_sign * hw, ay_sign * hh);
+        let (px, py) = self.to_local(pointer);
+        let (dx, dy) = (px - ax_local, py - ay_local);
+        let (init_sx, init_sy) = (-ax_sign, -ay_sign);
+        let sx = axis_sign(dx, init_sx);
+        let sy = axis_sign(dy, init_sy);
+        let (new_w, new_h) =
+            scaled_dimensions((start_w, start_h), (dx, dy), (min_w, min_h), keep_aspect);
+        let w = round_u32(new_w).max(min_size.0);
+        let h = round_u32(new_h).max(min_size.1);
+        let cx_local = ax_local + sx * f64::from(w) / 2.0;
+        let cy_local = ay_local + sy * f64::from(h) / 2.0;
+        let rect = self.rect_from_local_center((cx_local, cy_local), w, h);
+        (rect, (sx - init_sx).abs() > 0.5, (sy - init_sy).abs() > 0.5)
+    }
+
+    /// 拖动边中点缩放：只改变该方向尺寸，固定对边，拖过对边自动翻转；
+    /// 返回新框与 `(水平翻转, 垂直翻转)`。
+    pub fn resize_edge(
+        &self,
+        edge: BoxEdge,
+        pointer: PointF,
+        min_size: (u32, u32),
+    ) -> (Rect, bool, bool) {
+        let (hw, hh) = self.half();
+        let (px, py) = self.to_local(pointer);
+        match edge {
+            BoxEdge::Right | BoxEdge::Left => {
+                let (anchor_x, init_sx) = if edge == BoxEdge::Right {
+                    (-hw, 1.0)
+                } else {
+                    (hw, -1.0)
+                };
+                let dx = px - anchor_x;
+                let sx = axis_sign(dx, init_sx);
+                let w = round_u32(dx.abs()).max(min_size.0);
+                let cx_local = anchor_x + sx * f64::from(w) / 2.0;
+                let rect = self.rect_from_local_center((cx_local, 0.0), w, self.bounds.height);
+                (rect, (sx - init_sx).abs() > 0.5, false)
+            }
+            BoxEdge::Bottom | BoxEdge::Top => {
+                let (anchor_y, init_sy) = if edge == BoxEdge::Bottom {
+                    (-hh, 1.0)
+                } else {
+                    (hh, -1.0)
+                };
+                let dy = py - anchor_y;
+                let sy = axis_sign(dy, init_sy);
+                let h = round_u32(dy.abs()).max(min_size.1);
+                let cy_local = anchor_y + sy * f64::from(h) / 2.0;
+                let rect = self.rect_from_local_center((0.0, cy_local), self.bounds.width, h);
+                (rect, false, (sy - init_sy).abs() > 0.5)
+            }
         }
-        (q.0.abs() <= hw && q.1.abs() <= hh).then_some(TextHandle::Body)
+    }
+
+    fn rect_from_local_center(&self, center_local: PointF, width: u32, height: u32) -> Rect {
+        let center = self.to_screen(center_local);
+        Rect::new(
+            round_to_i32(center.0 - f64::from(width) / 2.0),
+            round_to_i32(center.1 - f64::from(height) / 2.0),
+            width,
+            height,
+        )
+    }
+}
+
+fn axis_sign(delta: f64, fallback: f64) -> f64 {
+    if delta > 0.0 {
+        1.0
+    } else if delta < 0.0 {
+        -1.0
+    } else {
+        fallback
+    }
+}
+
+fn scaled_dimensions(
+    start: (f64, f64),
+    delta: (f64, f64),
+    min: (f64, f64),
+    keep_aspect: bool,
+) -> (f64, f64) {
+    if !keep_aspect {
+        return (delta.0.abs().max(min.0), delta.1.abs().max(min.1));
+    }
+    match (start.0 > 0.0, start.1 > 0.0) {
+        (true, true) => {
+            let scale = (delta.0.abs() / start.0)
+                .max(delta.1.abs() / start.1)
+                .max(min.0 / start.0)
+                .max(min.1 / start.1);
+            (start.0 * scale, start.1 * scale)
+        }
+        (true, false) => ((delta.0.abs()).max(min.0), 0.0),
+        (false, true) => (0.0, (delta.1.abs()).max(min.1)),
+        (false, false) => min,
+    }
+}
+
+/// 旋转后的文本框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextBox {
+    /// 未旋转的本地框。
+    pub bounds: Rect,
+    /// 顺时针旋转角度（度，`0..360`）。
+    pub rotation: i32,
+    /// 竖排：换行边是上下边，旋转手柄在右侧。
+    pub vertical: bool,
+}
+
+impl TextBox {
+    /// 转为通用的旋转框。
+    pub fn rotated(&self) -> RotatedBox {
+        RotatedBox {
+            bounds: self.bounds,
+            rotation: self.rotation,
+        }
+    }
+
+    fn half(&self) -> (f64, f64) {
+        self.rotated().half()
+    }
+
+    /// 旋转中心（屏幕坐标）。
+    pub fn center(&self) -> PointF {
+        self.rotated().center()
+    }
+
+    /// 屏幕点转为相对中心、未旋转的本地坐标。
+    pub fn to_local(&self, p: PointF) -> PointF {
+        self.rotated().to_local(p)
+    }
+
+    /// 相对中心的本地坐标转为屏幕点。
+    pub fn to_screen(&self, local: PointF) -> PointF {
+        self.rotated().to_screen(local)
+    }
+
+    /// 某个角的屏幕坐标。
+    pub fn corner(&self, corner: BoxCorner) -> PointF {
+        self.rotated().corner(corner)
+    }
+
+    /// 四个角的屏幕坐标，顺序为左上、右上、右下、左下。
+    pub fn corners(&self) -> [PointF; 4] {
+        self.rotated().corners()
+    }
+
+    /// 屏幕点是否落在旋转后的框内。
+    pub fn contains(&self, p: PointF) -> bool {
+        self.rotated().contains(p)
+    }
+
+    /// 旋转手柄的屏幕位置。
+    pub fn rotate_handle(&self, distance: f64) -> PointF {
+        self.rotated().rotate_handle(distance, self.vertical)
+    }
+
+    /// 换行边手柄的位置（边中点，屏幕坐标）：横排为左右边，竖排为上下边。
+    pub fn edge_handles(&self) -> [(BoxEdge, PointF); 2] {
+        let r = self.rotated();
+        if self.vertical {
+            [
+                (BoxEdge::Top, r.edge_center(BoxEdge::Top)),
+                (BoxEdge::Bottom, r.edge_center(BoxEdge::Bottom)),
+            ]
+        } else {
+            [
+                (BoxEdge::Left, r.edge_center(BoxEdge::Left)),
+                (BoxEdge::Right, r.edge_center(BoxEdge::Right)),
+            ]
+        }
+    }
+
+    /// 命中测试：`tolerance` 为手柄与边缘的抓取半径，`rotate_distance` 为旋转手柄到框边的距离。
+    /// 优先级：旋转手柄 > 角 > 边手柄 > 边缘 > 内部。
+    pub fn hit(&self, p: PointF, tolerance: f64, rotate_distance: f64) -> Option<TextHandle> {
+        let edges: [BoxEdge; 2] = if self.vertical {
+            [BoxEdge::Top, BoxEdge::Bottom]
+        } else {
+            [BoxEdge::Left, BoxEdge::Right]
+        };
+        self.rotated()
+            .hit_handles(p, tolerance, Some(rotate_distance), &edges, self.vertical)
     }
 
     /// 本地矩形经旋转后的屏幕外接框；用于输入法候选窗排除区域。
     pub fn screen_bounds_of(&self, local: [PointF; 4]) -> Option<Rect> {
-        let points = local.map(|l| self.to_screen(l));
-        let xs = points.iter().map(|p| p.0);
-        let ys = points.iter().map(|p| p.1);
-        let min = |it: &mut dyn Iterator<Item = f64>| it.fold(f64::INFINITY, f64::min);
-        let max = |it: &mut dyn Iterator<Item = f64>| it.fold(f64::NEG_INFINITY, f64::max);
-        let (left, right) = (min(&mut xs.clone()), max(&mut xs.clone()));
-        let (top, bottom) = (min(&mut ys.clone()), max(&mut ys.clone()));
-        Rect::from_edges(
-            i64::from(round_to_i32(left.floor())),
-            i64::from(round_to_i32(top.floor())),
-            i64::from(round_to_i32(right.ceil())),
-            i64::from(round_to_i32(bottom.ceil())),
-        )
+        self.rotated().screen_bounds_of(local)
     }
 }
 
@@ -698,5 +955,78 @@ mod tests {
         assert_eq!(r, Rect::new(40, 24, 20, 2));
         let flat = tb(0, 0, 100, 50, 0, false);
         assert_eq!(flat.screen_bounds_of(local), Some(Rect::new(49, 15, 2, 20)));
+    }
+
+    #[test]
+    fn rotated_box_border_distance_handles_inside_outside_and_rotation() {
+        let r = RotatedBox::new(Rect::new(100, 100, 80, 40), 0);
+        assert!((r.border_distance((100.0, 120.0)) - 0.0).abs() < 1e-6);
+        assert!((r.border_distance((140.0, 120.0)) - 20.0).abs() < 1e-6);
+        assert!((r.border_distance((94.0, 120.0)) - 6.0).abs() < 1e-6);
+        assert!((r.border_distance((97.0, 96.0)) - 5.0).abs() < 1e-6);
+
+        let r90 = RotatedBox::new(Rect::new(0, 0, 100, 20), 90);
+        // 中心 (50, 10)，旋转 90° 后长边垂直，上端边中心在 (50, -40)
+        assert!((r90.border_distance((50.0, -40.0)) - 0.0).abs() < 1e-6);
+        assert!((r90.border_distance((50.0, 10.0)) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotated_box_corner_resize_supports_flip_aspect_and_min_size() {
+        let r = RotatedBox::new(Rect::new(100, 100, 80, 40), 0);
+        let (grown, fx, fy) =
+            r.resize_corner(BoxCorner::BottomRight, (260.0, 180.0), false, (2, 2));
+        assert_eq!(
+            (grown, fx, fy),
+            (Rect::new(100, 100, 160, 80), false, false)
+        );
+
+        // 拖过左上角发生双向翻转
+        let (flipped, fx, fy) =
+            r.resize_corner(BoxCorner::BottomRight, (40.0, 80.0), false, (2, 2));
+        assert_eq!((flipped, fx, fy), (Rect::new(40, 80, 60, 20), true, true));
+
+        // Shift 等比放大：80x40，x 拉到 260 (2x)，y 只拉到 150 (1.25x)，按较大比例 2x 放大
+        let (kept, fx, fy) = r.resize_corner(BoxCorner::BottomRight, (260.0, 150.0), true, (2, 2));
+        assert_eq!((kept, fx, fy), (Rect::new(100, 100, 160, 80), false, false));
+
+        // 最小尺寸夹紧且等比时不破坏比例
+        let (clamped, _, _) = r.resize_corner(BoxCorner::BottomRight, (100.0, 100.0), true, (2, 2));
+        assert_eq!(clamped, Rect::new(100, 100, 4, 2));
+    }
+
+    #[test]
+    fn rotated_box_edge_resize_changes_single_axis_and_rotates() {
+        let r = RotatedBox::new(Rect::new(100, 100, 80, 40), 0);
+        let (wider, fx, fy) = r.resize_edge(BoxEdge::Right, (220.0, 300.0), (2, 2));
+        assert_eq!(
+            (wider, fx, fy),
+            (Rect::new(100, 100, 120, 40), false, false)
+        );
+        let (flipped, fx, fy) = r.resize_edge(BoxEdge::Left, (210.0, 120.0), (2, 2));
+        assert_eq!(
+            (flipped, fx, fy),
+            (Rect::new(180, 100, 30, 40), true, false)
+        );
+
+        // 旋转 90° 后，本地右边朝正下方；固定边 Top/Left 仍在锚点
+        let r90 = RotatedBox::new(Rect::new(100, 100, 80, 40), 90);
+        let anchor_before = r90.corner(BoxCorner::TopLeft);
+        let c = r90.center();
+        let (bounds, _, _) = r90.resize_edge(BoxEdge::Right, (c.0, c.1 + 100.0), (2, 2));
+        let after = RotatedBox::new(bounds, 90);
+        let anchor_after = after.corner(BoxCorner::TopLeft);
+        assert!((anchor_before.0 - anchor_after.0).abs() <= 1.0);
+        assert!((anchor_before.1 - anchor_after.1).abs() <= 1.0);
+        assert_eq!(bounds.width, 140);
+        assert_eq!(bounds.height, 40);
+    }
+
+    #[test]
+    fn rotated_box_zero_size_resize_does_not_nan_or_panic() {
+        let zero = RotatedBox::new(Rect::new(-50, -30, 0, 40), 359);
+        let (next, _, _) = zero.resize_corner(BoxCorner::BottomRight, (-10.0, 20.0), true, (0, 2));
+        assert_eq!(next.width, 0);
+        assert!(next.height >= 2);
     }
 }

@@ -531,13 +531,26 @@ impl Painter<'_> {
                 to,
                 color: c,
                 width,
+                rotation,
             } => {
                 let rect = box_rect(*from, *to, origin);
+                if *rotation != 0 {
+                    self.set_rotation(
+                        (
+                            (rect.left + rect.right) / 2.0,
+                            (rect.top + rect.bottom) / 2.0,
+                        ),
+                        *rotation,
+                    );
+                }
                 // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效，矩形为局部变量。
                 unsafe {
                     brush.SetColor(&solid(*c, 1.0));
                     self.target
                         .DrawRectangle(&rect, brush, to_f32(i64::from(*width)), None);
+                }
+                if *rotation != 0 {
+                    self.reset_transform();
                 }
             }
             Shape::Ellipse {
@@ -545,6 +558,7 @@ impl Painter<'_> {
                 to,
                 color: c,
                 width,
+                rotation,
             } => {
                 let rect = box_rect(*from, *to, origin);
                 let mut ellipse = float_point(
@@ -553,11 +567,17 @@ impl Painter<'_> {
                 );
                 ellipse.radiusX = (rect.right - rect.left) / 2.0;
                 ellipse.radiusY = (rect.bottom - rect.top) / 2.0;
+                if *rotation != 0 {
+                    self.set_rotation((ellipse.point.X, ellipse.point.Y), *rotation);
+                }
                 // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效，椭圆为局部变量。
                 unsafe {
                     brush.SetColor(&solid(*c, 1.0));
                     self.target
                         .DrawEllipse(&ellipse, brush, to_f32(i64::from(*width)), None);
+                }
+                if *rotation != 0 {
+                    self.reset_transform();
                 }
             }
             Shape::Line {
