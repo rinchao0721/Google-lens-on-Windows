@@ -81,6 +81,8 @@ pub enum ToolbarButton {
 pub enum Glyph {
     /// 图标字体里的码位。
     Icon(char),
+    /// 自绘矢量图标（矩形外框加中间上下双向箭头）。
+    LongCapture,
     /// 固定文字，不依赖图标字体。
     Text(&'static str),
 }
@@ -111,7 +113,7 @@ impl ToolbarButton {
         ToolbarButton::Copy,
     ];
 
-    /// Segoe Fluent Icons / Segoe MDL2 Assets 中的图标码位；序号用数字字符。
+    /// Segoe Fluent Icons / Segoe MDL2 Assets 中的图标码位；序号用数字字符，长截图自绘。
     pub const fn glyph(self) -> Glyph {
         match self {
             ToolbarButton::Tool(Tool::Rectangle) => Glyph::Icon('\u{E739}'),
@@ -128,7 +130,7 @@ impl ToolbarButton {
             ToolbarButton::Search => Glyph::Icon('\u{E721}'),
             ToolbarButton::Pin => Glyph::Icon('\u{E718}'),
             ToolbarButton::Ocr => Glyph::Icon('\u{E8E9}'),
-            ToolbarButton::LongCapture => Glyph::Icon('\u{E8A5}'),
+            ToolbarButton::LongCapture => Glyph::LongCapture,
             ToolbarButton::Save => Glyph::Icon('\u{E74E}'),
             ToolbarButton::Cancel => Glyph::Icon('\u{E711}'),
             ToolbarButton::Copy => Glyph::Icon('\u{E8C8}'),
@@ -156,6 +158,30 @@ impl ToolbarButton {
             ToolbarButton::Save => "保存",
             ToolbarButton::Cancel => "取消",
             ToolbarButton::Copy => "复制",
+        }
+    }
+
+    /// 鼠标悬停提示文字（含实际可用的快捷键）。
+    pub const fn tooltip(self) -> &'static str {
+        match self {
+            ToolbarButton::Tool(Tool::Rectangle) => "矩形",
+            ToolbarButton::Tool(Tool::Ellipse) => "椭圆",
+            ToolbarButton::Tool(Tool::Line) => "直线",
+            ToolbarButton::Tool(Tool::Arrow) => "箭头",
+            ToolbarButton::Tool(Tool::Pen) => "画笔",
+            ToolbarButton::Tool(Tool::Highlighter) => "荧光笔",
+            ToolbarButton::Tool(Tool::Mosaic) => "马赛克",
+            ToolbarButton::Tool(Tool::Number) => "序号",
+            ToolbarButton::Tool(Tool::Text) => "文字",
+            ToolbarButton::Undo => "撤销 Ctrl+Z",
+            ToolbarButton::Redo => "重做 Ctrl+Y",
+            ToolbarButton::Search => "以图搜图",
+            ToolbarButton::Pin => "贴图 Ctrl+T",
+            ToolbarButton::Ocr => "识别文字",
+            ToolbarButton::LongCapture => "长截图",
+            ToolbarButton::Save => "保存",
+            ToolbarButton::Cancel => "取消 Esc",
+            ToolbarButton::Copy => "复制 Enter",
         }
     }
 }
@@ -766,6 +792,161 @@ impl ScrollButton {
             ScrollButton::Cancel => Some(ToolbarButton::Cancel),
         }
     }
+
+    /// 鼠标悬停提示文字（含面板内可用快捷键）。
+    pub const fn tooltip(self, auto_scrolling: bool) -> &'static str {
+        match self {
+            ScrollButton::AutoScroll if auto_scrolling => "停止自动滚动",
+            ScrollButton::AutoScroll => "自动滚动",
+            ScrollButton::Copy => "复制",
+            ScrollButton::Save => "保存",
+            ScrollButton::Pin => "贴图",
+            ScrollButton::Search => "以图搜图",
+            ScrollButton::Ocr => "识别文字",
+            ScrollButton::Cancel => "取消 Esc",
+        }
+    }
+}
+
+/// 悬停提示定时器控制指令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TooltipCommand {
+    /// 维持现状，不改动计时器。
+    Keep,
+    /// 启动或重置延迟计时器。
+    Arm,
+    /// 取消延迟计时器。
+    Disarm,
+}
+
+/// 按钮悬停提示纯状态机：移入目标约 400 ms 后才显示，移出或按下立即隐藏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooltipState<T> {
+    target: Option<T>,
+    shown: bool,
+}
+
+impl<T> Default for TooltipState<T> {
+    fn default() -> Self {
+        Self {
+            target: None,
+            shown: false,
+        }
+    }
+}
+
+impl<T: Copy + Eq> TooltipState<T> {
+    /// 光标移入或离开按钮；返回 `(定时器指令, 提示可见性是否变化)`。
+    pub fn on_hover(&mut self, next: Option<T>) -> (TooltipCommand, bool) {
+        if self.target == next {
+            return (TooltipCommand::Keep, false);
+        }
+        let was_shown = self.shown;
+        self.target = next;
+        self.shown = false;
+        let cmd = if next.is_some() {
+            TooltipCommand::Arm
+        } else {
+            TooltipCommand::Disarm
+        };
+        (cmd, was_shown)
+    }
+
+    /// 悬停计时器到期：若有目标且尚未显示则转为显示，返回是否需要重绘。
+    pub fn on_timer(&mut self) -> bool {
+        if self.target.is_some() && !self.shown {
+            self.shown = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 按下鼠标或开始交互时立即隐藏提示，并保持当前命中目标直到光标离开或切换按钮，避免松手前原地重弹。
+    pub fn on_press(&mut self) -> (TooltipCommand, bool) {
+        let was_shown = self.shown;
+        self.shown = false;
+        (TooltipCommand::Disarm, was_shown)
+    }
+
+    /// 清空当前悬停与提示状态。
+    pub fn reset(&mut self) -> (TooltipCommand, bool) {
+        let was_shown = self.shown;
+        self.target = None;
+        self.shown = false;
+        (TooltipCommand::Disarm, was_shown)
+    }
+
+    /// 当前正在显示的提示目标。
+    pub fn visible_target(&self) -> Option<T> {
+        if self.shown { self.target } else { None }
+    }
+}
+
+/// 根据文字测量宽度计算提示气泡的宽高（含水平与垂直内边距）。
+pub fn tooltip_size(text_width: u32, dpi: u32) -> (u32, u32) {
+    let pad_x = scaled(8, dpi);
+    let height = scaled(24, dpi);
+    let width = text_width.saturating_add(pad_x.saturating_mul(2));
+    (width, height)
+}
+
+/// 在 `anchor` 按钮旁定位提示气泡：优先放在上方居中，若超出 `bounds` 或与 `avoid` 重叠则翻到下方，并钳制在 `bounds` 内。
+pub fn tooltip_rect(
+    anchor: &Rect,
+    bounds: &Rect,
+    avoid: Option<&Rect>,
+    size: (u32, u32),
+    dpi: u32,
+) -> Rect {
+    let gap = i64::from(scaled(GAP, dpi));
+    let margin = i64::from(scaled(4, dpi));
+    let b = edges(bounds);
+    let w = i64::from(size.0).min((b.2 - b.0).max(1));
+    let h = i64::from(size.1).min((b.3 - b.1).max(1));
+
+    let min_x = if b.2 - b.0 >= w + margin * 2 {
+        b.0 + margin
+    } else {
+        b.0
+    };
+    let max_x = if b.2 - b.0 >= w + margin * 2 {
+        b.2 - margin - w
+    } else {
+        b.2 - w
+    };
+    let center_x = i64::from(anchor.x) + i64::from(anchor.width) / 2 - w / 2;
+    let x = center_x.clamp(min_x, max_x.max(min_x));
+
+    let above_y = i64::from(anchor.y) - gap - h;
+    let below_y = anchor.bottom() + gap;
+    let min_y = if b.3 - b.1 >= h + margin * 2 {
+        b.1 + margin
+    } else {
+        b.1
+    };
+    let max_y = if b.3 - b.1 >= h + margin * 2 {
+        b.3 - margin - h
+    } else {
+        b.3 - h
+    };
+
+    let candidate = |y: i64| Rect::from_edges(x, y, x + w, y + h).unwrap_or_default();
+    let above_rect = candidate(above_y);
+    let below_rect = candidate(below_y);
+    let hits_avoid = |r: &Rect| avoid.is_some_and(|av| r.intersect(av).is_some());
+
+    let above_ok = above_y >= min_y && !hits_avoid(&above_rect);
+    let below_ok = below_y <= max_y && !hits_avoid(&below_rect);
+    let y = if above_ok {
+        above_y
+    } else if below_ok || (below_y <= max_y && above_y < min_y) {
+        below_y
+    } else {
+        above_y.clamp(min_y, max_y.max(min_y))
+    };
+
+    Rect::from_edges(x, y, x + w, y + h).unwrap_or_default()
 }
 
 /// 长截图控制面板内部控件的窗口坐标布局。
@@ -1173,17 +1354,126 @@ mod tests {
             .chain(&ToolbarButton::ACTIONS);
         for button in all {
             assert!(!button.label().is_empty());
+            assert!(!button.tooltip().is_empty());
             match button.glyph() {
                 Glyph::Icon(c) => assert!(c as u32 >= 0xE000),
+                Glyph::LongCapture => assert_eq!(button.label(), "长截"),
                 Glyph::Text(t) => assert!(!t.is_empty()),
             }
         }
+        assert_eq!(ToolbarButton::LongCapture.glyph(), Glyph::LongCapture);
+        assert_eq!(ToolbarButton::Copy.tooltip(), "复制 Enter");
+        assert_eq!(ToolbarButton::Cancel.tooltip(), "取消 Esc");
+        assert_eq!(ToolbarButton::Undo.tooltip(), "撤销 Ctrl+Z");
+        assert_eq!(ToolbarButton::Redo.tooltip(), "重做 Ctrl+Y");
+        assert_eq!(ToolbarButton::Pin.tooltip(), "贴图 Ctrl+T");
+        assert_eq!(ToolbarButton::LongCapture.tooltip(), "长截图");
         for tool in Tool::ALL {
             assert_eq!(
                 ToolbarButton::Tool(tool).label().chars().count(),
                 1,
                 "{tool:?} 的退化文字应为单字"
             );
+        }
+    }
+
+    #[test]
+    fn scroll_buttons_have_tooltips_reflecting_auto_scroll_state() {
+        assert_eq!(ScrollButton::AutoScroll.tooltip(false), "自动滚动");
+        assert_eq!(ScrollButton::AutoScroll.tooltip(true), "停止自动滚动");
+        for button in ScrollButton::ACTIONS {
+            assert!(!button.tooltip(false).is_empty());
+        }
+        assert_eq!(ScrollButton::Cancel.tooltip(false), "取消 Esc");
+    }
+
+    #[test]
+    fn tooltip_state_delays_hides_on_leave_or_press_and_switches() {
+        let mut tip = TooltipState::default();
+        assert_eq!(tip.visible_target(), None);
+
+        // 移入按钮 A：需要武装计时器，尚未显示
+        assert_eq!(
+            tip.on_hover(Some(ScrollButton::Copy)),
+            (TooltipCommand::Arm, false)
+        );
+        assert_eq!(tip.visible_target(), None);
+        // 相同按钮移动不重复武装
+        assert_eq!(
+            tip.on_hover(Some(ScrollButton::Copy)),
+            (TooltipCommand::Keep, false)
+        );
+
+        // 计时器到期后显示
+        assert!(tip.on_timer());
+        assert_eq!(tip.visible_target(), Some(ScrollButton::Copy));
+        assert!(!tip.on_timer());
+
+        // 切换到按钮 B：立即隐藏旧提示并重新计时
+        assert_eq!(
+            tip.on_hover(Some(ScrollButton::Save)),
+            (TooltipCommand::Arm, true)
+        );
+        assert_eq!(tip.visible_target(), None);
+        assert!(tip.on_timer());
+        assert_eq!(tip.visible_target(), Some(ScrollButton::Save));
+
+        // 按下按钮：立即隐藏并取消计时，同一按钮内不再重弹
+        assert_eq!(tip.on_press(), (TooltipCommand::Disarm, true));
+        assert_eq!(tip.visible_target(), None);
+        assert_eq!(
+            tip.on_hover(Some(ScrollButton::Save)),
+            (TooltipCommand::Keep, false)
+        );
+
+        // 移出后再次移入：重新计时
+        assert_eq!(tip.on_hover(None), (TooltipCommand::Disarm, false));
+        assert_eq!(
+            tip.on_hover(Some(ScrollButton::Save)),
+            (TooltipCommand::Arm, false)
+        );
+        assert!(tip.on_timer());
+        assert_eq!(tip.visible_target(), Some(ScrollButton::Save));
+
+        // 移出时立即隐藏
+        assert_eq!(tip.on_hover(None), (TooltipCommand::Disarm, true));
+        assert_eq!(tip.visible_target(), None);
+    }
+
+    #[test]
+    fn tooltip_rect_stays_in_bounds_and_flips_when_blocked() {
+        // 默认放在按钮上方居中
+        let anchor = Rect::new(500, 400, 36, 32);
+        let tip = tooltip_rect(&anchor, &MONITOR, None, (80, 24), 96);
+        assert_eq!(tip, Rect::new(478, 370, 80, 24));
+
+        // 贴近顶部边界：翻到按钮下方
+        let top_anchor = Rect::new(500, 10, 36, 32);
+        let tip_top = tooltip_rect(&top_anchor, &MONITOR, None, (80, 24), 96);
+        assert_eq!(tip_top, Rect::new(478, 48, 80, 24));
+
+        // 上方被样式条遮挡：翻到按钮下方
+        let avoid = Rect::new(400, 354, 300, 40);
+        let tip_avoid = tooltip_rect(&anchor, &MONITOR, Some(&avoid), (80, 24), 96);
+        assert_eq!(tip_avoid, Rect::new(478, 438, 80, 24));
+
+        // 贴近左右边界：水平钳制不越界
+        let right_anchor = Rect::new(1880, 400, 36, 32);
+        let tip_right = tooltip_rect(&right_anchor, &MONITOR, None, (100, 24), 96);
+        assert_eq!(tip_right.right(), 1920 - 4);
+        assert_eq!(MONITOR.intersect(&tip_right), Some(tip_right));
+
+        let left_anchor = Rect::new(2, 400, 36, 32);
+        let tip_left = tooltip_rect(&left_anchor, &MONITOR, None, (100, 24), 96);
+        assert_eq!(tip_left.x, 4);
+        assert_eq!(MONITOR.intersect(&tip_left), Some(tip_left));
+
+        // 长截图控制面板内部所有按钮的提示都在面板范围内
+        let panel_size = scroll_panel_size(96);
+        let panel_layout = scroll_panel_layout(panel_size, 96);
+        for (_, btn_rect) in &panel_layout.buttons {
+            let r = tooltip_rect(btn_rect, &panel_layout.panel, None, (96, 24), 96);
+            assert_eq!(panel_layout.panel.intersect(&r), Some(r));
         }
     }
 

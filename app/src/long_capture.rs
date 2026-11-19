@@ -28,6 +28,9 @@ const MAX_PENDING_FRAMES: usize = 2;
 /// 自动滚动时允许的连续无位移帧数上限。
 const AUTO_SCROLL_NO_MOVE_LIMIT: u8 = 3;
 
+/// 触发「滚动太快」提示所需的连续 `TooFast` 帧数。
+const TOO_FAST_WARNING_THRESHOLD: u8 = 3;
+
 /// 从覆盖层回调投递到主线程的长截图 UI 事件。
 pub type ScrollMessage = (u64, ScrollEvent);
 
@@ -68,6 +71,7 @@ pub struct ScrollController {
     total_px: u32,
     reached_limit: bool,
     no_move_streak: u8,
+    too_fast_streak: u8,
     moved_once: bool,
     finishing: bool,
 }
@@ -111,6 +115,7 @@ impl ScrollController {
             total_px: 0,
             reached_limit: false,
             no_move_streak: 0,
+            too_fast_streak: 0,
             moved_once: false,
             finishing: false,
         }
@@ -130,6 +135,7 @@ impl ScrollController {
         if !enable {
             self.auto_scrolling = false;
             self.no_move_streak = 0;
+            self.too_fast_streak = 0;
             return AutoScrollAction::Stop {
                 status: self.idle_status(),
                 reset_ui: false,
@@ -144,6 +150,7 @@ impl ScrollController {
         }
         self.auto_scrolling = true;
         self.no_move_streak = 0;
+        self.too_fast_streak = 0;
         self.moved_once = false;
         let axis = self.axis.unwrap_or(ScrollAxis::Vertical);
         let status = if self.axis.is_some() {
@@ -202,12 +209,15 @@ impl ScrollController {
         preview: Option<CroppedImage>,
     ) -> StitchUiUpdate {
         match status {
-            StitchStatus::FirstFrame => StitchUiUpdate {
-                status: None,
-                auto_scrolling: None,
-                preview: Some((preview, self.axis)),
-                stop_timer: false,
-            },
+            StitchStatus::FirstFrame => {
+                self.too_fast_streak = 0;
+                StitchUiUpdate {
+                    status: None,
+                    auto_scrolling: None,
+                    preview: Some((preview, self.axis)),
+                    stop_timer: false,
+                }
+            }
             StitchStatus::Adopted {
                 total_px,
                 axis,
@@ -217,6 +227,7 @@ impl ScrollController {
                 self.total_px = total_px;
                 self.reached_limit = reached_limit;
                 self.no_move_streak = 0;
+                self.too_fast_streak = 0;
                 if self.auto_scrolling {
                     self.moved_once = true;
                 }
@@ -239,6 +250,7 @@ impl ScrollController {
                 }
             }
             StitchStatus::NoMove => {
+                self.too_fast_streak = 0;
                 if !self.auto_scrolling {
                     return StitchUiUpdate::default();
                 }
@@ -263,15 +275,21 @@ impl ScrollController {
             }
             StitchStatus::IgnoredBackward => {
                 self.no_move_streak = 0;
+                self.too_fast_streak = 0;
                 StitchUiUpdate::default()
             }
             StitchStatus::TooFast => {
                 self.no_move_streak = 0;
-                StitchUiUpdate {
-                    status: Some("滚动太快，请往回滚一点".to_string()),
-                    auto_scrolling: None,
-                    preview: None,
-                    stop_timer: false,
+                self.too_fast_streak = self.too_fast_streak.saturating_add(1);
+                if self.too_fast_streak >= TOO_FAST_WARNING_THRESHOLD {
+                    StitchUiUpdate {
+                        status: Some("滚动太快，请往回滚一点".to_string()),
+                        auto_scrolling: None,
+                        preview: None,
+                        stop_timer: false,
+                    }
+                } else {
+                    StitchUiUpdate::default()
                 }
             }
         }
@@ -284,6 +302,7 @@ impl ScrollController {
         self.finishing = true;
         self.auto_scrolling = false;
         self.no_move_streak = 0;
+        self.too_fast_streak = 0;
         true
     }
 }
@@ -711,14 +730,68 @@ mod tests {
             ctrl.on_stitch_status(StitchStatus::NoMove, None),
             StitchUiUpdate::default()
         );
-        let warn = ctrl.on_stitch_status(StitchStatus::TooFast, None);
-        assert_eq!(warn.status.as_deref(), Some("滚动太快，请往回滚一点"));
-        // TooFast 已清空无位移计数，下一次 NoMove 不应立刻停止
+        // 第 1 次 TooFast 清空 NoMove 计数，但尚未达到连续 3 帧警告阈值
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
+        // TooFast 已清空无位移计数，下一次 NoMove 不应立刻停止自动滚动
         assert_eq!(
             ctrl.on_stitch_status(StitchStatus::NoMove, None),
             StitchUiUpdate::default()
         );
         assert!(ctrl.is_auto_scrolling_for_test());
+    }
+
+    #[test]
+    fn too_fast_requires_three_consecutive_frames_and_recovers_on_adopted() {
+        let mut ctrl = ScrollController::new(Rect::new(0, 0, 200, 200));
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::FirstFrame, Some(img(100, 100)))
+                .status,
+            None
+        );
+
+        // 先出现两次 TooFast 被非 TooFast 打断，不应弹出警告
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::NoMove, None),
+            StitchUiUpdate::default()
+        );
+
+        // 重新连续 3 次 TooFast 才显示警告
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
+        let warn = ctrl.on_stitch_status(StitchStatus::TooFast, None);
+        assert_eq!(warn.status.as_deref(), Some("滚动太快，请往回滚一点"));
+
+        // 被采纳后恢复正常状态文字，并重置连续计数
+        let recovered = ctrl.on_stitch_status(
+            StitchStatus::Adopted {
+                total_px: 360,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            },
+            Some(img(100, 100)),
+        );
+        assert_eq!(recovered.status.as_deref(), Some("已拼接 360 px"));
+        assert_eq!(
+            ctrl.on_stitch_status(StitchStatus::TooFast, None),
+            StitchUiUpdate::default()
+        );
     }
 
     impl ScrollController {

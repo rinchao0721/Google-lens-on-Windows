@@ -41,20 +41,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
-    IsWindow, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SetCursor, SetWindowDisplayAffinity, SetWindowPos, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
-    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    IsWindow, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SetCursor, SetTimer, SetWindowDisplayAffinity, SetWindowPos, UnregisterClassW,
+    WDA_EXCLUDEFROMCAPTURE, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::error::{OverlayError, win32};
 use crate::input::point_from_lparam;
-use crate::layout::{self, ScrollButton, ScrollPanelLayout};
+use crate::layout::{self, ScrollButton, ScrollPanelLayout, TooltipCommand, TooltipState};
 use crate::render::{
-    Brushes, CORNER_RADIUS, Fonts, Renderer, color, draw_button_glyph_on, fill_rounded,
-    rect_to_d2d, rgba_to_bgra, to_f32,
+    Brushes, CORNER_RADIUS, Fonts, Renderer, color, draw_button_glyph_on, draw_tooltip_on,
+    fill_rounded, measure_text_width, rect_to_d2d, rgba_to_bgra, to_f32,
 };
 
 const BORDER_CLASS: PCWSTR = w!("LenswinScrollBorder");
@@ -62,6 +62,8 @@ const PANEL_CLASS: PCWSTR = w!("LenswinScrollPanel");
 const DEFAULT_DPI: u32 = 96;
 const PANEL_GAP: u32 = 12;
 const HOTKEY_ESC: i32 = 1;
+const TOOLTIP_TIMER_ID: usize = 1;
+const TOOLTIP_DELAY_MS: u32 = 400;
 /// 亮蓝色边框颜色（COLORREF 顺序为 0x00BBGGRR，对应 RGB(77, 153, 255)）。
 const BORDER_COLORREF: u32 = 0x00FF_994D;
 
@@ -88,6 +90,8 @@ struct ScrollState {
     auto_scrolling: bool,
     actions_enabled: bool,
     hovered: Option<ScrollButton>,
+    tooltip: TooltipState<ScrollButton>,
+    tooltip_timer: bool,
     tracking_leave: bool,
     preview: Option<CroppedImage>,
     preview_dirty: bool,
@@ -198,6 +202,8 @@ impl ScrollSession {
             auto_scrolling: false,
             actions_enabled: false,
             hovered: None,
+            tooltip: TooltipState::default(),
+            tooltip_timer: false,
             tracking_leave: false,
             preview: None,
             preview_dirty: false,
@@ -349,6 +355,8 @@ fn cleanup_windows(instance: HINSTANCE, panel: Option<HWND>, borders: &[HWND; 4]
     if let Some(hwnd) = panel
         && !hwnd.0.is_null()
     {
+        // SAFETY: 窗口销毁前停掉悬停提示计时器；未启动时失败无影响。
+        discard(unsafe { KillTimer(Some(hwnd), TOOLTIP_TIMER_ID) });
         // SAFETY: 注销本窗口登记的全局热键；未登记时失败无影响。
         discard(unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ESC) });
         // SAFETY: 窗口由本模块创建，此处只销毁一次。
@@ -544,6 +552,37 @@ impl ScrollState {
                 .push(ScrollEvent::Finished(ToolbarAction::Ocr)),
             ScrollButton::Cancel => self.pending_events.push(ScrollEvent::Closed),
         }
+    }
+
+    fn apply_tooltip_cmd(&mut self, cmd: TooltipCommand) {
+        match cmd {
+            TooltipCommand::Keep => {}
+            TooltipCommand::Arm => {
+                // SAFETY: panel_hwnd 是本线程创建且存活的窗口，不使用回调函数。
+                discard(unsafe {
+                    SetTimer(
+                        Some(self.panel_hwnd),
+                        TOOLTIP_TIMER_ID,
+                        TOOLTIP_DELAY_MS,
+                        None,
+                    )
+                });
+                self.tooltip_timer = true;
+            }
+            TooltipCommand::Disarm => {
+                if self.tooltip_timer {
+                    // SAFETY: panel_hwnd 持有该计时器。
+                    discard(unsafe { KillTimer(Some(self.panel_hwnd), TOOLTIP_TIMER_ID) });
+                    self.tooltip_timer = false;
+                }
+            }
+        }
+    }
+
+    fn press_tooltip(&mut self) -> bool {
+        let (cmd, vis_changed) = self.tooltip.on_press();
+        self.apply_tooltip_cmd(cmd);
+        vis_changed
     }
 
     fn ensure_resources(&mut self) -> Result<(), OverlayError> {
@@ -745,8 +784,20 @@ impl ScrollState {
                 } else {
                     &brushes.white
                 };
-                draw_button_glyph_on(target, button_style, fonts, tb, &r, brush);
+                draw_button_glyph_on(target, button_style, fonts, tb, &r, brush, None);
             }
+        }
+
+        if let Some(button) = self.tooltip.visible_target()
+            && let Some(anchor) = self.layout.button_rect(button)
+        {
+            let wide: Vec<u16> = button.tooltip(self.auto_scrolling).encode_utf16().collect();
+            let text_w =
+                measure_text_width(self.renderer.dwrite(), &wide, &fonts.tooltip, self.dpi);
+            let size = layout::tooltip_size(text_w, self.dpi);
+            let tip_rect = layout::tooltip_rect(&anchor, &self.layout.panel, None, size, self.dpi);
+            let local = rect_to_d2d(&tip_rect);
+            draw_tooltip_on(target, brushes, &fonts.tooltip, &local, radius, &wide);
         }
 
         // SAFETY: 与上面的 BeginDraw 配对。
@@ -853,7 +904,7 @@ unsafe extern "system" fn panel_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let (x, y) = point_from_lparam(lparam.0);
-            let hovered_changed = with_scroll(|s| {
+            let changed = with_scroll(|s| {
                 if !s.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: u32::try_from(std::mem::size_of::<TRACKMOUSEEVENT>()).unwrap_or(0),
@@ -867,15 +918,18 @@ unsafe extern "system" fn panel_wnd_proc(
                     }
                 }
                 let next = s.layout.hit(Point::new(x, y));
-                if next != s.hovered {
+                let hovered_changed = if next != s.hovered {
                     s.hovered = next;
                     true
                 } else {
                     false
-                }
+                };
+                let (cmd, tip_changed) = s.tooltip.on_hover(next);
+                s.apply_tooltip_cmd(cmd);
+                hovered_changed || tip_changed
             })
             .unwrap_or(false);
-            if hovered_changed {
+            if changed {
                 invalidate(hwnd);
             }
             return LRESULT(0);
@@ -883,7 +937,10 @@ unsafe extern "system" fn panel_wnd_proc(
         WM_MOUSELEAVE => {
             let changed = with_scroll(|s| {
                 s.tracking_leave = false;
-                s.hovered.take().is_some()
+                let hovered_changed = s.hovered.take().is_some();
+                let (cmd, tip_changed) = s.tooltip.reset();
+                s.apply_tooltip_cmd(cmd);
+                hovered_changed || tip_changed
             })
             .unwrap_or(false);
             if changed {
@@ -893,9 +950,39 @@ unsafe extern "system" fn panel_wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point_from_lparam(lparam.0);
-            with_scroll(|s| s.click(Point::new(x, y)));
+            let tip_hidden = with_scroll(|s| {
+                let hidden = s.press_tooltip();
+                s.click(Point::new(x, y));
+                hidden
+            })
+            .unwrap_or(false);
+            if tip_hidden {
+                invalidate(hwnd);
+            }
             deliver_events();
             return LRESULT(0);
+        }
+        WM_RBUTTONDOWN => {
+            let tip_hidden = with_scroll(ScrollState::press_tooltip).unwrap_or(false);
+            if tip_hidden {
+                invalidate(hwnd);
+            }
+            return LRESULT(0);
+        }
+        WM_TIMER => {
+            if wparam.0 == TOOLTIP_TIMER_ID {
+                let shown = with_scroll(|s| {
+                    // SAFETY: hwnd 是设置该单次计时器的面板窗口。
+                    discard(unsafe { KillTimer(Some(hwnd), TOOLTIP_TIMER_ID) });
+                    s.tooltip_timer = false;
+                    s.tooltip.on_timer()
+                })
+                .unwrap_or(false);
+                if shown {
+                    invalidate(hwnd);
+                }
+                return LRESULT(0);
+            }
         }
         WM_HOTKEY => {
             let id = i32::try_from(wparam.0).unwrap_or(-1);

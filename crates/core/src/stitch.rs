@@ -14,26 +14,50 @@ pub const MIN_OVERLAP_PX: u32 = 32;
 /// 签名分桶数量（沿垂直于滚动方向均匀划分）。
 const SIG_BUCKETS: usize = 16;
 
-/// 固定栏逐行匹配的最大平均亮度差（千分位，5000 = 5.0 灰度级）。
+/// 固定栏逐行匹配的最大平均亮度差（千分位，2000 = 2.0 灰度级）。
 const FIXED_LINE_MAD_MILLI: u64 = 2_000;
 
 /// 固定栏逐行允许的最大强变化像素比例（千分位，20 = 2%）。
 const FIXED_LINE_OUTLIER_MILLI: u64 = 20;
 
-/// 位移匹配可接受的最大平均亮度差（千分位，4500 = 4.5 灰度级）。
-const MATCH_MAD_MILLI: u64 = 4_500;
-
-/// 判定内容静止的最大平均亮度差（千分位，2500 = 2.5 灰度级）。
+/// 判定内容静止（完全无纹理时回退）的最大平均亮度差（千分位，2500 = 2.5 灰度级）。
 const NO_MOVE_MAD_MILLI: u64 = 2_500;
 
-/// 纯色/无纹理区域判定的最小跨行亮度极差。
-const MIN_TEXTURE_SPAN: u8 = 3;
+/// 逐行鲁棒匹配允许的单个像素亮度差容限（约 6% 满量程，可容忍抗锯齿与轻度渲染抖动）。
+const PX_DIFF_TOLERANCE: u8 = 16;
 
-/// 粗筛保留的候选位移个数。
-const TOP_CANDIDATES: usize = 8;
+/// 单行内允许超过 [`PX_DIFF_TOLERANCE`] 的离群像素最大占比（千分位，50 = 5%）。
+/// 常规滚动条（约占行宽 1%~3%）与闪烁光标（约 0.2%~0.5%）均低于此阈值，可在逐行匹配中被容忍。
+const LINE_OUTLIER_MAX_MILLI: u64 = 50;
 
-/// 判定近似并列时优先选较大重叠的容差（千分位，250 = 0.25 灰度级）。
-const TIE_TOLERANCE_MILLI: u64 = 250;
+/// 采纳候选位移所需的最少有纹理条带数（约一整行文字高度，避免纯白边距或偶然短条纹误匹配）。
+const MIN_TEXTURED_LINES: usize = 16;
+
+/// 采纳候选位移所需的有纹理条带最低匹配比例（千分位，800 = 80%）。
+/// 因参考帧本身也保留了上一帧屏幕固定位置的悬停高亮条，相邻帧滚动时新旧两处约 20~30 px
+/// 高亮条在文档坐标系中往往互不重叠，会在中等高度选区（300 px 级）产生最高约 20% 的变化行；
+/// 80% 下限可稳定容忍此类双边局部遮挡，而单行 95% 像素吻合约束仍可有效杜绝错位误匹配。
+const MATCH_RATIO_MIN_MILLI: u64 = 800;
+
+/// 零位移下判定为画面未动（NoMove）的有纹理条带最低匹配比例（千分位，900 = 90%）。
+/// 防止光标闪烁、悬停高亮等局部变化被误判为已滚动或滚动太快。
+const NO_MOVE_RATIO_MILLI: u64 = 900;
+
+/// 粗筛单行签名误差封顶值（16 桶 × 16 灰度级），避免强局部遮挡拖垮正确位移的粗筛排名。
+const ROUGH_SIG_LINE_CAP: u32 = 256;
+
+/// 粗筛阶段每个候选位移最多抽取的有纹理锚点条带数。
+/// 当有纹理条带不超过该值时全量参与；超出时用非周期分桶抖动抽样，避免与固定行距混叠并把 1080p 单帧耗时压到 30 ms 以内。
+const ROUGH_MAX_SAMPLES: usize = 64;
+
+/// 粗筛保留进入逐行精验证的候选位移个数，留足余量以免文本行距相似时漏掉真值。
+const TOP_CANDIDATES: usize = 32;
+
+/// 多个合法候选匹配比例相近时优先选较大重叠区的容差（千分位，20 = 2%）。
+const RATIO_TIE_TOLERANCE_MILLI: u64 = 20;
+
+/// 未锁轴且双轴均匹配时，横向必须高出竖向的最小匹配比例优势（千分位，50 = 5%），避免悬停或噪点误锁横向。
+const AXIS_LOCK_ADVANTAGE_MILLI: u64 = 50;
 
 /// 滚动方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +129,9 @@ struct OrientedPlane {
     line_len: usize,
     /// 逐条带紧凑存放的灰度值，长度等于 `lines * line_len`。
     luma: Vec<u8>,
-    /// 每条带的 16 段均值签名，供位移粗筛与纹理判定。
+    /// 每条带的 16 段均值签名，供位移粗筛。
     sigs: Vec<[u8; SIG_BUCKETS]>,
-    /// 每条带自身是否近似纯色，以及纯色均值（用于避免把大片纯白空白误当成固定栏）。
+    /// 每条带自身是否近似纯色，以及纯色均值（用于剔除空白行与回退纯色边距）。
     uniform_luma: Vec<Option<u8>>,
 }
 
@@ -139,7 +163,10 @@ impl OrientedPlane {
                 }
             }
         }
+        Self::with_luma(lines, line_len, luma)
+    }
 
+    fn with_luma(lines: usize, line_len: usize, luma: Vec<u8>) -> Self {
         let mut sigs = Vec::with_capacity(lines);
         let mut uniform_luma = Vec::with_capacity(lines);
         for line in 0..lines {
@@ -158,6 +185,32 @@ impl OrientedPlane {
             sigs,
             uniform_luma,
         }
+    }
+
+    /// 由已计算的竖向灰度平面分块转置得到横向平面，避免重复扫描 RGBA 与缓存抖动。
+    fn transpose_from(&self) -> Self {
+        let lines = self.line_len;
+        let line_len = self.lines;
+        let mut luma = vec![0u8; lines.saturating_mul(line_len)];
+        const TILE: usize = 32;
+        for y0 in (0..line_len).step_by(TILE) {
+            let y_end = y0.saturating_add(TILE).min(line_len);
+            for x0 in (0..lines).step_by(TILE) {
+                let x_end = x0.saturating_add(TILE).min(lines);
+                for y in y0..y_end {
+                    let src_row = y.saturating_mul(lines);
+                    for x in x0..x_end {
+                        if let (Some(&val), Some(dst)) = (
+                            self.luma.get(src_row.saturating_add(x)),
+                            luma.get_mut(x.saturating_mul(line_len).saturating_add(y)),
+                        ) {
+                            *dst = val;
+                        }
+                    }
+                }
+            }
+        }
+        Self::with_luma(lines, line_len, luma)
     }
 
     fn line_luma(&self, index: usize) -> &[u8] {
@@ -208,8 +261,8 @@ fn uniform_row_value(row: &[u8]) -> Option<u8> {
 struct MatchCandidate {
     /// 位移（正为向前滚，负为向回滚）。
     shift: isize,
-    /// 重叠区的平均亮度误差（千分位）。
-    mad_milli: u64,
+    /// 重叠区有纹理条带的匹配比例（千分位）。
+    match_ratio_milli: u64,
     /// 重叠长度（条带数）。
     overlap: usize,
     /// 首部固定栏条带数。
@@ -335,8 +388,10 @@ impl Stitcher {
             }
         } else {
             self.frame_size = Some((width, height));
-            self.prev_vert = Some(OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Vertical));
-            self.prev_horiz = Some(OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Horizontal));
+            let vert = OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Vertical);
+            let horiz = vert.transpose_from();
+            self.prev_vert = Some(vert);
+            self.prev_horiz = Some(horiz);
             self.accumulated = Some(Accumulated::Unset(rgba.to_vec()));
             return Ok(StitchStatus::FirstFrame);
         }
@@ -370,22 +425,33 @@ impl Stitcher {
         let Some(prev_h) = self.prev_horiz.as_ref() else {
             return Err(StitchError::NoFrames);
         };
-        // 快速判定整帧未动
-        if whole_mad_milli(
-            prev_v,
-            &OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Vertical),
-        ) <= 500
-        {
+        let curr_v = OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Vertical);
+        // 快速鲁棒判定整帧未动（容忍光标闪烁、悬停高亮等局部变化），静止时直接跳过横向转置与搜索
+        if is_stationary(prev_v, 0, &curr_v, 0, prev_v.lines) {
             return Ok(StitchStatus::NoMove);
         }
-        let curr_v = OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Vertical);
-        let curr_h = OrientedPlane::from_rgba(w, h, rgba, ScrollAxis::Horizontal);
         let search_v = search_axis(prev_v, &curr_v);
-        let search_h = search_axis(prev_h, &curr_h);
+        let vert_locks_out_horiz = matches!(
+            &search_v,
+            AxisSearch::Matched(cv)
+                if cv.shift > 0
+                    && cv.match_ratio_milli.saturating_add(AXIS_LOCK_ADVANTAGE_MILLI) > 1000
+        );
+        let (curr_h, search_h) = if vert_locks_out_horiz {
+            (None, AxisSearch::TooFast)
+        } else {
+            let h_plane = curr_v.transpose_from();
+            let h_res = search_axis(prev_h, &h_plane);
+            (Some(h_plane), h_res)
+        };
 
         let chosen = match (&search_v, &search_h) {
             (AxisSearch::Matched(cv), AxisSearch::Matched(ch)) if cv.shift > 0 && ch.shift > 0 => {
-                if ch.mad_milli < cv.mad_milli {
+                if ch.match_ratio_milli
+                    >= cv
+                        .match_ratio_milli
+                        .saturating_add(AXIS_LOCK_ADVANTAGE_MILLI)
+                {
                     Some((ScrollAxis::Horizontal, ch))
                 } else {
                     Some((ScrollAxis::Vertical, cv))
@@ -454,7 +520,7 @@ impl Stitcher {
                     self.prev_horiz = None;
                 }
                 ScrollAxis::Horizontal => {
-                    self.prev_horiz = Some(curr_h);
+                    self.prev_horiz = curr_h;
                     self.prev_vert = None;
                 }
             }
@@ -734,10 +800,6 @@ fn columns_to_row_major(cols: &[u8], width: usize, height: usize) -> Vec<u8> {
     out
 }
 
-fn whole_mad_milli(a: &OrientedPlane, b: &OrientedPlane) -> u64 {
-    range_mad_milli(a, 0, b, 0, a.lines)
-}
-
 fn range_mad_milli(
     a: &OrientedPlane,
     a_start: usize,
@@ -843,106 +905,212 @@ fn detect_fixed_bars(prev: &OrientedPlane, curr: &OrientedPlane) -> (usize, usiz
     (head, tail)
 }
 
-/// 从 `start` 起向后累积，找出首次出现足够纵向纹理所需的最小窗口长度。
-/// 若整个 `[start .. start + len)` 都缺乏纵向纹理，则返回 `None`。
-fn min_textured_len(plane: &OrientedPlane, start: usize, len: usize) -> Option<usize> {
-    let end = start.saturating_add(len).min(plane.sigs.len());
-    let slice = plane.sigs.get(start..end)?;
-    let mut mins = [255u8; SIG_BUCKETS];
-    let mut maxs = [0u8; SIG_BUCKETS];
-    for (idx, sig) in slice.iter().enumerate() {
-        for ((min_slot, max_slot), &v) in mins.iter_mut().zip(&mut maxs).zip(sig) {
-            *min_slot = (*min_slot).min(v);
-            *max_slot = (*max_slot).max(v);
-        }
-        if mins
-            .iter()
-            .zip(&maxs)
-            .any(|(&lo, &hi)| hi.saturating_sub(lo) >= MIN_TEXTURE_SPAN)
-        {
-            return Some(idx.saturating_add(1));
+/// 单行像素级鲁棒匹配：超过 [`PX_DIFF_TOLERANCE`] 的离群像素占比不超过 [`LINE_OUTLIER_MAX_MILLI`]。
+fn line_robust_matches(la: &[u8], lb: &[u8]) -> bool {
+    let len = la.len().min(lb.len());
+    if len == 0 {
+        return false;
+    }
+    let mut outliers: u64 = 0;
+    for (&va, &vb) in la.iter().zip(lb) {
+        if va.abs_diff(vb) > PX_DIFF_TOLERANCE {
+            outliers = outliers.saturating_add(1);
         }
     }
-    None
+    let denom = u64::try_from(len).unwrap_or(1);
+    outliers.saturating_mul(1000) <= LINE_OUTLIER_MAX_MILLI.saturating_mul(denom)
 }
 
-fn sig_mad_milli(
+/// 统计重叠区内有纹理条带的鲁棒匹配比例（千分位）以及有纹理条带总数；
+/// 当失败条带数已不可能达到 `min_ratio_milli` 时提前结束，避免在错误候选上扫描全图。
+fn robust_match_ratio(
     a: &OrientedPlane,
     a_start: usize,
     b: &OrientedPlane,
     b_start: usize,
     line_count: usize,
-) -> u64 {
-    if line_count == 0 {
-        return u64::MAX;
+    min_ratio_milli: u64,
+) -> (u64, usize) {
+    let Some(a_end) = a_start.checked_add(line_count) else {
+        return (0, 0);
+    };
+    let Some(b_end) = b_start.checked_add(line_count) else {
+        return (0, 0);
+    };
+    let (Some(a_uni), Some(b_uni)) = (
+        a.uniform_luma.get(a_start..a_end),
+        b.uniform_luma.get(b_start..b_end),
+    ) else {
+        return (0, 0);
+    };
+    let total_textured = a_uni
+        .iter()
+        .zip(b_uni)
+        .filter(|(ua, ub)| !(ua.is_some() && ub.is_some()))
+        .count();
+    if total_textured == 0 {
+        return (0, 0);
     }
-    // 粗匹配最多等距抽样 128 行，避免高分辨率选区出现 O(H^2) 开销
-    let step = (line_count / 128).max(1);
-    let mut sum: u64 = 0;
-    let mut sampled: usize = 0;
-    let mut offset = 0usize;
-    while offset < line_count {
-        let Some(sa) = a.sigs.get(a_start.saturating_add(offset)) else {
-            return u64::MAX;
-        };
-        let Some(sb) = b.sigs.get(b_start.saturating_add(offset)) else {
-            return u64::MAX;
-        };
-        for (&va, &vb) in sa.iter().zip(sb) {
-            sum = sum.saturating_add(u64::from(va.abs_diff(vb)));
+    let min_matched_u64 = u64::try_from(total_textured)
+        .unwrap_or(0)
+        .saturating_mul(min_ratio_milli)
+        .div_ceil(1000);
+    let min_matched = usize::try_from(min_matched_u64).unwrap_or(total_textured);
+    let max_mismatches = total_textured.saturating_sub(min_matched);
+
+    let mut matched: usize = 0;
+    let mut mismatched: usize = 0;
+    for (offset, (ua, ub)) in a_uni.iter().zip(b_uni).enumerate() {
+        if ua.is_some() && ub.is_some() {
+            continue;
         }
-        sampled = sampled.saturating_add(1);
-        offset = offset.saturating_add(step);
+        let la = a.line_luma(a_start.saturating_add(offset));
+        let lb = b.line_luma(b_start.saturating_add(offset));
+        if line_robust_matches(la, lb) {
+            matched = matched.saturating_add(1);
+        } else {
+            mismatched = mismatched.saturating_add(1);
+            if mismatched > max_mismatches {
+                return (0, total_textured);
+            }
+        }
     }
-    let denom = u64::try_from(sampled.saturating_mul(SIG_BUCKETS)).unwrap_or(1);
-    sum.saturating_mul(1000) / denom
+    let ratio = u64::try_from(matched).unwrap_or(0).saturating_mul(1000)
+        / u64::try_from(total_textured).unwrap_or(1);
+    (ratio, total_textured)
+}
+
+/// 鲁棒静止判定：有纹理条带零位移匹配比例达到 [`NO_MOVE_RATIO_MILLI`]（或全区无纹理且亮度几乎一致）即视为未动。
+fn is_stationary(
+    a: &OrientedPlane,
+    a_start: usize,
+    b: &OrientedPlane,
+    b_start: usize,
+    line_count: usize,
+) -> bool {
+    let (ratio, textured) =
+        robust_match_ratio(a, a_start, b, b_start, line_count, NO_MOVE_RATIO_MILLI);
+    if textured > 0 {
+        ratio >= NO_MOVE_RATIO_MILLI
+    } else {
+        range_mad_milli(a, a_start, b, b_start, line_count) <= NO_MOVE_MAD_MILLI
+    }
+}
+
+/// 粗筛打分：从锚点帧重叠区内的有纹理条带中取点（<= [`ROUGH_MAX_SAMPLES`] 时全量，超出时分桶抖动抽样），
+/// 使用封顶签名误差避免等距抽样混叠及局部遮挡失真。
+fn rough_sig_score(
+    fixed: &OrientedPlane,
+    fixed_start: usize,
+    shifted: &OrientedPlane,
+    shifted_start: usize,
+    anchors: &[usize],
+    overlap: usize,
+) -> Option<u64> {
+    let min_anchors = (MIN_TEXTURED_LINES / 2).max(1);
+    let len = anchors.len();
+    if len < min_anchors {
+        return None;
+    }
+
+    let mut sum: u64 = 0;
+    let mut count: usize = 0;
+    let mut accumulate = |off: usize| {
+        if let (Some(sf), Some(ss)) = (
+            fixed.sigs.get(fixed_start.saturating_add(off)),
+            shifted.sigs.get(shifted_start.saturating_add(off)),
+        ) {
+            let mut line_err: u32 = 0;
+            for (&va, &vb) in sf.iter().zip(ss) {
+                line_err = line_err.saturating_add(u32::from(va.abs_diff(vb)));
+            }
+            sum = sum.saturating_add(u64::from(line_err.min(ROUGH_SIG_LINE_CAP)));
+            count = count.saturating_add(1);
+        }
+    };
+
+    if len <= ROUGH_MAX_SAMPLES {
+        for &off in anchors {
+            accumulate(off);
+        }
+    } else {
+        for i in 0..ROUGH_MAX_SAMPLES {
+            let lo = i.saturating_mul(len) / ROUGH_MAX_SAMPLES;
+            let hi = (i.saturating_add(1).saturating_mul(len) / ROUGH_MAX_SAMPLES)
+                .max(lo.saturating_add(1));
+            let span = hi.saturating_sub(lo).max(1);
+            // 桶内相位随桶序号与当前重叠长度非周期变化，避免与文本固定行距产生混叠共振
+            let jitter = i.saturating_mul(7).saturating_add(overlap % 11) % span;
+            let off = anchors.get(lo.saturating_add(jitter)).copied().unwrap_or(0);
+            accumulate(off);
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let denom = u64::try_from(count).unwrap_or(1);
+    Some(sum.saturating_mul(1000) / denom)
+}
+
+fn textured_offsets(plane: &OrientedPlane, head: usize, mid_len: usize) -> Vec<usize> {
+    let end = head.saturating_add(mid_len);
+    plane
+        .uniform_luma
+        .get(head..end)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .filter_map(|(off, uni)| uni.is_none().then_some(off))
+        .collect()
 }
 
 fn search_axis(prev: &OrientedPlane, curr: &OrientedPlane) -> AxisSearch {
     let total = prev.lines;
+    if is_stationary(prev, 0, curr, 0, total) {
+        return AxisSearch::NoMove;
+    }
     let (head, tail) = detect_fixed_bars(prev, curr);
     let mid_end = total.saturating_sub(tail);
     let mid_len = mid_end.saturating_sub(head);
     let min_overlap = usize::try_from(MIN_OVERLAP_PX).unwrap_or(32);
 
     if mid_len < min_overlap {
-        return if whole_mad_milli(prev, curr) <= NO_MOVE_MAD_MILLI {
-            AxisSearch::NoMove
-        } else {
-            AxisSearch::TooFast
-        };
+        return AxisSearch::TooFast;
     }
 
-    let zero_mad = range_mad_milli(prev, head, curr, head, mid_len);
-    if zero_mad <= 500 {
+    if is_stationary(prev, head, curr, head, mid_len) {
         return AxisSearch::NoMove;
     }
 
-    let min_tex_curr = min_textured_len(curr, head, mid_len);
-    let min_tex_prev = min_textured_len(prev, head, mid_len);
+    let curr_tex = textured_offsets(curr, head, mid_len);
+    let prev_tex = textured_offsets(prev, head, mid_len);
     let max_shift = mid_len.saturating_sub(min_overlap);
-    // (签名误差, 有符号位移)
+    // (粗筛签名误差, 有符号位移)
     let mut rough: Vec<(u64, isize)> = Vec::new();
     for d in 1..=max_shift {
         let overlap = mid_len.saturating_sub(d);
         // 正向：curr[head..head+overlap] 对齐 prev[head+d..head+d+overlap]
-        if min_tex_curr.is_some_and(|need| overlap >= need) {
-            let mad = sig_mad_milli(prev, head.saturating_add(d), curr, head, overlap);
-            if let Ok(shift) = isize::try_from(d) {
-                rough.push((mad, shift));
-            }
+        let curr_n = curr_tex.partition_point(|&off| off < overlap);
+        if let Some(anchors) = curr_tex.get(..curr_n)
+            && let Some(score) =
+                rough_sig_score(curr, head, prev, head.saturating_add(d), anchors, overlap)
+            && let Ok(shift) = isize::try_from(d)
+        {
+            rough.push((score, shift));
         }
         // 反向：prev[head..head+overlap] 对齐 curr[head+d..head+d+overlap]
-        if min_tex_prev.is_some_and(|need| overlap >= need) {
-            let mad = sig_mad_milli(prev, head, curr, head.saturating_add(d), overlap);
-            if let Ok(shift) = isize::try_from(d) {
-                rough.push((mad, -shift));
-            }
+        let prev_n = prev_tex.partition_point(|&off| off < overlap);
+        if let Some(anchors) = prev_tex.get(..prev_n)
+            && let Some(score) =
+                rough_sig_score(prev, head, curr, head.saturating_add(d), anchors, overlap)
+            && let Ok(shift) = isize::try_from(d)
+        {
+            rough.push((score, -shift));
         }
     }
 
     if rough.is_empty() {
-        return if zero_mad <= NO_MOVE_MAD_MILLI {
+        return if is_stationary(prev, head, curr, head, mid_len) {
             AxisSearch::NoMove
         } else {
             AxisSearch::TooFast
@@ -955,6 +1123,7 @@ fn search_axis(prev: &OrientedPlane, curr: &OrientedPlane) -> AxisSearch {
     });
 
     let mut verified: Vec<MatchCandidate> = Vec::with_capacity(TOP_CANDIDATES);
+    let mut best_ratio: u64 = 0;
     for &(_, shift) in rough.iter().take(TOP_CANDIDATES) {
         let abs_d = shift.unsigned_abs();
         let overlap = mid_len.saturating_sub(abs_d);
@@ -963,11 +1132,16 @@ fn search_axis(prev: &OrientedPlane, curr: &OrientedPlane) -> AxisSearch {
         } else {
             (head, head.saturating_add(abs_d))
         };
-        let mad_milli = range_mad_milli(prev, p_start, curr, c_start, overlap);
-        if mad_milli <= MATCH_MAD_MILLI {
+        let min_req = best_ratio
+            .saturating_sub(RATIO_TIE_TOLERANCE_MILLI)
+            .max(MATCH_RATIO_MIN_MILLI);
+        let (match_ratio_milli, textured) =
+            robust_match_ratio(prev, p_start, curr, c_start, overlap, min_req);
+        if textured >= MIN_TEXTURED_LINES && match_ratio_milli >= MATCH_RATIO_MIN_MILLI {
+            best_ratio = best_ratio.max(match_ratio_milli);
             verified.push(MatchCandidate {
                 shift,
-                mad_milli,
+                match_ratio_milli,
                 overlap,
                 head,
                 tail,
@@ -975,26 +1149,20 @@ fn search_axis(prev: &OrientedPlane, curr: &OrientedPlane) -> AxisSearch {
         }
     }
 
-    let min_mad = verified.iter().map(|c| c.mad_milli).min();
-    let best = min_mad.and_then(|min_m| {
+    let max_ratio = verified.iter().map(|c| c.match_ratio_milli).max();
+    let best = max_ratio.and_then(|max_r| {
         verified
             .into_iter()
-            .filter(|c| c.mad_milli <= min_m.saturating_add(TIE_TOLERANCE_MILLI))
+            .filter(|c| c.match_ratio_milli >= max_r.saturating_sub(RATIO_TIE_TOLERANCE_MILLI))
             .max_by(|a, b| {
                 a.overlap
                     .cmp(&b.overlap)
-                    .then_with(|| b.mad_milli.cmp(&a.mad_milli))
+                    .then_with(|| a.match_ratio_milli.cmp(&b.match_ratio_milli))
             })
     });
 
     match best {
-        Some(cand)
-            if zero_mad <= cand.mad_milli.saturating_add(500) && zero_mad <= NO_MOVE_MAD_MILLI =>
-        {
-            AxisSearch::NoMove
-        }
         Some(cand) => AxisSearch::Matched(cand),
-        None if zero_mad <= NO_MOVE_MAD_MILLI => AxisSearch::NoMove,
         None => AxisSearch::TooFast,
     }
 }
@@ -1302,6 +1470,218 @@ mod tests {
                 expected: (40, 40),
                 actual: (40, 41)
             })
+        );
+    }
+
+    fn overlay_hover_bar(img: &mut [u8], w: u32, y_start: u32, height: u32) {
+        let row_bytes = usize::try_from(w * 4).expect("row");
+        let start = usize::try_from(y_start).expect("ys") * row_bytes;
+        let len = usize::try_from(height).expect("h") * row_bytes;
+        if let Some(slice) = img.get_mut(start..start + len) {
+            for px in slice.as_chunks_mut::<4>().0 {
+                px[0] = px[0].saturating_sub(24);
+                px[1] = px[1].saturating_sub(24);
+            }
+        }
+    }
+
+    fn overlay_caret(img: &mut [u8], w: u32, x0: u32, y0: u32, height: u32) {
+        for y in y0..y0 + height {
+            for x in x0..x0 + 2 {
+                let idx = usize::try_from(y * w + x).expect("idx") * 4;
+                if let Some(px) = img.get_mut(idx..idx + 3) {
+                    px.copy_from_slice(&[0, 0, 0]);
+                }
+            }
+        }
+    }
+
+    fn overlay_scrollbar(img: &mut [u8], w: u32, view_h: u32, doc_h: u32, y0: u32) {
+        let thumb_h = (view_h * view_h / doc_h).max(8);
+        let thumb_y = y0 * view_h / doc_h;
+        for y in 0..view_h {
+            let shade = if y >= thumb_y && y < thumb_y + thumb_h {
+                140u8
+            } else {
+                235u8
+            };
+            for x in (w - 10)..w {
+                let idx = usize::try_from(y * w + x).expect("idx") * 4;
+                if let Some(px) = img.get_mut(idx..idx + 3) {
+                    px.copy_from_slice(&[shade, shade, shade]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_highlight_keeps_vertical_axis_and_detects_no_move() {
+        let w = 200;
+        let view_h = 300;
+        let doc = make_vertical_doc(w, 800);
+
+        let frame_with_hover = |y0: u32, hover_y: Option<u32>| -> CroppedImage {
+            let mut raw = crop_vertical_doc(&doc, w, y0, view_h).rgba().to_vec();
+            if let Some(hy) = hover_y {
+                overlay_hover_bar(&mut raw, w, hy, 22);
+            }
+            CroppedImage::new(w, view_h, raw).expect("hover帧")
+        };
+
+        let mut s = Stitcher::new();
+        assert_eq!(
+            s.push(&frame_with_hover(0, None)),
+            Ok(StitchStatus::FirstFrame)
+        );
+        // 画面未滚动，仅悬停条移动 -> 应判为 NoMove 而非已移动或误锁横向
+        assert_eq!(
+            s.push(&frame_with_hover(0, Some(120))),
+            Ok(StitchStatus::NoMove)
+        );
+        assert_eq!(s.axis(), None);
+
+        // 伴随悬停条变化的小幅向下滚动 -> 正确锁定竖向并采纳
+        assert_eq!(
+            s.push(&frame_with_hover(40, Some(125))),
+            Ok(StitchStatus::Adopted {
+                total_px: view_h + 40,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            })
+        );
+        assert_eq!(
+            s.push(&frame_with_hover(100, Some(130))),
+            Ok(StitchStatus::Adopted {
+                total_px: view_h + 100,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            })
+        );
+        assert_eq!(
+            s.push(&frame_with_hover(100, Some(120))),
+            Ok(StitchStatus::NoMove)
+        );
+        assert_eq!(
+            s.push(&frame_with_hover(180, Some(125))),
+            Ok(StitchStatus::Adopted {
+                total_px: view_h + 180,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn caret_blink_is_treated_as_stationary_and_allows_scrolling() {
+        let w = 200;
+        let view_h = 240;
+        let doc = make_vertical_doc(w, 600);
+
+        let frame_with_caret = |y0: u32, caret_on: bool| -> CroppedImage {
+            let mut raw = crop_vertical_doc(&doc, w, y0, view_h).rgba().to_vec();
+            if caret_on {
+                overlay_caret(&mut raw, w, 90, 100, 20);
+            }
+            CroppedImage::new(w, view_h, raw).expect("caret帧")
+        };
+
+        let mut s = Stitcher::new();
+        assert_eq!(
+            s.push(&frame_with_caret(0, false)),
+            Ok(StitchStatus::FirstFrame)
+        );
+        assert_eq!(s.push(&frame_with_caret(0, true)), Ok(StitchStatus::NoMove));
+        assert_eq!(
+            s.push(&frame_with_caret(0, false)),
+            Ok(StitchStatus::NoMove)
+        );
+        assert_eq!(
+            s.push(&frame_with_caret(40, true)),
+            Ok(StitchStatus::Adopted {
+                total_px: view_h + 40,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            })
+        );
+        assert_eq!(
+            s.push(&frame_with_caret(40, false)),
+            Ok(StitchStatus::NoMove)
+        );
+        assert_eq!(
+            s.push(&frame_with_caret(100, true)),
+            Ok(StitchStatus::Adopted {
+                total_px: view_h + 100,
+                axis: ScrollAxis::Vertical,
+                reached_limit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn scrollbar_movement_is_tolerated_during_scroll() {
+        let w = 260;
+        let view_h = 260;
+        let doc_h = 900;
+        let doc = make_vertical_doc(w, doc_h);
+
+        let frame_with_sb = |y0: u32| -> CroppedImage {
+            let mut raw = crop_vertical_doc(&doc, w, y0, view_h).rgba().to_vec();
+            overlay_scrollbar(&mut raw, w, view_h, doc_h, y0);
+            CroppedImage::new(w, view_h, raw).expect("scrollbar帧")
+        };
+
+        let mut s = Stitcher::new();
+        assert_eq!(s.push(&frame_with_sb(0)), Ok(StitchStatus::FirstFrame));
+        for &(y0, expected_total) in &[
+            (20u32, view_h + 20),
+            (60, view_h + 60),
+            (120, view_h + 120),
+            (240, view_h + 240),
+        ] {
+            assert_eq!(
+                s.push(&frame_with_sb(y0)),
+                Ok(StitchStatus::Adopted {
+                    total_px: expected_total,
+                    axis: ScrollAxis::Vertical,
+                    reached_limit: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn small_vertical_scroll_steps_succeed() {
+        let w = 120;
+        let view_h = 220;
+        let doc_h = 400;
+        let doc = make_vertical_doc(w, doc_h);
+
+        let mut s = Stitcher::new();
+        assert_eq!(
+            s.push(&crop_vertical_doc(&doc, w, 0, view_h)),
+            Ok(StitchStatus::FirstFrame)
+        );
+        for &(y0, total) in &[
+            (8u32, view_h + 8),
+            (20, view_h + 20),
+            (40, view_h + 40),
+            (75, view_h + 75),
+            (135, view_h + 135),
+        ] {
+            assert_eq!(
+                s.push(&crop_vertical_doc(&doc, w, y0, view_h)),
+                Ok(StitchStatus::Adopted {
+                    total_px: total,
+                    axis: ScrollAxis::Vertical,
+                    reached_limit: false,
+                })
+            );
+        }
+        let composed = s.compose().expect("合成");
+        assert_eq!(composed.height(), view_h + 135);
+        assert_eq!(
+            composed.rgba(),
+            crop_vertical_doc(&doc, w, 0, view_h + 135).rgba()
         );
     }
 }

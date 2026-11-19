@@ -157,6 +157,10 @@ impl Renderer {
         &self.factory
     }
 
+    pub(crate) fn dwrite(&self) -> &IDWriteFactory {
+        &self.dwrite
+    }
+
     pub(crate) fn button_style(&self) -> ButtonStyle {
         self.button_style
     }
@@ -209,6 +213,12 @@ impl Renderer {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 px(12),
                 DWRITE_TEXT_ALIGNMENT_LEADING,
+            )?,
+            tooltip: self.text_format(
+                w!("Microsoft YaHei UI"),
+                DWRITE_FONT_WEIGHT_NORMAL,
+                px(12),
+                DWRITE_TEXT_ALIGNMENT_CENTER,
             )?,
             glyph_text: self.text_format(
                 w!("Segoe UI"),
@@ -620,6 +630,7 @@ pub(crate) struct Fonts {
     pub(crate) label: IDWriteTextFormat,
     pub(crate) info: IDWriteTextFormat,
     pub(crate) hint: IDWriteTextFormat,
+    pub(crate) tooltip: IDWriteTextFormat,
     pub(crate) button: IDWriteTextFormat,
     /// 工具栏上不依赖图标字体的固定文字，如序号按钮的「1」。
     pub(crate) glyph_text: IDWriteTextFormat,
@@ -763,7 +774,7 @@ impl TargetResources {
             self.draw_label(&r, surface);
         }
         if let Some(toolbar) = &view.toolbar {
-            self.draw_toolbar(toolbar, surface.origin);
+            self.draw_toolbar(toolbar, surface);
         }
         if !view.hints.is_empty() {
             self.draw_hints(
@@ -1193,26 +1204,7 @@ impl TargetResources {
 
     /// 文本在给定格式下的宽度（像素），测量失败时按字符数估算。
     fn text_width(&self, text: &[u16], format: &IDWriteTextFormat) -> u32 {
-        let estimate = u32::try_from(text.len())
-            .unwrap_or(0)
-            .saturating_mul(layout::scaled(8, self.dpi));
-        // SAFETY: text 与 format 在调用期间有效。
-        let Ok(layout) = (unsafe { self.dwrite.CreateTextLayout(text, format, 4096.0, 256.0) })
-        else {
-            return estimate;
-        };
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        // SAFETY: metrics 是有效的输出位置。
-        if unsafe { layout.GetMetrics(&mut metrics) }.is_err() {
-            return estimate;
-        }
-        let width = metrics.widthIncludingTrailingWhitespace.ceil();
-        if (0.0..65_535.0).contains(&width) {
-            // 已检查范围，转换不会截断
-            u32::from(f32_to_u16(width))
-        } else {
-            estimate
-        }
+        measure_text_width(&self.dwrite, text, format, self.dpi)
     }
 
     fn draw_label(&self, selection: &Rect, surface: &Surface<'_>) {
@@ -1236,8 +1228,9 @@ impl TargetResources {
         }
     }
 
-    /// 工具栏：分组按钮、分隔线，以及选中工具后的样式条。
-    fn draw_toolbar(&self, toolbar: &ToolbarView, origin: Point) {
+    /// 工具栏：分组按钮、分隔线、样式条与悬停提示气泡。
+    fn draw_toolbar(&self, toolbar: &ToolbarView, surface: &Surface<'_>) {
+        let origin = surface.origin;
         let layout = &toolbar.layout;
         self.panel(&local_rect(&layout.bar, origin));
         for (button, cell) in &layout.buttons {
@@ -1269,6 +1262,24 @@ impl TargetResources {
         if let (Some(strip), Some(style)) = (&layout.strip, toolbar.style) {
             self.draw_strip(strip, &style, toolbar.hovered, origin);
         }
+        if let Some(button) = toolbar.tooltip
+            && let Some(anchor) = layout.button_rect(button)
+        {
+            let wide: Vec<u16> = button.tooltip().encode_utf16().collect();
+            let text_w = self.text_width(&wide, &self.fonts.tooltip);
+            let size = layout::tooltip_size(text_w, self.dpi);
+            let avoid = layout.strip.as_ref().map(|s| &s.rect);
+            let tip_rect = layout::tooltip_rect(&anchor, &surface.monitor(), avoid, size, self.dpi);
+            let local = local_rect(&tip_rect, origin);
+            draw_tooltip_on(
+                &self.target,
+                &self.brushes,
+                &self.fonts.tooltip,
+                &local,
+                self.px(CORNER_RADIUS),
+                &wide,
+            );
+        }
     }
 
     fn draw_button_glyph(
@@ -1284,6 +1295,7 @@ impl TargetResources {
             button,
             rect,
             brush,
+            Some(&self.round_stroke),
         );
     }
 
@@ -2012,13 +2024,18 @@ pub(crate) fn draw_button_glyph_on(
     button: ToolbarButton,
     rect: &D2D_RECT_F,
     brush: &ID2D1SolidColorBrush,
+    stroke: Option<&ID2D1StrokeStyle>,
 ) {
     let (text, format): (Vec<u16>, &IDWriteTextFormat) = match (button_style, button.glyph()) {
         (_, Glyph::Text(t)) => (t.encode_utf16().collect(), &fonts.glyph_text),
         (ButtonStyle::Icon(_), Glyph::Icon(c)) => {
             (c.to_string().encode_utf16().collect(), &fonts.button)
         }
-        (ButtonStyle::Text, Glyph::Icon(_)) => {
+        (ButtonStyle::Icon(_), Glyph::LongCapture) => {
+            draw_long_capture_icon_on(target, rect, brush, stroke);
+            return;
+        }
+        (ButtonStyle::Text, Glyph::Icon(_) | Glyph::LongCapture) => {
             (button.label().encode_utf16().collect(), &fonts.button)
         }
     };
@@ -2029,6 +2046,135 @@ pub(crate) fn draw_button_glyph_on(
             format,
             rect,
             brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
+}
+
+/// 绘制「长截图」自绘图标：矩形外框与中间上下双向箭头。
+fn draw_long_capture_icon_on(
+    target: &ID2D1HwndRenderTarget,
+    rect: &D2D_RECT_F,
+    brush: &ID2D1SolidColorBrush,
+    stroke: Option<&ID2D1StrokeStyle>,
+) {
+    let cx = (rect.left + rect.right) / 2.0;
+    let cy = (rect.top + rect.bottom) / 2.0;
+    let side = (rect.right - rect.left)
+        .min(rect.bottom - rect.top)
+        .max(1.0);
+    let line_w = (side / 22.0).max(1.2);
+    let hw = side * 0.24;
+    let hh = side * 0.29;
+    let radius = (side * 0.06).max(1.5);
+    let frame = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: cx - hw,
+            top: cy - hh,
+            right: cx + hw,
+            bottom: cy + hh,
+        },
+        radiusX: radius,
+        radiusY: radius,
+    };
+    let shaft = hh * 0.56;
+    let head_w = hw * 0.42;
+    let head_h = hh * 0.27;
+    let top_tip = (cx, cy - shaft);
+    let bot_tip = (cx, cy + shaft);
+    // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效，坐标均为局部变量。
+    unsafe {
+        target.DrawRoundedRectangle(&frame, brush, line_w, stroke);
+        target.DrawLine(
+            float_point(top_tip.0, top_tip.1).point,
+            float_point(bot_tip.0, bot_tip.1).point,
+            brush,
+            line_w,
+            stroke,
+        );
+        target.DrawLine(
+            float_point(top_tip.0, top_tip.1).point,
+            float_point(top_tip.0 - head_w, top_tip.1 + head_h).point,
+            brush,
+            line_w,
+            stroke,
+        );
+        target.DrawLine(
+            float_point(top_tip.0, top_tip.1).point,
+            float_point(top_tip.0 + head_w, top_tip.1 + head_h).point,
+            brush,
+            line_w,
+            stroke,
+        );
+        target.DrawLine(
+            float_point(bot_tip.0, bot_tip.1).point,
+            float_point(bot_tip.0 - head_w, bot_tip.1 - head_h).point,
+            brush,
+            line_w,
+            stroke,
+        );
+        target.DrawLine(
+            float_point(bot_tip.0, bot_tip.1).point,
+            float_point(bot_tip.0 + head_w, bot_tip.1 - head_h).point,
+            brush,
+            line_w,
+            stroke,
+        );
+    }
+}
+
+/// 使用 DirectWrite 测量 UTF-16 文本宽度（像素），失败时按字符数估算。
+pub(crate) fn measure_text_width(
+    dwrite: &IDWriteFactory,
+    text: &[u16],
+    format: &IDWriteTextFormat,
+    dpi: u32,
+) -> u32 {
+    let estimate = u32::try_from(text.len())
+        .unwrap_or(0)
+        .saturating_mul(layout::scaled(8, dpi));
+    // SAFETY: text 与 format 在调用期间有效。
+    let Ok(layout) = (unsafe { dwrite.CreateTextLayout(text, format, 4096.0, 256.0) }) else {
+        return estimate;
+    };
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    // SAFETY: metrics 是有效的输出位置。
+    if unsafe { layout.GetMetrics(&mut metrics) }.is_err() {
+        return estimate;
+    }
+    let width = metrics.widthIncludingTrailingWhitespace.ceil();
+    if (0.0..65_535.0).contains(&width) {
+        u32::from(f32_to_u16(width))
+    } else {
+        estimate
+    }
+}
+
+/// 在任意渲染目标上绘制按钮悬停提示气泡；只能在 BeginDraw 与 EndDraw 之间调用。
+pub(crate) fn draw_tooltip_on(
+    target: &ID2D1HwndRenderTarget,
+    brushes: &Brushes,
+    format: &IDWriteTextFormat,
+    rect: &D2D_RECT_F,
+    radius: f32,
+    text: &[u16],
+) {
+    let rounded = D2D1_ROUNDED_RECT {
+        rect: *rect,
+        radiusX: radius,
+        radiusY: radius,
+    };
+    // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，颜色、画刷、文本与格式均有效。
+    unsafe {
+        brushes.swatch.SetColor(&color(0.08, 0.08, 0.09, 0.96));
+        target.FillRoundedRectangle(&rounded, &brushes.swatch);
+        target.DrawRoundedRectangle(&rounded, &brushes.separator, 1.0, None);
+        target.DrawText(
+            text,
+            format,
+            rect,
+            &brushes.white,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
             DWRITE_MEASURING_MODE_NATURAL,
         );

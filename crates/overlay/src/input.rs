@@ -161,6 +161,8 @@ pub struct ToolbarView {
     pub can_redo: bool,
     /// 样式条内容，没有选中工具时为 `None`。
     pub style: Option<StyleView>,
+    /// 延迟悬停后正在显示的按钮提示。
+    pub tooltip: Option<ToolbarButton>,
 }
 
 /// 需要画在冻结帧上的标注。
@@ -1318,6 +1320,7 @@ impl Interaction {
                             can_undo: self.annotator.can_undo(),
                             can_redo: self.annotator.can_redo(),
                             style: self.annotator.style_view(),
+                            tooltip: None,
                         });
                     }
                 }

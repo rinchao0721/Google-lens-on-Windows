@@ -62,6 +62,10 @@ const GLOW_FRAME_MS: u32 = 16;
 const CARET_TIMER_ID: usize = 2;
 /// 文字光标闪烁周期的一半（毫秒）。
 const CARET_BLINK_MS: u32 = 530;
+/// 工具栏按钮悬停提示计时器的标识。
+const TOOLTIP_TIMER_ID: usize = 3;
+/// 工具栏按钮悬停提示触发延迟（毫秒）。
+const TOOLTIP_DELAY_MS: u32 = 400;
 
 /// 显式丢弃无法处理的返回值。
 fn discard<T>(_value: T) {}
@@ -93,6 +97,10 @@ struct Session {
     pending_high: Option<u16>,
     /// 光标闪烁计时器正在运行。
     caret_timer: bool,
+    /// 工具栏按钮悬停提示状态（含窗口序号与按钮）。
+    tooltip: layout::TooltipState<(usize, layout::ToolbarButton)>,
+    /// 正在运行悬停提示延迟计时器的窗口句柄。
+    tooltip_timer: Option<HWND>,
 }
 
 /// 输入法上下文，离开作用域时释放。
@@ -404,8 +412,58 @@ impl Session {
         }
     }
 
+    /// 将当前悬停按钮同步到 400 ms 提示状态机；返回提示是否从显示变为隐藏。
+    fn sync_tooltip(&mut self) -> bool {
+        let hovered_btn = if self.interaction.is_capturing() {
+            None
+        } else {
+            (0..self.windows.len()).find_map(|idx| {
+                let view = self.interaction.view(idx);
+                let toolbar = view.toolbar?;
+                match toolbar.hovered {
+                    Some(layout::Hit::Button(btn)) => Some((idx, btn)),
+                    _ => None,
+                }
+            })
+        };
+        let (cmd, vis_changed) = self.tooltip.on_hover(hovered_btn);
+        self.apply_tooltip_cmd(cmd);
+        vis_changed
+    }
+
+    /// 鼠标按下时立即隐藏悬停提示并取消延迟计时。
+    fn press_tooltip(&mut self) {
+        let (cmd, _) = self.tooltip.on_press();
+        self.apply_tooltip_cmd(cmd);
+    }
+
+    fn apply_tooltip_cmd(&mut self, cmd: layout::TooltipCommand) {
+        match cmd {
+            layout::TooltipCommand::Keep => {}
+            layout::TooltipCommand::Arm => {
+                if let Some(hwnd) = self.windows.first().map(|s| s.hwnd) {
+                    // SAFETY: hwnd 是本线程创建且存活的窗口，不使用回调函数。
+                    discard(unsafe {
+                        SetTimer(Some(hwnd), TOOLTIP_TIMER_ID, TOOLTIP_DELAY_MS, None)
+                    });
+                    self.tooltip_timer = Some(hwnd);
+                }
+            }
+            layout::TooltipCommand::Disarm => {
+                if let Some(hwnd) = self.tooltip_timer.take() {
+                    // SAFETY: hwnd 是此前设置该计时器的窗口。
+                    discard(unsafe { KillTimer(Some(hwnd), TOOLTIP_TIMER_ID) });
+                }
+            }
+        }
+    }
+
     fn paint(&mut self, index: usize) {
         let effects = self.effects();
+        let visible_tip = self
+            .tooltip
+            .visible_target()
+            .and_then(|(win, btn)| (win == index).then_some(btn));
         let Some(slot) = self.windows.get_mut(index) else {
             return;
         };
@@ -432,7 +490,11 @@ impl Session {
             show_lasso_bounds: self.show_lasso_bounds,
             effects,
         };
-        match target.draw(&surface, &self.interaction.view(index)) {
+        let mut view = self.interaction.view(index);
+        if let Some(toolbar) = view.toolbar.as_mut() {
+            toolbar.tooltip = visible_tip;
+        }
+        match target.draw(&surface, &view) {
             Ok(DrawStatus::Done) => {}
             Ok(DrawStatus::RecreateTarget) => {
                 slot.target = None;
@@ -468,6 +530,7 @@ fn update(hwnd: HWND, change: impl FnOnce(&mut Session)) {
             discard(unsafe { ReleaseCapture() });
         }
         s.sync_editing();
+        discard(s.sync_tooltip());
         s.invalidate_windows(&before);
         s.invalidate_windows(&s.interaction.painted_windows());
     });
@@ -493,8 +556,14 @@ fn on_mouse(hwnd: HWND, lparam: LPARAM, event: Mouse) {
         };
         s.interaction.set_shift(shift);
         match event {
-            Mouse::Down => s.interaction.press(index, local),
-            Mouse::DoubleClick => s.interaction.double_click(index, local),
+            Mouse::Down => {
+                s.press_tooltip();
+                s.interaction.press(index, local);
+            }
+            Mouse::DoubleClick => {
+                s.press_tooltip();
+                s.interaction.double_click(index, local);
+            }
             Mouse::Move => s.interaction.mouse_move(index, local),
             Mouse::Up => s.interaction.release(index, local),
         }
@@ -780,7 +849,10 @@ unsafe extern "system" fn wnd_proc(
             set_cursor();
         }
         WM_LBUTTONUP => on_mouse(hwnd, lparam, Mouse::Up),
-        WM_RBUTTONDOWN => update(hwnd, |s| s.interaction.right_click()),
+        WM_RBUTTONDOWN => update(hwnd, |s| {
+            s.press_tooltip();
+            s.interaction.right_click();
+        }),
         WM_MOUSEWHEEL => {
             let notches = wheel_notches(wparam);
             update(hwnd, |s| s.interaction.wheel(notches));
@@ -798,6 +870,19 @@ unsafe extern "system" fn wnd_proc(
             with_session(|s| {
                 s.interaction.toggle_caret();
                 s.invalidate_windows(&s.interaction.painted_windows());
+            });
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == TOOLTIP_TIMER_ID => {
+            // SAFETY: hwnd 是本线程创建且设置该计时器的窗口。
+            discard(unsafe { KillTimer(Some(hwnd), TOOLTIP_TIMER_ID) });
+            with_session(|s| {
+                s.tooltip_timer = None;
+                if s.tooltip.on_timer()
+                    && let Some((win, _)) = s.tooltip.visible_target()
+                {
+                    s.invalidate_window(win);
+                }
             });
             return LRESULT(0);
         }
@@ -1039,6 +1124,8 @@ fn open(input: SessionInput, mode: SessionMode) -> Result<Windows, OverlayError>
                 candidate: None,
                 pending_high: None,
                 caret_timer: false,
+                tooltip: layout::TooltipState::default(),
+                tooltip_timer: None,
             });
         })
         .map_err(|_| OverlayError::InvalidInput("无法初始化覆盖层会话".to_string()))?;
