@@ -5,7 +5,7 @@ use lenswin_core::monitor::MonitorInfo;
 use windows::Win32::Foundation::{LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint,
+    MonitorFromPoint, MonitorFromRect,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY};
@@ -30,15 +30,32 @@ pub fn work_area_at_cursor() -> Result<Rect, PlatformError> {
     let pt = POINT { x: pos.x, y: pos.y };
     // SAFETY: MONITOR_DEFAULTTONEAREST 保证在无精确命中时返回最近显示器。
     let monitor = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    work_area_from_monitor(monitor)
+}
+
+/// 返回包含指定矩形面积最大显示器的工作区矩形（物理像素，排除任务栏）。
+pub fn work_area_for(rect: Rect) -> Result<Rect, PlatformError> {
+    let win_rect = RECT {
+        left: rect.x,
+        top: rect.y,
+        right: i32::try_from(rect.right()).unwrap_or(i32::MAX),
+        bottom: i32::try_from(rect.bottom()).unwrap_or(i32::MAX),
+    };
+    // SAFETY: win_rect 为有效局部变量；MONITOR_DEFAULTTONEAREST 保证返回某个显示器。
+    let monitor = unsafe { MonitorFromRect(&win_rect, MONITOR_DEFAULTTONEAREST) };
+    work_area_from_monitor(monitor)
+}
+
+fn work_area_from_monitor(monitor: HMONITOR) -> Result<Rect, PlatformError> {
     if monitor.is_invalid() {
-        return Err(PlatformError::Invalid("未检测到光标所在显示器".to_string()));
+        return Err(PlatformError::Invalid("未检测到目标显示器".to_string()));
     }
     let mut mi = MONITORINFO {
         cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>())
             .map_err(|_| PlatformError::Invalid("MONITORINFO 尺寸溢出".to_string()))?,
         ..Default::default()
     };
-    // SAFETY: mi 的 cbSize 已设置，monitor 来自 MonitorFromPoint。
+    // SAFETY: mi 的 cbSize 已设置，monitor 来自 MonitorFromPoint 或 MonitorFromRect。
     if !unsafe { GetMonitorInfoW(monitor, &mut mi) }.as_bool() {
         return Err(last_error("GetMonitorInfoW"));
     }

@@ -10,9 +10,10 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW, RegisterClassExW,
-    RegisterWindowMessageW, UnregisterClassW, WM_APP, WM_COPYDATA, WM_HOTKEY, WM_LBUTTONUP,
-    WM_RBUTTONUP, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, KillTimer, PostMessageW, RegisterClassExW,
+    RegisterWindowMessageW, SetTimer, SetWindowDisplayAffinity, UnregisterClassW,
+    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_COPYDATA, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{PCWSTR, w};
 
@@ -59,6 +60,8 @@ pub enum WindowEvent {
     SecondInstance,
     /// 后台任务有结果待取。
     TaskDone,
+    /// 窗口计时器到期，值为启动时的 id。
+    Timer(usize),
 }
 
 /// 处理跨进程提交的回调：参数为消息类型与负载，返回 [`IpcResult`] 的数值。
@@ -310,6 +313,30 @@ impl WindowHandle {
     pub(crate) fn hwnd(self) -> HWND {
         HWND(std::ptr::with_exposed_provenance_mut(self.hwnd))
     }
+
+    /// 启动周期性窗口定时器，到期后向消息队列投递 [`WindowEvent::Timer`]。
+    pub fn start_timer(self, id: usize, interval_ms: u32) -> Result<(), PlatformError> {
+        // SAFETY: hwnd 为主消息窗口句柄，lpTimerFunc 为 None 表示通过 WM_TIMER 派发。
+        let ret = unsafe { SetTimer(Some(self.hwnd()), id, interval_ms, None) };
+        if ret == 0 {
+            return Err(last_error("SetTimer"));
+        }
+        Ok(())
+    }
+
+    /// 停止指定 id 的窗口定时器；窗口已销毁或定时器不存在时静默忽略。
+    pub fn stop_timer(self, id: usize) {
+        // SAFETY: hwnd 为主消息窗口句柄，KillTimer 失败仅表示定时器已不存在或窗口已销毁。
+        discard(unsafe { KillTimer(Some(self.hwnd()), id) });
+    }
+}
+
+/// 把窗口标记为从屏幕捕获中排除，失败时仅记警告日志不影响流程。
+pub fn exclude_from_capture(hwnd: HWND) {
+    // SAFETY: hwnd 由调用方保证有效；SetWindowDisplayAffinity 仅修改其显示亲和性。
+    if let Err(error) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+        log::warn!("设置窗口避开截图失败：{error}");
+    }
 }
 
 /// 工作线程用它向消息窗口投递 [`WindowEvent::TaskDone`]。
@@ -368,6 +395,10 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SECOND_INSTANCE => enqueue_and_wake(hwnd, WindowEvent::SecondInstance),
         WM_TASK_DONE => enqueue_and_wake(hwnd, WindowEvent::TaskDone),
+        WM_TIMER => {
+            enqueue_and_wake(hwnd, WindowEvent::Timer(wparam.0));
+            return LRESULT(0);
+        }
         // 消息循环在本条消息分发后处理队列，这里只需清掉在途标记
         WM_EVENT_PENDING => set_wake_pending(false),
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {

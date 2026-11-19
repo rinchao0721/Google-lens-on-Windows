@@ -16,6 +16,7 @@ pub mod ocr;
 pub mod pin;
 pub mod selection;
 pub mod snip;
+pub mod stitch;
 pub mod text_box;
 pub mod text_edit;
 pub mod update;

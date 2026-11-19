@@ -2,6 +2,8 @@
 
 pub mod gdi;
 
+pub use gdi::capture_rect;
+
 use lenswin_core::error::FrameError;
 use lenswin_core::frame::Frame;
 use lenswin_core::monitor::MonitorInfo;

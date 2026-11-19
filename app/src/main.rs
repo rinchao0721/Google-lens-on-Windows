@@ -8,6 +8,7 @@ mod config_store;
 mod dispatcher;
 mod hotkeys;
 mod logging;
+mod long_capture;
 mod ocr_worker;
 mod shared;
 mod tray_menu;

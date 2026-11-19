@@ -29,6 +29,19 @@ pub enum LiveEvent {
     Failed(String),
 }
 
+/// 长截图会话回投给调用方的事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrollEvent {
+    /// 用户点击了结果动作按钮或按回车复制。
+    Finished(ToolbarAction),
+    /// 用户开关自动滚动。
+    AutoScroll(bool),
+    /// 用户退出（取消按钮或 Esc）。
+    Closed,
+    /// 会话出错，会话已不可用。
+    Failed(String),
+}
+
 /// 工具栏上可选的动作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarAction {
@@ -51,6 +64,8 @@ pub enum OverlayResult {
     Selected(Selection),
     /// 工具栏流程得到的选区、用户选的动作和合成好的成图（含标注）。
     Action(Selection, ToolbarAction, CroppedImage),
+    /// 工具栏点击长截图得到的选区（已丢弃标注）。
+    LongCapture(Selection),
     /// 取色结果，已按用户选择的格式格式化。
     Color(String),
 }

@@ -19,7 +19,9 @@ use lenswin_core::lens::LensRequest;
 use lenswin_core::monitor::MonitorInfo;
 use lenswin_core::pin::{MAX_PIN_COUNT, PinEvent, fit_work_area};
 use lenswin_core::selection::{Selection, SelectionMode, SelectionShape};
-use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayResult, ToolbarAction, push_history};
+use lenswin_core::snip::{
+    LiveEvent, OverlayFlow, OverlayResult, ScrollEvent, ToolbarAction, push_history,
+};
 use lenswin_core::text_edit::sanitize_clipboard;
 use lenswin_core::update::is_release_page_url;
 use lenswin_overlay::{LiveSession, SelectRequest};
@@ -41,6 +43,9 @@ use lenswin_popup::{PopupEvent, PopupHost};
 use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
+use crate::long_capture::{
+    ActiveLongCapture, LongCaptureState, SCROLL_TIMER_ID, ScrollMessage, WorkerReply,
+};
 use crate::ocr_worker::{OcrOutcome, OcrWorker};
 use crate::shared::AppShared;
 use crate::tray_menu::{self, MenuAction, PinMenuState};
@@ -214,6 +219,13 @@ pub struct Dispatcher<'a> {
     live_seq: Cell<u64>,
     live_tx: Sender<LiveMessage>,
     live_rx: Receiver<LiveMessage>,
+    long_capture: RefCell<Option<LongCaptureState>>,
+    /// 最近一次长截图会话的序号。
+    long_capture_seq: Cell<u64>,
+    scroll_tx: Sender<ScrollMessage>,
+    scroll_rx: Receiver<ScrollMessage>,
+    stitch_tx: Sender<WorkerReply>,
+    stitch_rx: Receiver<WorkerReply>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -233,6 +245,8 @@ impl<'a> Dispatcher<'a> {
         let (lens_tx, lens_rx) = channel();
         let (update_tx, update_rx) = channel();
         let (live_tx, live_rx) = channel();
+        let (scroll_tx, scroll_rx) = channel();
+        let (stitch_tx, stitch_rx) = channel();
         let exe = match std::env::current_exe() {
             Ok(path) => Some(path),
             Err(e) => {
@@ -268,6 +282,12 @@ impl<'a> Dispatcher<'a> {
             live_seq: Cell::new(0),
             live_tx,
             live_rx,
+            long_capture: RefCell::new(None),
+            long_capture_seq: Cell::new(0),
+            scroll_tx,
+            scroll_rx,
+            stitch_tx,
+            stitch_rx,
         }
     }
 
@@ -491,6 +511,15 @@ impl<'a> Dispatcher<'a> {
                 self.drain_results();
                 LoopControl::Continue
             }
+            WindowEvent::Timer(id) => {
+                if id == SCROLL_TIMER_ID
+                    && let Some(LongCaptureState::Active(active)) =
+                        self.long_capture.borrow_mut().as_mut()
+                {
+                    active.on_timer();
+                }
+                LoopControl::Continue
+            }
         }
     }
 
@@ -524,6 +553,7 @@ impl<'a> Dispatcher<'a> {
 
     fn perform(&self, action: MenuAction) -> LoopControl {
         self.end_live();
+        self.end_long_capture();
         match action {
             MenuAction::Run(command) => return self.run(command),
             MenuAction::SetSelectionMode(mode) => {
@@ -634,6 +664,7 @@ impl<'a> Dispatcher<'a> {
 
     fn run(&self, command: Command) -> LoopControl {
         self.end_live();
+        self.end_long_capture();
         match command {
             Command::Search => {
                 self.search();
@@ -702,7 +733,9 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         match result {
-            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _, _) => {
+            OverlayResult::Selected(selection)
+            | OverlayResult::Action(selection, _, _)
+            | OverlayResult::LongCapture(selection) => {
                 if let Some(image) = self.crop(&selection, &frames) {
                     self.search_image(image, &selection.bounds());
                 }
@@ -718,7 +751,9 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         match result {
-            OverlayResult::Selected(selection) | OverlayResult::Action(selection, _, _) => {
+            OverlayResult::Selected(selection)
+            | OverlayResult::Action(selection, _, _)
+            | OverlayResult::LongCapture(selection) => {
                 if let Some(image) = self.crop(&selection, &frames) {
                     self.start_ocr(image);
                 }
@@ -744,6 +779,10 @@ impl<'a> Dispatcher<'a> {
                     return;
                 };
                 (selection, ToolbarAction::Copy, image)
+            }
+            OverlayResult::LongCapture(selection) => {
+                self.start_long_capture(&selection);
+                return;
             }
             OverlayResult::Color(text) => {
                 self.copy_color(&text);
@@ -992,6 +1031,157 @@ impl<'a> Dispatcher<'a> {
         if let Some(popup) = self.popup.host {
             popup.hide();
         }
+    }
+
+    /// 启动长截图会话：等待覆盖层合成消失后创建边框、控制面板与后台拼接线程。
+    fn start_long_capture(&self, selection: &Selection) {
+        self.end_long_capture();
+        let bounds = selection.bounds();
+        log::info!("启动长截图：范围 {bounds:?}");
+        if let Err(e) = capture::wait_for_composition() {
+            log::warn!("等待桌面合成失败，照常启动长截图：{e}");
+        }
+        let id = self.long_capture_seq.get().wrapping_add(1);
+        self.long_capture_seq.set(id);
+        match ActiveLongCapture::start(
+            id,
+            bounds,
+            self.shared.window,
+            self.notifier,
+            self.scroll_tx.clone(),
+            self.stitch_tx.clone(),
+        ) {
+            Ok(active) => {
+                self.long_capture
+                    .replace(Some(LongCaptureState::Active(Box::new(active))));
+            }
+            Err(message) => {
+                log::error!("{message}");
+                self.balloon(NotifyLevel::Error, "lenswin", &message);
+            }
+        }
+    }
+
+    /// 结束当前长截图会话：停止定时器、销毁边框与控制面板并断开后台线程；空闲时无操作。
+    fn end_long_capture(&self) {
+        self.long_capture.borrow_mut().take();
+    }
+
+    fn on_scroll_message(&self, (id, event): ScrollMessage) {
+        let current = self
+            .long_capture
+            .borrow()
+            .as_ref()
+            .map(LongCaptureState::id);
+        if current != Some(id) {
+            log::debug!("丢弃已结束长截图会话 #{id} 的界面事件");
+            return;
+        }
+        match event {
+            ScrollEvent::AutoScroll(enable) => {
+                if let Some(LongCaptureState::Active(active)) =
+                    self.long_capture.borrow_mut().as_mut()
+                {
+                    active.on_auto_scroll(enable);
+                }
+            }
+            ScrollEvent::Finished(action) => {
+                let ready = if let Some(LongCaptureState::Active(active)) =
+                    self.long_capture.borrow_mut().as_mut()
+                {
+                    active.request_finish(action)
+                } else {
+                    false
+                };
+                if ready {
+                    self.long_capture
+                        .replace(Some(LongCaptureState::Finishing { id }));
+                } else {
+                    self.end_long_capture();
+                    self.balloon(NotifyLevel::Error, "lenswin", "长截图合成失败，请重试");
+                }
+            }
+            ScrollEvent::Closed => {
+                log::info!("长截图已取消");
+                self.end_long_capture();
+            }
+            ScrollEvent::Failed(message) => {
+                log::error!("长截图失败：{message}");
+                self.end_long_capture();
+                self.balloon(
+                    NotifyLevel::Error,
+                    "lenswin",
+                    &format!("长截图失败：{message}"),
+                );
+            }
+        }
+    }
+
+    fn on_worker_reply(&self, reply: WorkerReply) {
+        match reply {
+            WorkerReply::FrameProcessed {
+                seq,
+                status,
+                preview,
+            } => {
+                let current = self
+                    .long_capture
+                    .borrow()
+                    .as_ref()
+                    .map(LongCaptureState::id);
+                if current != Some(seq) {
+                    return;
+                }
+                if let Some(LongCaptureState::Active(active)) =
+                    self.long_capture.borrow_mut().as_mut()
+                {
+                    active.on_frame_processed(status, preview);
+                }
+            }
+            WorkerReply::Finished {
+                seq,
+                action,
+                bounds,
+                result,
+            } => {
+                let current = self
+                    .long_capture
+                    .borrow()
+                    .as_ref()
+                    .map(LongCaptureState::id);
+                if current != Some(seq) {
+                    log::debug!("丢弃已结束长截图会话 #{seq} 的合成结果");
+                    return;
+                }
+                self.end_long_capture();
+                match result {
+                    Ok(image) => match action {
+                        ToolbarAction::Copy => self.copy_image(image),
+                        ToolbarAction::Save => self.save_image(image),
+                        ToolbarAction::Pin => self.pin_long_image(image, bounds),
+                        ToolbarAction::Search => self.search_image(image, &bounds),
+                        ToolbarAction::Ocr => self.start_ocr(image),
+                    },
+                    Err(message) => {
+                        log::error!("{message}");
+                        self.balloon(NotifyLevel::Error, "lenswin", &message);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 钉住长截图：初始窗口按选区所在显示器工作区等比缩小，内部保留原图分辨率。
+    fn pin_long_image(&self, image: CroppedImage, bounds: Rect) {
+        let work_area = monitor::work_area_for(bounds).or_else(|_| monitor::work_area_at_cursor());
+        let target = match work_area {
+            Ok(area) => fit_work_area(image.width(), image.height(), area).0,
+            Err(e) => {
+                log::warn!("获取显示器工作区失败，按原尺寸贴图：{e}");
+                bounds
+            }
+        };
+        self.pin_image(image, target);
     }
 
     /// 弹出内置弹窗，工作线程准备好请求后由弹窗直接提交给 Lens。
@@ -1377,6 +1567,12 @@ impl<'a> Dispatcher<'a> {
         while let Ok(message) = self.live_rx.try_recv() {
             self.on_live_message(message);
         }
+        while let Ok(message) = self.scroll_rx.try_recv() {
+            self.on_scroll_message(message);
+        }
+        while let Ok(reply) = self.stitch_rx.try_recv() {
+            self.on_worker_reply(reply);
+        }
         while let Ok(event) = self.popup.events.try_recv() {
             self.on_popup_event(event);
         }
@@ -1577,7 +1773,9 @@ impl<'a> Dispatcher<'a> {
     /// 把矩形选区记入历史。
     fn remember(&self, result: &OverlayResult, capacity: u32) {
         let selection = match result {
-            OverlayResult::Selected(s) | OverlayResult::Action(s, _, _) => s,
+            OverlayResult::Selected(s)
+            | OverlayResult::Action(s, _, _)
+            | OverlayResult::LongCapture(s) => s,
             OverlayResult::Color(_) => return,
         };
         log::info!(

@@ -1,6 +1,7 @@
 //! 基于 GDI BitBlt 的屏幕捕获。
 
-use lenswin_core::frame::Frame;
+use lenswin_core::frame::{CroppedImage, Frame};
+use lenswin_core::geometry::Rect;
 use lenswin_core::monitor::MonitorInfo;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, DIB_RGB_COLORS, GetDIBits, RGBQUAD,
@@ -25,14 +26,29 @@ impl ScreenCapturer for GdiCapturer {
     }
 }
 
+/// 截取虚拟桌面上单个矩形区域的像素（不透明 RGBA）。
+pub fn capture_rect(region: Rect) -> Result<CroppedImage, CaptureError> {
+    let screen = ScreenDc::acquire()?;
+    let rgba = capture_region(&screen, region)?;
+    Ok(CroppedImage::new(region.width, region.height, rgba)?)
+}
+
 fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, CaptureError> {
-    let width = i32::try_from(monitor.bounds.width)
-        .map_err(|_| PlatformError::Invalid("显示器宽度超出范围".to_string()))?;
-    let height = i32::try_from(monitor.bounds.height)
-        .map_err(|_| PlatformError::Invalid("显示器高度超出范围".to_string()))?;
-    let byte_len = usize::try_from(monitor.bounds.width)
+    let rgba = capture_region(screen, monitor.bounds)?;
+    Ok(Frame::new(monitor.bounds, rgba)?)
+}
+
+fn capture_region(screen: &ScreenDc, region: Rect) -> Result<Vec<u8>, CaptureError> {
+    if region.is_empty() {
+        return Err(PlatformError::Invalid("捕获矩形宽高不能为 0".to_string()).into());
+    }
+    let width = i32::try_from(region.width)
+        .map_err(|_| PlatformError::Invalid("捕获宽度超出范围".to_string()))?;
+    let height = i32::try_from(region.height)
+        .map_err(|_| PlatformError::Invalid("捕获高度超出范围".to_string()))?;
+    let byte_len = usize::try_from(region.width)
         .ok()
-        .zip(usize::try_from(monitor.bounds.height).ok())
+        .zip(usize::try_from(region.height).ok())
         .and_then(|(w, h)| w.checked_mul(h))
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| PlatformError::Invalid("帧缓冲区大小溢出".to_string()))?;
@@ -51,8 +67,8 @@ fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, Ca
                 width,
                 height,
                 Some(screen.raw()),
-                monitor.bounds.x,
-                monitor.bounds.y,
+                region.x,
+                region.y,
                 SRCCOPY | CAPTUREBLT,
             )
         }
@@ -84,7 +100,7 @@ fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, Ca
             screen.raw(),
             bitmap.raw(),
             0,
-            monitor.bounds.height,
+            region.height,
             Some(rgba.as_mut_ptr().cast()),
             &mut info,
             DIB_RGB_COLORS,
@@ -100,7 +116,7 @@ fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, Ca
         );
     }
     bgra_to_opaque_rgba(&mut rgba);
-    Ok(Frame::new(monitor.bounds, rgba)?)
+    Ok(rgba)
 }
 
 /// BGRA 转 RGBA；屏幕 BitBlt 的 alpha 通道不可靠，一律置为不透明。

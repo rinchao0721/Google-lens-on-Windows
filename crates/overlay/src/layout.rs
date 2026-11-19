@@ -66,6 +66,8 @@ pub enum ToolbarButton {
     Pin,
     /// 识别文字。
     Ocr,
+    /// 长截图。
+    LongCapture,
     /// 保存。
     Save,
     /// 取消。
@@ -99,10 +101,11 @@ impl ToolbarButton {
     /// 撤销重做组。
     pub const HISTORY: [ToolbarButton; 2] = [ToolbarButton::Undo, ToolbarButton::Redo];
     /// 动作组。
-    pub const ACTIONS: [ToolbarButton; 6] = [
+    pub const ACTIONS: [ToolbarButton; 7] = [
         ToolbarButton::Search,
         ToolbarButton::Pin,
         ToolbarButton::Ocr,
+        ToolbarButton::LongCapture,
         ToolbarButton::Save,
         ToolbarButton::Cancel,
         ToolbarButton::Copy,
@@ -125,6 +128,7 @@ impl ToolbarButton {
             ToolbarButton::Search => Glyph::Icon('\u{E721}'),
             ToolbarButton::Pin => Glyph::Icon('\u{E718}'),
             ToolbarButton::Ocr => Glyph::Icon('\u{E8E9}'),
+            ToolbarButton::LongCapture => Glyph::Icon('\u{E8A5}'),
             ToolbarButton::Save => Glyph::Icon('\u{E74E}'),
             ToolbarButton::Cancel => Glyph::Icon('\u{E711}'),
             ToolbarButton::Copy => Glyph::Icon('\u{E8C8}'),
@@ -148,6 +152,7 @@ impl ToolbarButton {
             ToolbarButton::Search => "搜索",
             ToolbarButton::Pin => "钉",
             ToolbarButton::Ocr => "识",
+            ToolbarButton::LongCapture => "长截",
             ToolbarButton::Save => "保存",
             ToolbarButton::Cancel => "取消",
             ToolbarButton::Copy => "复制",
@@ -708,6 +713,170 @@ fn edges(r: &Rect) -> (i64, i64, i64, i64) {
     (i64::from(r.x), i64::from(r.y), r.right(), r.bottom())
 }
 
+/// 长截图控制面板在 96 DPI 下的逻辑尺寸。
+const SCROLL_PANEL_WIDTH: u32 = 256;
+const SCROLL_PANEL_HEIGHT: u32 = 280;
+/// 长截图控制面板内边距与控件间距（96 DPI 下）。
+const SCROLL_PANEL_PADDING: u32 = 8;
+const SCROLL_PANEL_GAP: u32 = 6;
+const SCROLL_STATUS_HEIGHT: u32 = 22;
+const SCROLL_AUTO_HEIGHT: u32 = 30;
+/// 长截图选区外框的线宽（96 DPI 下）。
+const SCROLL_BORDER_THICKNESS: u32 = 3;
+
+/// 长截图控制面板上的按钮。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollButton {
+    /// 开始或停止自动滚动。
+    AutoScroll,
+    /// 复制结果。
+    Copy,
+    /// 保存结果。
+    Save,
+    /// 钉在屏幕上。
+    Pin,
+    /// 以图搜图。
+    Search,
+    /// 识别文字。
+    Ocr,
+    /// 取消并关闭。
+    Cancel,
+}
+
+impl ScrollButton {
+    /// 底部一排结果动作按钮，顺序与规格一致。
+    pub const ACTIONS: [ScrollButton; 6] = [
+        ScrollButton::Copy,
+        ScrollButton::Save,
+        ScrollButton::Pin,
+        ScrollButton::Search,
+        ScrollButton::Ocr,
+        ScrollButton::Cancel,
+    ];
+
+    /// 对应的工具栏按钮定义，用于复用图标与退化文字绘制。
+    pub const fn as_toolbar_button(self) -> Option<ToolbarButton> {
+        match self {
+            ScrollButton::AutoScroll => None,
+            ScrollButton::Copy => Some(ToolbarButton::Copy),
+            ScrollButton::Save => Some(ToolbarButton::Save),
+            ScrollButton::Pin => Some(ToolbarButton::Pin),
+            ScrollButton::Search => Some(ToolbarButton::Search),
+            ScrollButton::Ocr => Some(ToolbarButton::Ocr),
+            ScrollButton::Cancel => Some(ToolbarButton::Cancel),
+        }
+    }
+}
+
+/// 长截图控制面板内部控件的窗口坐标布局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollPanelLayout {
+    /// 整个面板范围。
+    pub panel: Rect,
+    /// 预览缩略图区域。
+    pub preview: Rect,
+    /// 状态文字区域。
+    pub status: Rect,
+    /// 全部可点击按钮及其范围。
+    pub buttons: Vec<(ScrollButton, Rect)>,
+}
+
+impl ScrollPanelLayout {
+    /// 命中哪个按钮。
+    pub fn hit(&self, p: Point) -> Option<ScrollButton> {
+        self.buttons
+            .iter()
+            .find(|(_, r)| r.contains(p))
+            .map(|(b, _)| *b)
+    }
+
+    /// 某个按钮的范围。
+    pub fn button_rect(&self, button: ScrollButton) -> Option<Rect> {
+        self.buttons
+            .iter()
+            .find(|(b, _)| *b == button)
+            .map(|(_, r)| *r)
+    }
+}
+
+/// 长截图控制面板按 DPI 缩放后的建议宽高。
+pub fn scroll_panel_size(dpi: u32) -> (u32, u32) {
+    (
+        scaled(SCROLL_PANEL_WIDTH, dpi),
+        scaled(SCROLL_PANEL_HEIGHT, dpi),
+    )
+}
+
+/// 计算长截图控制面板内部控件布局（相对于面板左上角 `(0, 0)`）。
+pub fn scroll_panel_layout(size: (u32, u32), dpi: u32) -> ScrollPanelLayout {
+    let w = i64::from(size.0.max(1));
+    let h = i64::from(size.1.max(1));
+    let pad = i64::from(scaled(SCROLL_PANEL_PADDING, dpi)).min(w / 4);
+    let gap = i64::from(scaled(SCROLL_PANEL_GAP, dpi));
+    let status_h = i64::from(scaled(SCROLL_STATUS_HEIGHT, dpi));
+    let auto_h = i64::from(scaled(SCROLL_AUTO_HEIGHT, dpi));
+    let bh = i64::from(scaled(BUTTON_HEIGHT, dpi));
+    let bw = i64::from(scaled(BUTTON_WIDTH, dpi));
+
+    let inner_left = pad;
+    let inner_right = (w - pad).max(inner_left + 1);
+    let inner_w = inner_right - inner_left;
+
+    let action_bottom = (h - pad).max(pad + 1);
+    let action_top = (action_bottom - bh).max(pad);
+    let auto_bottom = (action_top - gap).max(pad);
+    let auto_top = (auto_bottom - auto_h).max(pad);
+    let status_bottom = (auto_top - gap).max(pad);
+    let status_top = (status_bottom - status_h).max(pad);
+    let preview_bottom = (status_top - gap).max(pad + 1);
+    let preview_top = pad.min(preview_bottom - 1);
+
+    let panel = Rect::new(0, 0, size.0.max(1), size.1.max(1));
+    let preview =
+        Rect::from_edges(inner_left, preview_top, inner_right, preview_bottom).unwrap_or(panel);
+    let status =
+        Rect::from_edges(inner_left, status_top, inner_right, status_bottom).unwrap_or(panel);
+
+    let mut buttons = Vec::with_capacity(7);
+    if let Some(auto_rect) = Rect::from_edges(inner_left, auto_top, inner_right, auto_bottom) {
+        buttons.push((ScrollButton::AutoScroll, auto_rect));
+    }
+
+    let count = i64::try_from(ScrollButton::ACTIONS.len()).unwrap_or(6);
+    let btn_w = bw.min((inner_w / count).max(1));
+    let total_btn_w = btn_w * count;
+    let extra = (inner_w - total_btn_w).max(0);
+    let gaps = count.saturating_sub(1).max(1);
+    for (idx, button) in ScrollButton::ACTIONS.iter().enumerate() {
+        let i = i64::try_from(idx).unwrap_or(0);
+        let x = inner_left + i * btn_w + (extra * i) / gaps;
+        if let Some(r) = Rect::from_edges(x, action_top, x + btn_w, action_bottom) {
+            buttons.push((*button, r));
+        }
+    }
+
+    ScrollPanelLayout {
+        panel,
+        preview,
+        status,
+        buttons,
+    }
+}
+
+/// 贴在 `bounds` 外侧的四条边框矩形（上、下、左、右），与 `bounds` 零重叠。
+pub fn scroll_border_rects(bounds: &Rect, dpi: u32) -> [Rect; 4] {
+    let t = i64::from(scaled(SCROLL_BORDER_THICKNESS, dpi));
+    let left = i64::from(bounds.x);
+    let top = i64::from(bounds.y);
+    let right = bounds.right();
+    let bottom = bounds.bottom();
+    let top_bar = Rect::from_edges(left - t, top - t, right + t, top).unwrap_or_default();
+    let bottom_bar = Rect::from_edges(left - t, bottom, right + t, bottom + t).unwrap_or_default();
+    let left_bar = Rect::from_edges(left - t, top, left, bottom).unwrap_or_default();
+    let right_bar = Rect::from_edges(right, top, right + t, bottom).unwrap_or_default();
+    [top_bar, bottom_bar, left_bar, right_bar]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,18 +916,18 @@ mod tests {
     fn toolbar_single_row_below_right_aligned() {
         let sel = Rect::new(800, 100, 600, 300);
         let layout = bar_of(&sel, &MONITOR);
-        // 17 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
-        assert_eq!(layout.bar, Rect::new(762, 406, 638, 40));
-        assert_eq!(layout.buttons.len(), 17);
+        // 18 个按钮 × 36 + 2 条分隔 × 9 + 内边距 8
+        assert_eq!(layout.bar, Rect::new(726, 406, 674, 40));
+        assert_eq!(layout.buttons.len(), 18);
         assert_eq!(layout.separators.len(), 2);
         assert_eq!(layout.strip, None);
         assert_eq!(
             layout.button_rect(ToolbarButton::Tool(Tool::Rectangle)),
-            Some(Rect::new(766, 410, 36, 32))
+            Some(Rect::new(730, 410, 36, 32))
         );
         assert_eq!(
             layout.button_rect(ToolbarButton::Undo),
-            Some(Rect::new(766 + 9 * 36 + 9, 410, 36, 32))
+            Some(Rect::new(730 + 9 * 36 + 9, 410, 36, 32))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
         assert_eq!(copy.right(), 1400 - 4);
@@ -799,7 +968,7 @@ mod tests {
         let full = Rect::new(0, 0, 1920, 1080);
         let bar = bar_of(&full, &MONITOR).bar;
         assert_eq!(bar.y, 1080 - 6 - 40);
-        assert_eq!(bar.x, 1920 - 638);
+        assert_eq!(bar.x, 1920 - 674);
     }
 
     #[test]
@@ -818,7 +987,7 @@ mod tests {
         // 第一行 11 个按钮 + 1 条分隔 + 内边距
         assert_eq!(layout.bar, Rect::new(0, 306, 413, 72));
         assert_eq!(layout.separators.len(), 1);
-        assert_eq!(layout.buttons.len(), 17);
+        assert_eq!(layout.buttons.len(), 18);
         assert_eq!(
             layout.button_rect(ToolbarButton::Search),
             Some(Rect::new(4, 306 + 4 + 32, 36, 32))
@@ -846,7 +1015,7 @@ mod tests {
     fn hit_finds_buttons_and_ignores_gaps() {
         let layout = bar_of(&Rect::new(800, 100, 600, 300), &MONITOR);
         assert_eq!(
-            layout.hit(Point::new(770, 420)),
+            layout.hit(Point::new(734, 420)),
             Some(Hit::Button(ToolbarButton::Tool(Tool::Rectangle)))
         );
         let copy = layout.button_rect(ToolbarButton::Copy).expect("复制");
@@ -855,10 +1024,10 @@ mod tests {
             Some(Hit::Button(ToolbarButton::Copy))
         );
         // 内边距和分隔线不属于任何按钮，但仍在工具栏内
-        assert_eq!(layout.hit(Point::new(763, 407)), None);
-        assert!(layout.covers(Point::new(763, 407)));
-        assert!(!layout.covers(Point::new(761, 407)));
-        assert!(!layout.covers(Point::new(763, 446)));
+        assert_eq!(layout.hit(Point::new(727, 407)), None);
+        assert!(layout.covers(Point::new(727, 407)));
+        assert!(!layout.covers(Point::new(725, 407)));
+        assert!(!layout.covers(Point::new(727, 446)));
     }
 
     #[test]
@@ -1094,5 +1263,47 @@ mod tests {
         );
         assert_eq!(pixel_at(&bgra, &monitor, Point::new(12, 10)), None);
         assert_eq!(pixel_at(&bgra[..5], &monitor, Point::new(11, 10)), None);
+    }
+
+    #[test]
+    fn scroll_borders_never_intersect_bounds() {
+        let bounds = Rect::new(100, 200, 400, 300);
+        let borders = scroll_border_rects(&bounds, 96);
+        for border in &borders {
+            assert!(!border.is_empty());
+            assert_eq!(border.intersect(&bounds), None);
+        }
+        assert_eq!(borders[0].bottom(), i64::from(bounds.y));
+        assert_eq!(i64::from(borders[1].y), bounds.bottom());
+        assert_eq!(borders[2].right(), i64::from(bounds.x));
+        assert_eq!(i64::from(borders[3].x), bounds.right());
+    }
+
+    #[test]
+    fn scroll_panel_layout_contains_all_controls_without_overlap() {
+        let size = scroll_panel_size(96);
+        let layout = scroll_panel_layout(size, 96);
+        assert_eq!(layout.panel, Rect::new(0, 0, size.0, size.1));
+        assert_eq!(
+            layout.panel.intersect(&layout.preview),
+            Some(layout.preview)
+        );
+        assert_eq!(layout.panel.intersect(&layout.status), Some(layout.status));
+        assert_eq!(layout.buttons.len(), 7);
+        for (_, r) in &layout.buttons {
+            assert_eq!(layout.panel.intersect(r), Some(*r));
+            assert_eq!(r.intersect(&layout.preview), None);
+            assert_eq!(r.intersect(&layout.status), None);
+        }
+        for i in 0..layout.buttons.len() {
+            for j in (i + 1)..layout.buttons.len() {
+                assert_eq!(layout.buttons[i].1.intersect(&layout.buttons[j].1), None);
+            }
+        }
+        let copy = layout.button_rect(ScrollButton::Copy).expect("复制按钮");
+        assert_eq!(
+            layout.hit(Point::new(copy.x + 2, copy.y + 2)),
+            Some(ScrollButton::Copy)
+        );
     }
 }

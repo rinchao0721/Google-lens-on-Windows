@@ -66,7 +66,7 @@ const OUTLINE_WIDTH: u32 = 2;
 /// 遮罩透明度。
 const DIM_ALPHA: f32 = 0.45;
 /// 面板圆角半径（96 DPI 下）。
-const CORNER_RADIUS: u32 = 4;
+pub(crate) const CORNER_RADIUS: u32 = 4;
 /// 边缘辉光的宽度（96 DPI 下）。
 const GLOW_WIDTH: u32 = 72;
 /// 辉光由外向内切成的层数，层数越多渐隐越平滑。
@@ -121,7 +121,7 @@ pub enum DrawStatus {
 
 /// 工具栏按钮用图标还是文字。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ButtonStyle {
+pub(crate) enum ButtonStyle {
     /// 图标字体，值为字体在 `ICON_FONTS` 中的序号。
     Icon(usize),
     /// 系统没有图标字体，退回中文文字。
@@ -150,6 +150,89 @@ impl Renderer {
             factory,
             dwrite,
             button_style,
+        })
+    }
+
+    pub(crate) fn factory(&self) -> &ID2D1Factory {
+        &self.factory
+    }
+
+    pub(crate) fn button_style(&self) -> ButtonStyle {
+        self.button_style
+    }
+
+    /// 为指定渲染目标创建覆盖层与控制面板共用的基础画刷组。
+    pub(crate) fn create_brushes(
+        &self,
+        target: &ID2D1HwndRenderTarget,
+    ) -> Result<Brushes, OverlayError> {
+        let brush = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush, OverlayError> {
+            // SAFETY: c 是有效的颜色结构，目标已创建。
+            unsafe { target.CreateSolidColorBrush(&c, None) }
+                .map_err(win32("CreateSolidColorBrush"))
+        };
+        Ok(Brushes {
+            dim: brush(color(0.0, 0.0, 0.0, DIM_ALPHA))?,
+            trail: brush(color(1.0, 1.0, 1.0, 0.9))?,
+            paint: brush(color(1.0, 1.0, 1.0, 1.0))?,
+            accent: brush(color(0.30, 0.60, 1.0, 1.0))?,
+            white: brush(color(1.0, 1.0, 1.0, 1.0))?,
+            panel: brush(color(0.12, 0.12, 0.13, 0.92))?,
+            hover: brush(color(1.0, 1.0, 1.0, 0.16))?,
+            crosshair: brush(color(0.30, 0.60, 1.0, 0.45))?,
+            muted: brush(color(1.0, 1.0, 1.0, 0.72))?,
+            swatch: brush(color(0.0, 0.0, 0.0, 1.0))?,
+            active: brush(color(0.30, 0.60, 1.0, 0.40))?,
+            disabled: brush(color(1.0, 1.0, 1.0, 0.30))?,
+            separator: brush(color(1.0, 1.0, 1.0, 0.25))?,
+        })
+    }
+
+    /// 按 DPI 创建覆盖层与控制面板共用的字体组。
+    pub(crate) fn create_fonts(&self, dpi: u32) -> Result<Fonts, OverlayError> {
+        let px = |v: u32| to_f32(i64::from(layout::scaled(v, dpi)));
+        Ok(Fonts {
+            label: self.text_format(
+                w!("Segoe UI"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                px(12),
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?,
+            info: self.text_format(
+                w!("Consolas"),
+                DWRITE_FONT_WEIGHT_NORMAL,
+                px(12),
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+            )?,
+            hint: self.text_format(
+                w!("Microsoft YaHei UI"),
+                DWRITE_FONT_WEIGHT_NORMAL,
+                px(12),
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+            )?,
+            glyph_text: self.text_format(
+                w!("Segoe UI"),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                px(15),
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            )?,
+            button: match self.button_style {
+                ButtonStyle::Icon(index) => self.text_format(
+                    ICON_FONTS
+                        .get(index)
+                        .copied()
+                        .unwrap_or(w!("Segoe MDL2 Assets")),
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    px(16),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+                ButtonStyle::Text => self.text_format(
+                    w!("Microsoft YaHei UI"),
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    px(12),
+                    DWRITE_TEXT_ALIGNMENT_CENTER,
+                )?,
+            },
         })
     }
 
@@ -212,75 +295,13 @@ impl Renderer {
         let frame_brush = unsafe { target.CreateBitmapBrush(&bitmap, None, None) }
             .map_err(win32("CreateBitmapBrush"))?;
 
-        let brush = |c: D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush, OverlayError> {
-            // SAFETY: c 是有效的颜色结构，目标刚刚创建。
-            unsafe { target.CreateSolidColorBrush(&c, None) }
-                .map_err(win32("CreateSolidColorBrush"))
-        };
-        let brushes = Brushes {
-            dim: brush(color(0.0, 0.0, 0.0, DIM_ALPHA))?,
-            trail: brush(color(1.0, 1.0, 1.0, 0.9))?,
-            paint: brush(color(1.0, 1.0, 1.0, 1.0))?,
-            accent: brush(color(0.30, 0.60, 1.0, 1.0))?,
-            white: brush(color(1.0, 1.0, 1.0, 1.0))?,
-            panel: brush(color(0.12, 0.12, 0.13, 0.92))?,
-            hover: brush(color(1.0, 1.0, 1.0, 0.16))?,
-            crosshair: brush(color(0.30, 0.60, 1.0, 0.45))?,
-            muted: brush(color(1.0, 1.0, 1.0, 0.72))?,
-            swatch: brush(color(0.0, 0.0, 0.0, 1.0))?,
-            active: brush(color(0.30, 0.60, 1.0, 0.40))?,
-            disabled: brush(color(1.0, 1.0, 1.0, 0.30))?,
-            separator: brush(color(1.0, 1.0, 1.0, 0.25))?,
-        };
+        let brushes = self.create_brushes(&target)?;
 
         let round_stroke = self.round_stroke_style()?;
         let flat_stroke = self.flat_stroke_style()?;
         let dash_stroke = self.dash_stroke_style()?;
 
-        let px = |v: u32| to_f32(i64::from(layout::scaled(v, dpi)));
-        let fonts = Fonts {
-            label: self.text_format(
-                w!("Segoe UI"),
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                px(12),
-                DWRITE_TEXT_ALIGNMENT_CENTER,
-            )?,
-            info: self.text_format(
-                w!("Consolas"),
-                DWRITE_FONT_WEIGHT_NORMAL,
-                px(12),
-                DWRITE_TEXT_ALIGNMENT_LEADING,
-            )?,
-            hint: self.text_format(
-                w!("Microsoft YaHei UI"),
-                DWRITE_FONT_WEIGHT_NORMAL,
-                px(12),
-                DWRITE_TEXT_ALIGNMENT_LEADING,
-            )?,
-            glyph_text: self.text_format(
-                w!("Segoe UI"),
-                DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                px(15),
-                DWRITE_TEXT_ALIGNMENT_CENTER,
-            )?,
-            button: match self.button_style {
-                ButtonStyle::Icon(index) => self.text_format(
-                    ICON_FONTS
-                        .get(index)
-                        .copied()
-                        .unwrap_or(w!("Segoe MDL2 Assets")),
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    px(16),
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
-                )?,
-                ButtonStyle::Text => self.text_format(
-                    w!("Microsoft YaHei UI"),
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    px(12),
-                    DWRITE_TEXT_ALIGNMENT_CENTER,
-                )?,
-            },
-        };
+        let fonts = self.create_fonts(dpi)?;
 
         Ok(TargetResources {
             target,
@@ -431,7 +452,7 @@ impl Renderer {
         unsafe { self.factory.CreateStrokeStyle(&props, None) }.map_err(win32("CreateStrokeStyle"))
     }
 
-    fn text_format(
+    pub(crate) fn text_format(
         &self,
         family: PCWSTR,
         weight: DWRITE_FONT_WEIGHT,
@@ -575,33 +596,33 @@ fn icon_font_index(dwrite: &IDWriteFactory) -> Option<usize> {
     })
 }
 
-struct Brushes {
-    dim: ID2D1SolidColorBrush,
-    trail: ID2D1SolidColorBrush,
+pub(crate) struct Brushes {
+    pub(crate) dim: ID2D1SolidColorBrush,
+    pub(crate) trail: ID2D1SolidColorBrush,
     /// 颜色逐段变化的画刷，每次使用前设置颜色。
-    paint: ID2D1SolidColorBrush,
-    accent: ID2D1SolidColorBrush,
-    white: ID2D1SolidColorBrush,
-    panel: ID2D1SolidColorBrush,
-    hover: ID2D1SolidColorBrush,
-    crosshair: ID2D1SolidColorBrush,
-    muted: ID2D1SolidColorBrush,
-    swatch: ID2D1SolidColorBrush,
+    pub(crate) paint: ID2D1SolidColorBrush,
+    pub(crate) accent: ID2D1SolidColorBrush,
+    pub(crate) white: ID2D1SolidColorBrush,
+    pub(crate) panel: ID2D1SolidColorBrush,
+    pub(crate) hover: ID2D1SolidColorBrush,
+    pub(crate) crosshair: ID2D1SolidColorBrush,
+    pub(crate) muted: ID2D1SolidColorBrush,
+    pub(crate) swatch: ID2D1SolidColorBrush,
     /// 选中的工具与样式按钮底色。
-    active: ID2D1SolidColorBrush,
+    pub(crate) active: ID2D1SolidColorBrush,
     /// 不可用按钮的图标。
-    disabled: ID2D1SolidColorBrush,
+    pub(crate) disabled: ID2D1SolidColorBrush,
     /// 工具栏分隔线。
-    separator: ID2D1SolidColorBrush,
+    pub(crate) separator: ID2D1SolidColorBrush,
 }
 
-struct Fonts {
-    label: IDWriteTextFormat,
-    info: IDWriteTextFormat,
-    hint: IDWriteTextFormat,
-    button: IDWriteTextFormat,
+pub(crate) struct Fonts {
+    pub(crate) label: IDWriteTextFormat,
+    pub(crate) info: IDWriteTextFormat,
+    pub(crate) hint: IDWriteTextFormat,
+    pub(crate) button: IDWriteTextFormat,
     /// 工具栏上不依赖图标字体的固定文字，如序号按钮的「1」。
-    glyph_text: IDWriteTextFormat,
+    pub(crate) glyph_text: IDWriteTextFormat,
 }
 
 /// 单个窗口的渲染目标与资源，目标失效时整体丢弃重建。
@@ -1256,27 +1277,14 @@ impl TargetResources {
         rect: &D2D_RECT_F,
         brush: &ID2D1SolidColorBrush,
     ) {
-        let (text, format): (Vec<u16>, &IDWriteTextFormat) =
-            match (self.button_style, button.glyph()) {
-                (_, Glyph::Text(t)) => (t.encode_utf16().collect(), &self.fonts.glyph_text),
-                (ButtonStyle::Icon(_), Glyph::Icon(c)) => {
-                    (c.to_string().encode_utf16().collect(), &self.fonts.button)
-                }
-                (ButtonStyle::Text, Glyph::Icon(_)) => {
-                    (button.label().encode_utf16().collect(), &self.fonts.button)
-                }
-            };
-        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
-        unsafe {
-            self.target.DrawText(
-                &text,
-                format,
-                rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
+        draw_button_glyph_on(
+            &self.target,
+            self.button_style,
+            &self.fonts,
+            button,
+            rect,
+            brush,
+        );
     }
 
     /// 样式条：8 个色块、粗细数值框，序号工具多一组「1 / A」。
@@ -1976,14 +1984,54 @@ impl TargetResources {
     }
 
     fn rounded(&self, rect: &D2D_RECT_F, brush: &ID2D1SolidColorBrush) {
-        let radius = self.px(CORNER_RADIUS);
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: *rect,
-            radiusX: radius,
-            radiusY: radius,
-        };
-        // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
-        unsafe { self.target.FillRoundedRectangle(&rounded, brush) };
+        fill_rounded(&self.target, rect, brush, self.px(CORNER_RADIUS));
+    }
+}
+
+/// 在任意渲染目标上填充圆角矩形；只能在 BeginDraw 与 EndDraw 之间调用。
+pub(crate) fn fill_rounded(
+    target: &ID2D1HwndRenderTarget,
+    rect: &D2D_RECT_F,
+    brush: &ID2D1SolidColorBrush,
+    radius: f32,
+) {
+    let rounded = D2D1_ROUNDED_RECT {
+        rect: *rect,
+        radiusX: radius,
+        radiusY: radius,
+    };
+    // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，画刷有效。
+    unsafe { target.FillRoundedRectangle(&rounded, brush) };
+}
+
+/// 在任意渲染目标上绘制工具栏按钮的图标或退化文字；只能在 BeginDraw 与 EndDraw 之间调用。
+pub(crate) fn draw_button_glyph_on(
+    target: &ID2D1HwndRenderTarget,
+    button_style: ButtonStyle,
+    fonts: &Fonts,
+    button: ToolbarButton,
+    rect: &D2D_RECT_F,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let (text, format): (Vec<u16>, &IDWriteTextFormat) = match (button_style, button.glyph()) {
+        (_, Glyph::Text(t)) => (t.encode_utf16().collect(), &fonts.glyph_text),
+        (ButtonStyle::Icon(_), Glyph::Icon(c)) => {
+            (c.to_string().encode_utf16().collect(), &fonts.button)
+        }
+        (ButtonStyle::Text, Glyph::Icon(_)) => {
+            (button.label().encode_utf16().collect(), &fonts.button)
+        }
+    };
+    // SAFETY: 在 BeginDraw 与 EndDraw 之间调用，文本、格式与画刷有效。
+    unsafe {
+        target.DrawText(
+            &text,
+            format,
+            rect,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
     }
 }
 
@@ -2101,7 +2149,7 @@ fn preview_region(preview: &Preview<'_>, origin: Point, size: (u32, u32)) -> Opt
     ))
 }
 
-fn rect_to_d2d(r: &Rect) -> D2D_RECT_F {
+pub(crate) fn rect_to_d2d(r: &Rect) -> D2D_RECT_F {
     D2D_RECT_F {
         left: to_f32(i64::from(r.x)),
         top: to_f32(i64::from(r.y)),

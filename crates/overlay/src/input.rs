@@ -26,6 +26,8 @@ pub enum Outcome {
     Selected(Selection),
     /// 工具栏流程得到的选区和动作。
     Action(Selection, ToolbarAction),
+    /// 工具栏点击长截图按钮得到的选区（已丢弃标注）。
+    LongCapture(Selection),
     /// 取色结果。
     Color(String),
     /// 用户取消。
@@ -414,6 +416,11 @@ impl Interaction {
                 ToolbarButton::Search => self.finish_with_action(adj, ToolbarAction::Search),
                 ToolbarButton::Pin => self.finish_with_action(adj, ToolbarAction::Pin),
                 ToolbarButton::Ocr => self.finish_with_action(adj, ToolbarAction::Ocr),
+                ToolbarButton::LongCapture => {
+                    if let Some(selection) = self.adjusted_selection(&adj) {
+                        self.finish(Outcome::LongCapture(selection));
+                    }
+                }
                 ToolbarButton::Save => self.finish_with_action(adj, ToolbarAction::Save),
                 ToolbarButton::Copy => self.finish_with_action(adj, ToolbarAction::Copy),
                 ToolbarButton::Cancel => self.finish(Outcome::Cancelled),
@@ -3376,5 +3383,22 @@ mod tests {
             it.document().shapes().first(),
             Some(Shape::Rectangle { to, .. }) if *to == Point::new(540, 430)
         ));
+    }
+
+    #[test]
+    fn long_capture_button_returns_selection_and_discards_annotations() {
+        let mut it = adjusting();
+        click_button(&mut it, ToolbarButton::Tool(Tool::Rectangle));
+        drag_on_window(&mut it, (150, 150), (250, 220));
+        assert_eq!(it.document().shapes().len(), 1);
+        click_button(&mut it, ToolbarButton::LongCapture);
+        assert!(it.is_finished());
+        match it.take_outcome() {
+            Some(Outcome::LongCapture(sel)) => {
+                assert_eq!(sel.bounds(), Rect::new(100, 100, 400, 300));
+                assert_eq!(*sel.shape(), SelectionShape::Rect);
+            }
+            other => panic!("期望 LongCapture 结局，实际为 {other:?}"),
+        }
     }
 }

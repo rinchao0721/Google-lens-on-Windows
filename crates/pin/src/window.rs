@@ -28,7 +28,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::error::{PinError, last_error, win32};
 use crate::menu::{self, MenuAction};
-use crate::render::{Renderer, TargetResources, rgba_to_premultiplied_bgra};
+use crate::render::{Renderer, TargetResources};
 use crate::state::PinState;
 
 const CLASS_NAME: PCWSTR = w!("LenswinPinWindow");
@@ -41,7 +41,6 @@ pub struct PinId(u64);
 struct PinSlot {
     hwnd: HWND,
     state: PinState,
-    pbgra: Vec<u8>,
     target: Option<TargetResources>,
 }
 
@@ -115,7 +114,6 @@ impl PinManager {
             return Err(PinError::TooMany);
         }
         let state = PinState::new(image, at).map_err(PinError::InvalidInput)?;
-        let pbgra = rgba_to_premultiplied_bgra(state.image().rgba());
         let alpha = state.alpha();
         let rect = state.rect();
         let w = i32::try_from(rect.width.max(1))
@@ -158,7 +156,6 @@ impl PinManager {
             host.slots.push(PinSlot {
                 hwnd,
                 state,
-                pbgra,
                 target: None,
             });
             id
@@ -390,13 +387,10 @@ fn on_paint(hwnd: HWND) {
         };
         if slot.target.is_none() {
             let rect = slot.state.rect();
-            let img_size = (slot.state.image().width(), slot.state.image().height());
-            match host.renderer.create_target(
-                hwnd,
-                (rect.width, rect.height),
-                img_size,
-                &slot.pbgra,
-            ) {
+            match host
+                .renderer
+                .create_target(hwnd, (rect.width, rect.height), slot.state.image())
+            {
                 Ok(target) => slot.target = Some(target),
                 Err(_) => return false,
             }

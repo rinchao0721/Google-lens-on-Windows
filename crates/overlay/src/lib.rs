@@ -17,6 +17,7 @@ pub mod stroke;
 
 mod paint;
 mod render;
+mod scroll;
 mod window;
 
 use std::rc::Rc;
@@ -31,6 +32,7 @@ use lenswin_core::snip::{LiveEvent, OverlayFlow, OverlayOutput, OverlayResult};
 pub use crate::error::OverlayError;
 use crate::hint::HintState;
 use crate::input::{Interaction, Options, Outcome, SnapState};
+pub use crate::scroll::ScrollSession;
 use crate::window::{SessionInput, Visual};
 
 /// 一次选区请求。
@@ -120,6 +122,7 @@ pub fn select(request: &SelectRequest<'_>) -> Result<OverlayOutput, OverlayError
                 .ok_or_else(|| OverlayError::InvalidInput("缺少合成好的成图".to_string()))?;
             Some(OverlayResult::Action(selection, action, image))
         }
+        Outcome::LongCapture(selection) => Some(OverlayResult::LongCapture(selection)),
         Outcome::Color(text) => Some(OverlayResult::Color(text)),
         Outcome::Cancelled => None,
     };

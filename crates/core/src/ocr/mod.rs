@@ -16,4 +16,7 @@ pub use rec::{
     RecCrop, column_ink, decode_ctc, pack_rec_batch, parse_charset, plan_rec_batches,
     rec_bucket_width, rec_prepare, rec_target_width, valid_steps,
 };
-pub use text::{has_recognized_text, insert_script_spaces, join_lines};
+pub use text::{
+    crop_ocr_chunk, has_recognized_text, insert_script_spaces, join_lines, merge_ocr_chunks,
+    plan_ocr_chunks,
+};

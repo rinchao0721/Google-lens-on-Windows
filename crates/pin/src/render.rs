@@ -1,6 +1,8 @@
 //! Direct2D 贴图绘制：1:1 物理像素位图、旋转缩放矩阵与 1px 实线/虚线边框。
 
+use lenswin_core::frame::CroppedImage;
 use lenswin_core::geometry::Rect;
+use lenswin_core::lens::downscale;
 use lenswin_core::pin::Rotation;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -35,6 +37,7 @@ pub(crate) struct Renderer {
 pub(crate) struct TargetResources {
     target: ID2D1HwndRenderTarget,
     bitmap: ID2D1Bitmap,
+    bitmap_size: (u32, u32),
     accent: ID2D1SolidColorBrush,
     unfocused: ID2D1SolidColorBrush,
     target_size: (u32, u32),
@@ -66,13 +69,8 @@ impl Renderer {
         &self,
         hwnd: HWND,
         win_size: (u32, u32),
-        img_size: (u32, u32),
-        pbgra: &[u8],
+        image: &CroppedImage,
     ) -> Result<TargetResources, PinError> {
-        let pitch = img_size
-            .0
-            .checked_mul(4)
-            .ok_or_else(|| PinError::InvalidInput("贴图行字节数溢出".to_string()))?;
         // 固定 96 DPI，确保 1 个 DIP 永远等于 1 个物理像素
         let target_props = D2D1_RENDER_TARGET_PROPERTIES {
             dpiX: 96.0,
@@ -94,6 +92,14 @@ impl Renderer {
         }
         .map_err(win32("CreateHwndRenderTarget"))?;
 
+        // SAFETY: target 刚创建成功，GetMaximumBitmapSize 只读设备纹理边长上限。
+        let max_side = unsafe { target.GetMaximumBitmapSize() }.max(1);
+        let (bitmap_size, pbgra) = display_image_data(image, max_side)?;
+        let pitch = bitmap_size
+            .0
+            .checked_mul(4)
+            .ok_or_else(|| PinError::InvalidInput("贴图行字节数溢出".to_string()))?;
+
         let bitmap_props = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -102,12 +108,12 @@ impl Renderer {
             dpiX: 96.0,
             dpiY: 96.0,
         };
-        // SAFETY: pbgra 长度等于 img_size.0 * img_size.1 * 4，pitch 与之匹配且调用期间有效。
+        // SAFETY: pbgra 长度等于 bitmap_size.0 * bitmap_size.1 * 4，pitch 与之匹配且调用期间有效。
         let bitmap = unsafe {
             target.CreateBitmap(
                 D2D_SIZE_U {
-                    width: img_size.0,
-                    height: img_size.1,
+                    width: bitmap_size.0,
+                    height: bitmap_size.1,
                 },
                 Some(pbgra.as_ptr().cast()),
                 pitch,
@@ -128,6 +134,7 @@ impl Renderer {
         Ok(TargetResources {
             target,
             bitmap,
+            bitmap_size,
             accent,
             unfocused,
             target_size: (win_size.0.max(1), win_size.1.max(1)),
@@ -152,11 +159,10 @@ impl Renderer {
             res.target_size = (win_w, win_h);
         }
 
-        let img_w = state.image().width();
-        let img_h = state.image().height();
-        let transform = bitmap_transform((img_w, img_h), &rect, state.rotation());
+        let (bmp_w, bmp_h) = res.bitmap_size;
+        let transform = bitmap_transform(res.bitmap_size, &rect, state.rotation());
         let identity = D2D1_BRUSH_PROPERTIES::default().transform;
-        let interp = if state.zoom_permille() == 1000 {
+        let interp = if state.zoom_permille() == 1000 && res.bitmap_size == (win_w, win_h) {
             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         } else {
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
@@ -167,8 +173,8 @@ impl Renderer {
         let src_rect = D2D_RECT_F {
             left: 0.0,
             top: 0.0,
-            right: u32_to_f32(img_w),
-            bottom: u32_to_f32(img_h),
+            right: u32_to_f32(bmp_w),
+            bottom: u32_to_f32(bmp_h),
         };
         let border_rect = D2D_RECT_F {
             left: 0.5,
@@ -203,6 +209,21 @@ impl Renderer {
             Err(e) => Err(win32("EndDraw")(e)),
         }
     }
+}
+
+/// 生成用于 Direct2D 显示位图的尺寸和预乘 BGRA 缓冲；超过硬件纹理上限时等比缩小，不影响原图导出。
+fn display_image_data(
+    image: &CroppedImage,
+    max_side: u32,
+) -> Result<((u32, u32), Vec<u8>), PinError> {
+    if image.width() <= max_side && image.height() <= max_side {
+        let pbgra = rgba_to_premultiplied_bgra(image.rgba());
+        return Ok(((image.width(), image.height()), pbgra));
+    }
+    let scaled = downscale(image.clone(), max_side)
+        .map_err(|e| PinError::InvalidInput(format!("缩小超长贴图失败：{e}")))?;
+    let pbgra = rgba_to_premultiplied_bgra(scaled.rgba());
+    Ok(((scaled.width(), scaled.height()), pbgra))
 }
 
 /// RGBA 转预乘 Alpha 的 BGRA（Direct2D 位图格式）。
@@ -294,5 +315,14 @@ mod tests {
         assert_eq!(map(&m90, 0.0, 100.0), (0.0, 0.0));
         // 原图左上角 (0, 0) 旋转 90° 后应落在窗口右上角 (200, 0)
         assert_eq!(map(&m90, 0.0, 0.0), (200.0, 0.0));
+    }
+
+    #[test]
+    fn display_image_data_downscales_when_exceeding_max_side() {
+        let rgba = vec![255u8; 100 * 2000 * 4];
+        let img = CroppedImage::new(100, 2000, rgba).expect("构造长图");
+        let ((w, h), buf) = display_image_data(&img, 1000).expect("生成显示位图数据");
+        assert_eq!((w, h), (50, 1000));
+        assert_eq!(buf.len(), 50 * 1000 * 4);
     }
 }

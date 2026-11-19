@@ -13,6 +13,7 @@ pub mod focus;
 pub mod fonts;
 pub mod handle;
 pub mod hotkey;
+pub mod input;
 pub mod ipc;
 pub mod message_loop;
 pub mod monitor;
