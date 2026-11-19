@@ -20,7 +20,7 @@ use lenswin_platform::clipboard::{self, ClipboardOwner};
 pub use copy::CopyAction;
 pub use encode::encode_png;
 pub use lens::prepare_lens_request;
-pub use ocr::{OcrError, recognize_image};
+pub use ocr::{OcrEngine, OcrError, load_ocr_engine, recognize_image};
 pub use pin::decode_clipboard_image;
 pub use save::{SaveAction, default_file_name, save_to};
 pub use search::SearchAction;

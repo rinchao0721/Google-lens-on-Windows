@@ -42,6 +42,13 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'lenswin.exe')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.txt') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
+# OCR 运行库与第三方许可证，必须与 lenswin.exe 同目录
+$ocrDir = Join-Path $root 'assets\ocr'
+foreach ($name in 'onnxruntime.dll', 'LICENSE-onnxruntime.txt', 'LICENSE-PaddleOCR.txt') {
+    $file = Join-Path $ocrDir $name
+    if (-not (Test-Path -LiteralPath $file)) { throw "找不到 $file" }
+    Copy-Item -LiteralPath $file -Destination $stage
+}
 # 空文件即可，程序只检查是否存在
 New-Item -ItemType File -Path (Join-Path $stage 'portable') -Force | Out-Null
 

@@ -17,7 +17,6 @@ pub mod ipc;
 pub mod message_loop;
 pub mod monitor;
 pub mod notify;
-pub mod ocr;
 pub mod paths;
 pub mod shell;
 pub mod single_instance;

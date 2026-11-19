@@ -69,20 +69,16 @@ fn decode_png(bytes: &[u8]) -> Result<CroppedImage, ActionError> {
 
 fn rgb_to_rgba(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity((raw.len() / 3).saturating_mul(4));
-    for px in raw.chunks_exact(3) {
-        if let [r, g, b] = *px {
-            out.extend_from_slice(&[r, g, b, 255]);
-        }
+    for &[r, g, b] in raw.as_chunks::<3>().0 {
+        out.extend_from_slice(&[r, g, b, 255]);
     }
     out
 }
 
 fn gray_alpha_to_rgba(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len().saturating_mul(2));
-    for px in raw.chunks_exact(2) {
-        if let [y, a] = *px {
-            out.extend_from_slice(&[y, y, y, a]);
-        }
+    for &[y, a] in raw.as_chunks::<2>().0 {
+        out.extend_from_slice(&[y, y, y, a]);
     }
     out
 }

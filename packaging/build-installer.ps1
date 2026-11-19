@@ -62,6 +62,7 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
     "/DSourceExe=$exe" `
     "/DIconFile=$(Join-Path $root 'app\assets\lenswin.ico')" `
     "/DLicenseFile=$(Join-Path $root 'LICENSE')" `
+    "/DOcrDir=$(Join-Path $root 'assets\ocr')" `
     "/DOutputDir=$OutputDir" `
     (Join-Path $PSScriptRoot 'lenswin.iss')
 if ($LASTEXITCODE -ne 0) { throw 'ISCC 编译失败' }

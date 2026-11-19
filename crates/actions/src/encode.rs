@@ -7,10 +7,8 @@ use lenswin_core::frame::CroppedImage;
 pub fn encode_png(image: &CroppedImage) -> Result<Vec<u8>, ActionError> {
     let fail = |e: png::EncodingError| ActionError::Failed(format!("PNG 编码失败：{e}"));
     let mut rgb = Vec::with_capacity(image.rgba().len() / 4 * 3);
-    for px in image.rgba().chunks_exact(4) {
-        if let [r, g, b, _] = *px {
-            rgb.extend_from_slice(&[r, g, b]);
-        }
+    for &[r, g, b, _] in image.rgba().as_chunks::<4>().0 {
+        rgb.extend_from_slice(&[r, g, b]);
     }
     let mut out = Vec::new();
     {

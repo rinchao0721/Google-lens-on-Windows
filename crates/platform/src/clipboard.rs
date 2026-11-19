@@ -268,10 +268,8 @@ fn rgba_to_dib(image: &CroppedImage) -> Result<Vec<u8>, PlatformError> {
         return Err(PlatformError::Invalid("图像宽度为 0".to_string()));
     }
     for row in image.rgba().chunks_exact(row_bytes).rev() {
-        for px in row.chunks_exact(4) {
-            if let [r, g, b, a] = *px {
-                out.extend_from_slice(&[b, g, r, a]);
-            }
+        for &[r, g, b, a] in row.as_chunks::<4>().0 {
+            out.extend_from_slice(&[b, g, r, a]);
         }
     }
     if out.len() != total {

@@ -49,7 +49,7 @@ pub fn page_of_field(field: &str) -> Page {
     match section {
         "hotkeys" => Page::Hotkeys,
         "search" | "upload" | "privacy" => Page::SearchUpload,
-        "screenshot" | "selection" | "annotate" | "ocr" => Page::Screenshot,
+        "screenshot" | "selection" | "annotate" => Page::Screenshot,
         _ => Page::General,
     }
 }
@@ -548,8 +548,6 @@ mod tests {
             ("annotate.number.size", Page::Screenshot),
             ("annotate.rectangle.color", Page::Screenshot),
             ("screenshot.save_dir", Page::Screenshot),
-            ("ocr.languages", Page::Screenshot),
-            ("ocr.strategy", Page::Screenshot),
             ("hotkeys.ocr", Page::Hotkeys),
             ("general.notifications", Page::General),
             ("unknown", Page::General),

@@ -238,10 +238,10 @@ impl Drop for ConfigStore {
     fn drop(&mut self) {
         // 先关闭任务通道让线程退出，并等它写完排队中的配置
         self.jobs.take();
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                log::error!("配置线程异常退出");
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("配置线程异常退出");
         }
     }
 }

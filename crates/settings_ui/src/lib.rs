@@ -9,7 +9,6 @@ mod client;
 mod fonts;
 mod form;
 mod icons;
-mod ocr_languages;
 mod recorder;
 mod theme;
 mod update_status;

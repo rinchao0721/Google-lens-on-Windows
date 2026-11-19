@@ -188,10 +188,10 @@ impl Key {
             }
         }
         if let Some(num) = token.strip_prefix(['F', 'f']) {
-            if let Ok(n) = num.parse::<u8>() {
-                if (1..=24).contains(&n) {
-                    return Some(Key::Function(n));
-                }
+            if let Ok(n) = num.parse::<u8>()
+                && (1..=24).contains(&n)
+            {
+                return Some(Key::Function(n));
             }
             return None;
         }

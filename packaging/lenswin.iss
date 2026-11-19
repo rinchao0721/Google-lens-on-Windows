@@ -1,4 +1,4 @@
-﻿; lenswin 安装脚本，由 build-installer.ps1 传入版本号、exe、图标和输出目录。
+﻿; lenswin 安装脚本，由 build-installer.ps1 传入版本号、exe、图标、OCR 资源目录和输出目录。
 #ifndef AppVersion
   #error 缺少 AppVersion，请通过 build-installer.ps1 编译
 #endif
@@ -10,6 +10,9 @@
 #endif
 #ifndef LicenseFile
   #error 缺少 LicenseFile
+#endif
+#ifndef OcrDir
+  #error 缺少 OcrDir
 #endif
 #ifndef OutputDir
   #define OutputDir "."
@@ -47,6 +50,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LicenseFile}"; DestDir: "{app}"; Flags: ignoreversion
+; OCR 运行库必须与 lenswin.exe 同目录
+Source: "{#OcrDir}\onnxruntime.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#OcrDir}\LICENSE-onnxruntime.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#OcrDir}\LICENSE-PaddleOCR.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
 ; 安装目录里不能有 portable 标记，否则会被误判为便携版

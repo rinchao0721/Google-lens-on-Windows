@@ -68,19 +68,24 @@ impl AppPaths {
 
     /// 探测当前进程的运行模式并得到目录；便携目录不可写时降级为 `PortableFallback`。
     pub fn detect() -> Result<Self, PlatformError> {
-        let exe = std::env::current_exe().map_err(|source| PlatformError::Io {
-            context: "获取 exe 路径",
-            source,
-        })?;
-        let exe_dir = exe
-            .parent()
-            .ok_or_else(|| PlatformError::Invalid("exe 路径没有父目录".to_string()))?;
+        let exe_dir = exe_dir()?;
         let has_marker = exe_dir.join(PORTABLE_MARKER).is_file();
         let writable = has_marker && probe_writable(&exe_dir.join(PORTABLE_DATA_DIR));
         let roaming = known_folder(&FOLDERID_RoamingAppData, "SHGetKnownFolderPath(Roaming)")?;
         let local = known_folder(&FOLDERID_LocalAppData, "SHGetKnownFolderPath(Local)")?;
-        Ok(resolve(exe_dir, has_marker, writable, &roaming, &local))
+        Ok(resolve(&exe_dir, has_marker, writable, &roaming, &local))
     }
+}
+
+/// 当前 exe 所在目录（绝对路径），同目录的随包文件按它定位。
+pub fn exe_dir() -> Result<PathBuf, PlatformError> {
+    let exe = std::env::current_exe().map_err(|source| PlatformError::Io {
+        context: "获取 exe 路径",
+        source,
+    })?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| PlatformError::Invalid("exe 路径没有父目录".to_string()))
 }
 
 /// 由探测结果推出目录，不做任何 IO，便于测试两种模式。

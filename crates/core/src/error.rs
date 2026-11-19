@@ -26,6 +26,33 @@ pub enum FrameError {
     SizeOverflow,
 }
 
+/// OCR 数据处理错误。
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum OcrDataError {
+    /// 图像或裁剪框宽高为 0。
+    #[error("图像或文本框尺寸为 0")]
+    EmptyImage,
+    /// 尺寸或缓冲区长度运算溢出。
+    #[error("尺寸运算溢出")]
+    SizeOverflow,
+    /// 张量元素数与声明的形状不符。
+    #[error("张量大小不符：期望 {expected}，实际 {actual}")]
+    ShapeMismatch {
+        /// 期望的元素数。
+        expected: usize,
+        /// 实际的元素数。
+        actual: usize,
+    },
+    /// 字典为空，或与模型输出类别数不符。
+    #[error("字典大小 {charset} 与模型输出类别数 {classes} 不符")]
+    CharsetMismatch {
+        /// 字典项数。
+        charset: usize,
+        /// 模型输出的类别数。
+        classes: usize,
+    },
+}
+
 /// 选区构造错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum SelectionError {

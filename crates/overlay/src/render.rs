@@ -551,10 +551,8 @@ fn read_back(bitmap: &IWICBitmap, width: u32, height: u32) -> Result<CroppedImag
             .checked_add(row_bytes)
             .ok_or_else(|| invalid("偏移溢出"))?;
         let line = pixels.get(start..end).ok_or_else(|| invalid("像素不足"))?;
-        for px in line.chunks_exact(4) {
-            if let [b, g, r, _] = px {
-                rgba.extend_from_slice(&[*r, *g, *b, 255]);
-            }
+        for &[b, g, r, _] in line.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
     CroppedImage::new(width, height, rgba).map_err(|e| invalid(&e.to_string()))
@@ -2117,7 +2115,7 @@ pub(crate) fn f32_to_u16(value: f32) -> u16 {
 /// RGBA 转 BGRA，Direct2D 位图使用 BGRA 排列。
 pub(crate) fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = rgba.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     out

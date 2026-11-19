@@ -733,7 +733,7 @@ pub fn mosaic_grid(
             for y in usize::try_from(y0).ok()?..usize::try_from(y1).ok()? {
                 let start = y.checked_mul(stride)?.checked_add(sx0)?.checked_mul(4)?;
                 let end = y.checked_mul(stride)?.checked_add(sx1)?.checked_mul(4)?;
-                for px in pixels.get(start..end)?.chunks_exact(4) {
+                for px in pixels.get(start..end)?.as_chunks::<4>().0 {
                     sum[0] += u64::from(*px.get(ri)?);
                     sum[1] += u64::from(*px.get(1)?);
                     sum[2] += u64::from(*px.get(bi)?);

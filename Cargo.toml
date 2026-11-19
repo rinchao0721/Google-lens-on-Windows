@@ -11,13 +11,14 @@ members = [
     "crates/settings_ui",
     "crates/popup",
     "crates/pin",
+    "crates/ocr",
     "app",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.92"
 publish = false
 
 [workspace.dependencies]
@@ -36,10 +37,13 @@ lenswin-actions = { path = "crates/actions" }
 lenswin-settings-ui = { path = "crates/settings_ui" }
 lenswin-popup = { path = "crates/popup" }
 lenswin-pin = { path = "crates/pin" }
+lenswin-ocr = { path = "crates/ocr" }
 
 # 外部依赖（均在 PLAN 第 8 节批准范围内）
 anyhow = "1.0.104"
 log = "0.4.35"
+# 离线 OCR 推理，只被 ocr 使用；运行时从 exe 旁加载 onnxruntime.dll，构建不联网
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
 png = "0.18.1"
 # 0.13 起特性改名且默认依赖 aws-lc，固定 0.12 以使用 PLAN 约定的 rustls-tls
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "multipart", "rustls-tls"] }
@@ -47,15 +51,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 simplelog = { version = "0.12.2", default-features = false, features = ["local-offset"] }
 windows = { version = "0.62.2", features = [
-    "Foundation",
-    "Foundation_Collections",
-    "Globalization",
-    "Graphics",
-    "Graphics_Imaging",
-    "Media",
-    "Media_Ocr",
-    "Storage",
-    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",

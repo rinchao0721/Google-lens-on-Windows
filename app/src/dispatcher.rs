@@ -6,8 +6,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use lenswin_actions::{
-    ActionRegistry, OcrError, check_update, decode_clipboard_image, default_file_name,
-    prepare_lens_request, recognize_image, save_to,
+    ActionRegistry, check_update, decode_clipboard_image, default_file_name, prepare_lens_request,
+    save_to,
 };
 use lenswin_core::action::{ActionContext, ActionInput, ActionKind};
 use lenswin_core::config::AnnotateConfig;
@@ -28,7 +28,6 @@ use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::capture::gdi::GdiCapturer;
 use lenswin_platform::capture::{self, ScreenCapturer};
 use lenswin_platform::clipboard;
-use lenswin_platform::com::MtaScope;
 use lenswin_platform::dialog;
 use lenswin_platform::message_loop::LoopControl;
 use lenswin_platform::monitor;
@@ -42,6 +41,7 @@ use lenswin_popup::{PopupEvent, PopupHost};
 use lenswin_upload::privacy_summary;
 
 use crate::hotkeys::{self, HotkeySet};
+use crate::ocr_worker::{OcrOutcome, OcrWorker};
 use crate::shared::AppShared;
 use crate::tray_menu::{self, MenuAction, PinMenuState};
 use crate::update_check::{
@@ -193,8 +193,10 @@ pub struct Dispatcher<'a> {
     pin: PinLink<'a>,
     pin_decode_tx: Sender<(Result<CroppedImage, String>, Rect)>,
     pin_decode_rx: Receiver<(Result<CroppedImage, String>, Rect)>,
-    ocr_tx: Sender<Result<Option<String>, OcrError>>,
-    ocr_rx: Receiver<Result<Option<String>, OcrError>>,
+    ocr_tx: Sender<OcrOutcome>,
+    ocr_rx: Receiver<OcrOutcome>,
+    /// 常驻的 OCR 工作线程，第一次识别时才创建。
+    ocr_worker: RefCell<Option<OcrWorker>>,
     /// 是否已有 OCR 识别在工作线程中运行；同一时间只跑一个。
     ocr_running: Cell<bool>,
     lens_tx: Sender<(u64, LensResult)>,
@@ -253,6 +255,7 @@ impl<'a> Dispatcher<'a> {
             pin_decode_rx,
             ocr_tx,
             ocr_rx,
+            ocr_worker: RefCell::new(None),
             ocr_running: Cell::new(false),
             lens_tx,
             lens_rx,
@@ -1395,7 +1398,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// 在工作线程运行一次 OCR 识别；已有任务运行时拒绝新任务。
+    /// 把图像交给常驻的 OCR 工作线程；已有任务运行时拒绝新任务。
     fn start_ocr(&self, image: CroppedImage) {
         if self.ocr_running.get() {
             log::info!("已有文字识别任务运行中，忽略本次请求");
@@ -1403,27 +1406,25 @@ impl<'a> Dispatcher<'a> {
             return;
         }
         self.ocr_running.set(true);
-        let config = self.shared.store.snapshot().ocr;
-        let tx = self.ocr_tx.clone();
-        let notifier = self.notifier;
-        let spawned = std::thread::Builder::new()
-            .name("lenswin-ocr".to_string())
-            .spawn(move || {
-                let result = match MtaScope::enter() {
-                    Ok(_mta) => recognize_image(&config, image),
-                    Err(e) => Err(OcrError::Failed(e.to_string())),
-                };
-                if tx.send(result).is_err() {
+        let mut worker = self.ocr_worker.borrow_mut();
+        if worker.is_none() {
+            match OcrWorker::spawn(self.ocr_tx.clone(), self.notifier) {
+                Ok(spawned) => *worker = Some(spawned),
+                Err(e) => {
+                    self.ocr_running.set(false);
+                    log::error!("创建文字识别线程失败：{e}");
+                    self.balloon(NotifyLevel::Error, "lenswin", &format!("文字识别失败：{e}"));
                     return;
                 }
-                if let Err(e) = notifier.notify() {
-                    log::error!("投递文字识别结果失败：{e}");
-                }
-            });
-        if let Err(e) = spawned {
+            }
+        }
+        let submitted = worker.as_ref().map(|w| w.submit(image));
+        if !matches!(submitted, Some(Ok(()))) {
+            // 工作线程已退出，丢弃句柄，下次触发时重建
+            *worker = None;
             self.ocr_running.set(false);
-            log::error!("创建文字识别线程失败：{e}");
-            self.balloon(NotifyLevel::Error, "lenswin", &format!("文字识别失败：{e}"));
+            log::error!("文字识别线程已退出");
+            self.balloon(NotifyLevel::Error, "lenswin", "文字识别失败，请重试");
         }
     }
 

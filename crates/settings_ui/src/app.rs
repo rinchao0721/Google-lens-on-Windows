@@ -9,11 +9,10 @@ use lenswin_core::annotation::NumberStyle;
 use lenswin_core::config::{
     ANNOTATE_WIDTH_RANGE, Config, GlowMode, HIGHLIGHTER_WIDTH_RANGE, HISTORY_SIZE_RANGE,
     LASSO_PADDING_RANGE, LASSO_STROKE_WIDTH_RANGE, LitterboxExpiry, MOSAIC_BLOCK_RANGE,
-    NUMBER_SIZE_RANGE, OcrStrategy, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend,
-    TEXT_SIZE_RANGE, TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider, ValidationIssue, validate,
+    NUMBER_SIZE_RANGE, ResponseKind, SEARCH_ENGINE_PRESETS, SearchBackend, TEXT_SIZE_RANGE,
+    TIMEOUT_SECS_RANGE, TrayLeftClick, UploadProvider, ValidationIssue, validate,
 };
 use lenswin_core::hotkey::{HotkeyChoice, Key, selectable_keys};
-use lenswin_core::ocr::MAX_OCR_LANGUAGES;
 use lenswin_core::selection::SelectionMode;
 use lenswin_platform::autostart::{self, AutostartState};
 use lenswin_platform::paths::AppPaths;
@@ -26,10 +25,6 @@ use crate::form::{
     staleness,
 };
 use crate::icons;
-use crate::ocr_languages::{
-    OcrLanguageLoader, OcrLanguageState, add_language, addable_languages, can_add_language,
-    display_label, move_down, move_up, remove_at,
-};
 use crate::recorder::{self, Capture};
 use crate::theme::{self, CARD_GAP, FONT_DESC, Look, NAV_WIDTH, PAGE_MARGIN_X, Palette, ThemeKind};
 use crate::update_status::{UpdateChecker, UpdateStatus};
@@ -105,7 +100,6 @@ pub struct SettingsApp {
     issues: Vec<ValidationIssue>,
     feedback: Option<Feedback>,
     updates: UpdateChecker,
-    ocr_langs: OcrLanguageLoader,
     fonts: FontStatus,
     look: Look,
     theme_kind: ThemeKind,
@@ -156,7 +150,6 @@ impl SettingsApp {
             issues: Vec::new(),
             feedback: None,
             updates: UpdateChecker::new(),
-            ocr_langs: OcrLanguageLoader::new(),
             fonts,
             look: Look {
                 palette: Palette::of(theme_kind),
@@ -971,175 +964,7 @@ impl SettingsApp {
             .show(ui, &look, |ui| {
                 toggle(ui, &look, show_bounds);
             });
-        self.ocr_section(ui);
         self.annotate_cards(ui);
-    }
-
-    fn ocr_section(&mut self, ui: &mut egui::Ui) {
-        let look = self.look;
-        let p = look.palette;
-        self.ocr_langs.ensure_loaded(ui.ctx());
-        group_label(ui, &look, "识别");
-
-        enum LangAction {
-            Up(usize),
-            Down(usize),
-            Remove(usize),
-            Add(String),
-            Reload,
-        }
-
-        let langs_error = self.issue("ocr.languages");
-        let lang_state = self.ocr_langs.state().clone();
-        let installed = match &lang_state {
-            OcrLanguageState::Loaded(list) => list.as_slice(),
-            _ => &[],
-        };
-        let mut pending_action = None;
-        let selected_count = self.draft.config.ocr.languages.len();
-        let can_add = can_add_language(&self.draft.config.ocr.languages);
-
-        Card::new("识别语言")
-            .icon(icons::DOCUMENT)
-            .desc("按顺序尝试识别；留空时使用系统语言")
-            .error(langs_error.as_deref())
-            .show_wide(
-                ui,
-                &look,
-                |_| {},
-                |ui| {
-                    if selected_count == 0 {
-                        ui.label(
-                            egui::RichText::new("跟随系统语言")
-                                .size(FONT_DESC)
-                                .color(p.text_dim),
-                        );
-                    } else {
-                        for (idx, tag) in self.draft.config.ocr.languages.iter().enumerate() {
-                            let label = display_label(tag, installed);
-                            ui.horizontal(|ui| {
-                                ui.label(label);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if choice_chip(ui, &look, false, "移除").clicked() {
-                                            pending_action = Some(LangAction::Remove(idx));
-                                        }
-                                        if ui
-                                            .add_enabled_ui(idx + 1 < selected_count, |ui| {
-                                                choice_chip(ui, &look, false, "下移")
-                                            })
-                                            .inner
-                                            .clicked()
-                                        {
-                                            pending_action = Some(LangAction::Down(idx));
-                                        }
-                                        if ui
-                                            .add_enabled_ui(idx > 0, |ui| {
-                                                choice_chip(ui, &look, false, "上移")
-                                            })
-                                            .inner
-                                            .clicked()
-                                        {
-                                            pending_action = Some(LangAction::Up(idx));
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    }
-
-                    ui.add_space(4.0);
-                    match &lang_state {
-                        OcrLanguageState::Idle | OcrLanguageState::Loading => {
-                            ui.label(
-                                egui::RichText::new("正在读取系统已安装语言…")
-                                    .size(FONT_DESC)
-                                    .color(p.text_dim),
-                            );
-                        }
-                        OcrLanguageState::Failed(_) => {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("无法获取已安装语言")
-                                        .size(FONT_DESC)
-                                        .color(p.error),
-                                );
-                                if choice_chip(ui, &look, false, "重试").clicked() {
-                                    pending_action = Some(LangAction::Reload);
-                                }
-                            });
-                        }
-                        OcrLanguageState::Loaded(list) => {
-                            let addable = addable_languages(&self.draft.config.ocr.languages, list);
-                            if !can_add {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "最多配置 {MAX_OCR_LANGUAGES} 种语言"
-                                    ))
-                                    .size(FONT_DESC)
-                                    .color(p.text_dim),
-                                );
-                            } else if addable.is_empty() {
-                                ui.label(
-                                    egui::RichText::new("已安装语言均已添加")
-                                        .size(FONT_DESC)
-                                        .color(p.text_dim),
-                                );
-                            } else {
-                                egui::ComboBox::from_id_salt("ocr-add-language")
-                                    .width(260.0)
-                                    .selected_text("添加语言")
-                                    .show_ui(ui, |ui| {
-                                        for lang in addable {
-                                            let text =
-                                                format!("{} ({})", lang.display_name, lang.tag);
-                                            if ui.selectable_label(false, text).clicked() {
-                                                pending_action =
-                                                    Some(LangAction::Add(lang.tag.clone()));
-                                            }
-                                        }
-                                    });
-                            }
-                        }
-                    }
-                },
-            );
-
-        if let Some(act) = pending_action {
-            let langs = &mut self.draft.config.ocr.languages;
-            match act {
-                LangAction::Up(idx) => {
-                    move_up(langs, idx);
-                }
-                LangAction::Down(idx) => {
-                    move_down(langs, idx);
-                }
-                LangAction::Remove(idx) => {
-                    remove_at(langs, idx);
-                }
-                LangAction::Add(tag) => {
-                    add_language(langs, &tag);
-                }
-                LangAction::Reload => self.ocr_langs.reload(ui.ctx()),
-            }
-        }
-
-        let strategy_error = self.issue("ocr.strategy");
-        let strategy = &mut self.draft.config.ocr.strategy;
-        Card::new("多语言策略")
-            .icon(icons::SETTINGS)
-            .desc("回退：按顺序识别到第一个有文字的结果；择优：全部尝试后选有效字符最多的结果")
-            .error(strategy_error.as_deref())
-            .right_width(160.0)
-            .show(ui, &look, |ui| {
-                // right_to_left 布局下先添加的在右侧，逆序添加使视觉顺序为「回退、择优」
-                for option in OcrStrategy::ALL.iter().rev() {
-                    if choice_chip(ui, &look, *strategy == *option, option.label()).clicked() {
-                        *strategy = *option;
-                    }
-                }
-            });
     }
 
     /// 标注工具的默认样式：每个工具一行；截屏结束时会自动记住最近一次的改动。
@@ -1559,7 +1384,6 @@ impl eframe::App for SettingsApp {
         if let Some(message) = self.updates.poll() {
             self.set_feedback(FeedbackKind::Error, format!("无法打开下载页：{message}"));
         }
-        self.ocr_langs.poll();
         self.sync_theme(ctx);
         self.capture_keys(ctx);
         let p = self.look.palette;

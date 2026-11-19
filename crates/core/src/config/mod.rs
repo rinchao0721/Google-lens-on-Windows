@@ -1,5 +1,6 @@
 //! 配置结构、默认值、取值范围与读写。校验规则见 [`validate`]。
 
+mod legacy;
 mod validate;
 
 use std::ops::RangeInclusive;
@@ -10,6 +11,7 @@ use crate::annotation::NumberStyle;
 use crate::error::ConfigError;
 use crate::selection::SelectionMode;
 
+pub use legacy::strip_legacy_ocr;
 pub use validate::{ValidationIssue, is_http_url, validate};
 
 /// 上传超时（秒）的合法范围。
@@ -90,8 +92,6 @@ pub struct Config {
     pub selection: SelectionConfig,
     /// 截屏。
     pub screenshot: ScreenshotConfig,
-    /// 文字识别。
-    pub ocr: OcrConfig,
     /// 原地标注的默认样式。
     pub annotate: AnnotateConfig,
     /// 隐私。
@@ -103,7 +103,7 @@ pub struct Config {
 impl Config {
     /// 解析并校验 TOML 文本；解析失败或校验不通过都返回错误，不返回半成品。
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(text)?;
+        let config: Config = toml::from_str(&strip_legacy_ocr(text))?;
         validate(&config).map_err(ConfigError::Invalid)?;
         Ok(config)
     }
@@ -457,40 +457,6 @@ impl Default for ScreenshotConfig {
             window_snap: true,
             history_size: 10,
             show_hints: true,
-        }
-    }
-}
-
-/// `[ocr]`。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct OcrConfig {
-    /// 有序的识别语言列表（BCP-47 标签），为空表示跟随系统用户语言。
-    pub languages: Vec<String>,
-    /// 多语言识别策略。
-    pub strategy: OcrStrategy,
-}
-
-/// 多语言识别策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OcrStrategy {
-    /// 按列表顺序识别，得到非空结果即停止。
-    #[default]
-    Fallback,
-    /// 每种语言都识别一次，取有效字符数最多的结果。
-    Best,
-}
-
-impl OcrStrategy {
-    /// 全部取值，供界面生成选项。
-    pub const ALL: [OcrStrategy; 2] = [OcrStrategy::Fallback, OcrStrategy::Best];
-
-    /// 面向用户的中文名称。
-    pub const fn label(self) -> &'static str {
-        match self {
-            OcrStrategy::Fallback => "回退",
-            OcrStrategy::Best => "择优",
         }
     }
 }
@@ -887,8 +853,6 @@ auto_check = 1
         config.hotkeys.pin_clipboard = "Ctrl+Alt+P".to_string();
         config.hotkeys.pin_passthrough = "Ctrl+Alt+T".to_string();
         config.hotkeys.ocr = "Ctrl+Alt+O".to_string();
-        config.ocr.languages = vec!["zh-Hans-CN".to_string(), "en-US".to_string()];
-        config.ocr.strategy = OcrStrategy::Best;
         config.search.selection_mode = SelectionMode::Rect;
         config.search.glow = GlowMode::Always;
         config.search.colorful_stroke = false;
@@ -926,33 +890,6 @@ auto_check = 1
         assert_eq!(hotkeys.pin_clipboard, "");
         assert_eq!(hotkeys.pin_passthrough, "");
         assert_eq!(hotkeys.ocr, "");
-    }
-
-    #[test]
-    fn ocr_defaults_and_roundtrip() {
-        let defaults = OcrConfig::default();
-        assert!(defaults.languages.is_empty());
-        assert_eq!(defaults.strategy, OcrStrategy::Fallback);
-
-        let mut labels: Vec<_> = OcrStrategy::ALL.iter().map(|s| s.label()).collect();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), OcrStrategy::ALL.len());
-
-        for (text, expected) in [
-            ("fallback", OcrStrategy::Fallback),
-            ("best", OcrStrategy::Best),
-        ] {
-            let toml =
-                format!("[ocr]\nlanguages = [\"zh-Hans-CN\", \"en-US\"]\nstrategy = \"{text}\"\n");
-            let parsed = Config::from_toml_str(&toml).expect("解析");
-            assert_eq!(parsed.ocr.strategy, expected, "{text}");
-            assert_eq!(parsed.ocr.languages, vec!["zh-Hans-CN", "en-US"]);
-            let back = parsed.to_toml_string().expect("序列化");
-            assert!(back.contains(&format!("strategy = \"{text}\"")), "{back}");
-        }
-        assert!(Config::from_toml_str("[ocr]\nstrategy = \"fast\"\n").is_err());
-        assert!(Config::from_toml_str("[ocr]\nextra = 1\n").is_err());
     }
 
     #[test]

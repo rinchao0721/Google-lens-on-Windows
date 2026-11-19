@@ -247,12 +247,21 @@ mod tests {
         assert_eq!((exported.width(), exported.height()), (2, 3));
         let reds: Vec<u8> = exported
             .rgba()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| *px.first().unwrap_or(&0))
             .collect();
         // 导出仅应用旋转，不应用缩放与透明度
         assert_eq!(reds, vec![4, 1, 5, 2, 6, 3]);
-        assert!(exported.rgba().chunks_exact(4).all(|px| px[3] == 255));
+        assert!(
+            exported
+                .rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| px[3] == 255)
+        );
 
         let r0 = state.rotate_ccw();
         assert_eq!(r0.width, 3);

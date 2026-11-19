@@ -9,7 +9,6 @@ use super::{
 };
 use crate::annotation::Color;
 use crate::hotkey::Hotkey;
-use crate::ocr::{MAX_OCR_LANGUAGES, is_valid_language_tag};
 
 /// 一条校验问题，`field` 为点分隔的配置路径，便于界面就地标红。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +52,6 @@ pub fn validate(config: &Config) -> Result<(), Vec<ValidationIssue>> {
     check_search(config, &mut issues);
     check_upload(config, &mut issues);
     check_selection(config, &mut issues);
-    check_ocr(config, &mut issues);
     check_annotate(config, &mut issues);
     check_misc(config, &mut issues);
     if issues.is_empty() {
@@ -210,35 +208,6 @@ fn check_selection(config: &Config, issues: &mut Vec<ValidationIssue>) {
         &HISTORY_SIZE_RANGE,
         issues,
     );
-}
-
-fn check_ocr(config: &Config, issues: &mut Vec<ValidationIssue>) {
-    let langs = &config.ocr.languages;
-    if langs.len() > MAX_OCR_LANGUAGES {
-        issues.push(ValidationIssue::new(
-            "ocr.languages",
-            format!("最多只能配置 {MAX_OCR_LANGUAGES} 种识别语言"),
-        ));
-    }
-    let mut seen: Vec<String> = Vec::with_capacity(langs.len());
-    for tag in langs {
-        if !is_valid_language_tag(tag) {
-            issues.push(ValidationIssue::new(
-                "ocr.languages",
-                format!("语言标签格式无效：{tag}"),
-            ));
-            continue;
-        }
-        let lower = tag.to_ascii_lowercase();
-        if seen.iter().any(|s| s == &lower) {
-            issues.push(ValidationIssue::new(
-                "ocr.languages",
-                format!("语言列表不能重复：{tag}"),
-            ));
-        } else {
-            seen.push(lower);
-        }
-    }
 }
 
 fn check_color(field: &'static str, value: &str, issues: &mut Vec<ValidationIssue>) {
@@ -511,25 +480,6 @@ mod tests {
         assert_eq!(fields(&c), vec!["hotkeys.ocr"]);
         c.hotkeys.ocr = "Win+Shift+O".to_string();
         assert!(fields(&c).is_empty());
-    }
-
-    #[test]
-    fn ocr_languages_enforce_syntax_uniqueness_and_limit() {
-        let mut c = Config::default();
-        c.ocr.languages = vec!["zh-Hans-CN".to_string(), "en-US".to_string()];
-        assert!(fields(&c).is_empty());
-
-        // 大小写不同视为重复
-        c.ocr.languages = vec!["en-US".to_string(), "en-us".to_string()];
-        assert_eq!(fields(&c), vec!["ocr.languages"]);
-
-        // 无效标签
-        c.ocr.languages = vec!["zh_CN".to_string()];
-        assert_eq!(fields(&c), vec!["ocr.languages"]);
-
-        // 超过上限（8 种）
-        c.ocr.languages = (1..=9).map(|i| format!("en-0{i}")).collect();
-        assert_eq!(fields(&c), vec!["ocr.languages"]);
     }
 
     #[test]

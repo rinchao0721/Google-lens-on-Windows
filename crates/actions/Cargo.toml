@@ -11,6 +11,7 @@ lenswin-update.workspace = true
 lenswin-overlay.workspace = true
 lenswin-platform.workspace = true
 lenswin-core.workspace = true
+lenswin-ocr.workspace = true
 log.workspace = true
 png.workspace = true
 

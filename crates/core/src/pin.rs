@@ -387,18 +387,19 @@ pub fn decode_dib(bytes: &[u8]) -> Result<CroppedImage, DibError> {
             for px in row
                 .get(..row_bytes)
                 .ok_or(DibError::TooShort)?
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
             {
-                if let [b, g, r] = *px {
-                    out.extend_from_slice(&[r, g, b, 255]);
-                }
+                let [b, g, r] = *px;
+                out.extend_from_slice(&[r, g, b, 255]);
             }
         } else {
             let row_bytes = w.checked_mul(4).ok_or(DibError::InvalidSize)?;
             for px in row
                 .get(..row_bytes)
                 .ok_or(DibError::TooShort)?
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
             {
                 if let Some(m) = masks {
                     let raw = u32::from_le_bytes([
@@ -418,7 +419,8 @@ pub fn decode_dib(bytes: &[u8]) -> Result<CroppedImage, DibError> {
                         a
                     };
                     out.extend_from_slice(&[r, g, b, a]);
-                } else if let [b, g, r, a] = *px {
+                } else {
+                    let [b, g, r, a] = *px;
                     any_nonzero_alpha |= a != 0;
                     out.extend_from_slice(&[r, g, b, a]);
                 }
@@ -427,10 +429,8 @@ pub fn decode_dib(bytes: &[u8]) -> Result<CroppedImage, DibError> {
     }
 
     if !any_nonzero_alpha {
-        for px in out.chunks_exact_mut(4) {
-            if let Some(alpha) = px.get_mut(3) {
-                *alpha = 255;
-            }
+        for px in out.as_chunks_mut::<4>().0 {
+            px[3] = 255;
         }
     }
 
@@ -537,7 +537,9 @@ mod tests {
 
     fn reds(img: &CroppedImage) -> Vec<u8> {
         img.rgba()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| *px.first().unwrap_or(&0))
             .collect()
     }

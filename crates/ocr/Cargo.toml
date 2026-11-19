@@ -1,0 +1,17 @@
+[package]
+name = "lenswin-ocr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lenswin-core.workspace = true
+ort.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+
+[lints]
+workspace = true

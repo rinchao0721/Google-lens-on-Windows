@@ -386,10 +386,10 @@ mod tests {
         config.upload.provider = UploadProvider::Custom;
         let menu = build(&config, &AutostartState::Disabled, PinMenuState::default());
         for item in flat(&menu) {
-            if let MenuItem::Entry { id, enabled, .. } = item {
-                if matches!(menu.action(*id), Some(MenuAction::SetExpiry(_))) {
-                    assert!(!enabled);
-                }
+            if let MenuItem::Entry { id, enabled, .. } = item
+                && matches!(menu.action(*id), Some(MenuAction::SetExpiry(_)))
+            {
+                assert!(!enabled);
             }
         }
     }

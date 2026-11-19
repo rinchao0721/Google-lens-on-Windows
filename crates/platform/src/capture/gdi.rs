@@ -105,11 +105,9 @@ fn capture_monitor(screen: &ScreenDc, monitor: &MonitorInfo) -> Result<Frame, Ca
 
 /// BGRA 转 RGBA；屏幕 BitBlt 的 alpha 通道不可靠，一律置为不透明。
 fn bgra_to_opaque_rgba(buf: &mut [u8]) {
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
-        if let Some(a) = px.get_mut(3) {
-            *a = 255;
-        }
+        px[3] = 255;
     }
 }
 

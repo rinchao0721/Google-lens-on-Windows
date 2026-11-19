@@ -481,10 +481,12 @@ fn on_key_down(hwnd: HWND, wparam: WPARAM) {
         }
         return;
     }
-    if vk == VK_S.0 && ctrl && !alt {
-        if let Some(Ok(img)) = with_slot(hwnd, |s| s.state.export_image()) {
-            emit(PinEvent::Save(img));
-        }
+    if vk == VK_S.0
+        && ctrl
+        && !alt
+        && let Some(Ok(img)) = with_slot(hwnd, |s| s.state.export_image())
+    {
+        emit(PinEvent::Save(img));
     }
 }
 

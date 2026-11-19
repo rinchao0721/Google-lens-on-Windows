@@ -208,17 +208,15 @@ impl Renderer {
 /// RGBA 转预乘 Alpha 的 BGRA（Direct2D 位图格式）。
 pub(crate) fn rgba_to_premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        if let [r, g, b, a] = *px {
-            match a {
-                255 => out.extend_from_slice(&[b, g, r, 255]),
-                0 => out.extend_from_slice(&[0, 0, 0, 0]),
-                alpha => {
-                    let pb = premul(b, alpha);
-                    let pg = premul(g, alpha);
-                    let pr = premul(r, alpha);
-                    out.extend_from_slice(&[pb, pg, pr, alpha]);
-                }
+    for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
+        match a {
+            255 => out.extend_from_slice(&[b, g, r, 255]),
+            0 => out.extend_from_slice(&[0, 0, 0, 0]),
+            alpha => {
+                let pb = premul(b, alpha);
+                let pg = premul(g, alpha);
+                let pr = premul(r, alpha);
+                out.extend_from_slice(&[pb, pg, pr, alpha]);
             }
         }
     }

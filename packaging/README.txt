@@ -13,4 +13,7 @@ lenswin —— Windows 托盘以图搜图工具
   - 升级：覆盖解压即可，data 文件夹会保留。
   - 卸载：先在托盘菜单关闭「开机自启」，再删除整个文件夹。
 
-许可证见 LICENSE。
+文字识别
+  - 离线识别，图片不会上传。依赖与 lenswin.exe 同目录的 onnxruntime.dll，请不要删除或移动。
+
+许可证见 LICENSE；第三方组件的许可证见 LICENSE-onnxruntime.txt、LICENSE-PaddleOCR.txt。
